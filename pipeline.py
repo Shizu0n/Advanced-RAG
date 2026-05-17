@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import os
 import json
 import unicodedata
+import hashlib
+
+logger = logging.getLogger(__name__)
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -157,6 +161,7 @@ INTENT_REWRITES = {
     "setup": "setup install instalar executar rodar ambiente env scripts npm",
     "security": "security seguranca auth authentication jwt password senha bcrypt guard token",
     "evaluation": "evaluation avaliacao metricas tests testes qualidade benchmark ragas",
+    "fine_tune": "fine tune training dataset hyperparameters lora qlora phi training_details",
 }
 
 
@@ -205,6 +210,7 @@ def analyze_query(query: str) -> QueryAnalysis:
         "setup": ("setup", "install", "instalar", "executar", "rodar", "ambiente", "env", "script", "scripts"),
         "security": ("security", "seguranca", "auth", "authentication", "jwt", "senha", "password", "bcrypt", "token"),
         "evaluation": ("evaluation", "avaliacao", "avaliar", "metric", "metrics", "metrica", "metricas", "test", "tests"),
+        "fine_tune": ("fine tune", "fine-tune", "fine tunning", "fine tuning", "finetuning", "training data", "hyperparameter", "lora", "qlora", "dataset"),
     }
     for intent, patterns in intent_patterns.items():
         if any(pattern in normalized for pattern in patterns):
@@ -415,6 +421,267 @@ def _format_package_manifest(path: Path) -> str | None:
     )
 
 
+def _is_noise_chunk(text: str) -> bool:
+    """Filter chunks that are code blocks, not documentation."""
+    stripped = text.strip()
+    if stripped.startswith("```") or stripped.startswith(">>>"):
+        return True
+    first_lines = stripped.split("\n")[:3]
+    for line in first_lines:
+        ls = line.lstrip()
+        # Shell commands at column 0
+        if ls.startswith(("$", "#>", "- ", "> ")) and any(ls.startswith(p) for p in ("$ pip", "$ npm", "# pip", "- pip", "$ node", "$ python")):
+            return True
+        if ls.startswith("if __name__"):
+            return True
+        if any(ls.startswith(kw) for kw in ("import ", "from ", "def ", "class ", "return ", "result =", "=> ")):
+            return True
+        if ls.startswith("```"):
+            return True
+    return False
+
+
+@dataclass
+class FineTuneMetadata:
+    """Metadata extracted from HuggingFace model cards."""
+    base_model: str | None = None
+    dataset: str | list[str] | None = None
+    training_details: dict[str, Any] | None = None
+    evaluation_metrics: dict[str, Any] | None = None
+    lora_config: dict[str, Any] | None = None
+    license: str | None = None
+    language: list[str] | None = None
+    tags: list[str] | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "base_model": self.base_model,
+            "dataset": self.dataset,
+            "training_details": self.training_details,
+            "evaluation_metrics": self.evaluation_metrics,
+            "lora_config": self.lora_config,
+            "license": self.license,
+            "language": self.language,
+            "tags": self.tags,
+        }
+
+    def to_summary(self) -> str:
+        parts: list[str] = []
+        if self.base_model:
+            parts.append(f"Base Model: {self.base_model}")
+        if self.dataset:
+            if isinstance(self.dataset, list):
+                parts.append(f"Dataset: {', '.join(self.dataset)}")
+            else:
+                parts.append(f"Dataset: {self.dataset}")
+        if self.training_details:
+            details = []
+            for key, value in self.training_details.items():
+                details.append(f"{key}: {value}")
+            if details:
+                parts.append(f"Training: {', '.join(details)}")
+        if self.evaluation_metrics:
+            metrics = [f"{key}: {value}" for key, value in self.evaluation_metrics.items()]
+            if metrics:
+                parts.append(f"Evaluation: {', '.join(metrics)}")
+        if self.lora_config:
+            lora_parts = [f"{key}: {value}" for key, value in self.lora_config.items()]
+            if lora_parts:
+                parts.append(f"LoRA: {', '.join(lora_parts)}")
+        return " | ".join(parts) if parts else None
+
+
+def _parse_yaml_frontmatter(text: str) -> dict[str, Any]:
+    """Parse YAML frontmatter from HuggingFace README.md.
+
+    Returns dict of parsed values or empty dict if no frontmatter.
+    Does not require external YAML library - uses simple line-by-line parsing.
+    """
+    text = text.strip()
+    if not text.startswith("---"):
+        return {}
+
+    lines = text.split("\n")[1:]
+    yaml_lines: list[str] = []
+
+    for line in lines:
+        if line.strip() == "---":
+            break
+        yaml_lines.append(line)
+
+    if not yaml_lines:
+        return {}
+
+    result: dict[str, Any] = {}
+    current_key: str | None = None
+    current_indent = 0
+    in_multiline = False
+    multiline_value: list[str] = []
+
+    for line in yaml_lines:
+        if not line.strip():
+            continue
+
+        if line.startswith("  ") or line.startswith("- "):
+            if current_key:
+                existing = result.get(current_key)
+                if isinstance(existing, list):
+                    item = line.strip()
+                    if item.startswith("- "):
+                        existing.append(item[2:].strip())
+                    else:
+                        existing.append(item)
+            continue
+
+        if ":" in line:
+            key_part, value_part = line.split(":", 1)
+            key = key_part.strip()
+            value = value_part.strip()
+
+            if value == "":
+                result[key] = []
+                current_key = key
+            elif value.startswith("[") and value.endswith("]"):
+                items = [item.strip() for item in value[1:-1].split(",") if item.strip()]
+                result[key] = items
+                current_key = key
+            elif value.startswith("-"):
+                result[key] = [value[1:].strip()]
+                current_key = key
+            else:
+                result[key] = value
+                current_key = key
+
+    return result
+
+
+def _parse_markdown_section(text: str, section_name: str) -> str:
+    """Extract content under a specific markdown section heading."""
+    pattern = rf"^##\s+{re.escape(section_name)}\s*$"
+    lines = text.split("\n")
+    start_idx = None
+
+    for i, line in enumerate(lines):
+        if re.match(pattern, line, re.IGNORECASE):
+            start_idx = i + 1
+            break
+
+    if start_idx is None:
+        return ""
+
+    content_lines: list[str] = []
+    for line in lines[start_idx:]:
+        if re.match(r"^##\s+", line):
+            break
+        content_lines.append(line)
+
+    return "\n".join(content_lines).strip()
+
+
+def _extract_fine_tune_info(contexts: Sequence[str], sources: Sequence[dict[str, Any]]) -> FineTuneMetadata:
+    """Extract structured fine-tuning metadata from HuggingFace model cards.
+
+    Parses:
+    - YAML frontmatter for base_model, datasets, license, tags, language
+    - Training Details section for epochs, batch_size, learning_rate, etc.
+    - Evaluation section for metrics
+    - LoRA/QLoRA config tables
+
+    Args:
+        contexts: List of retrieved text chunks
+        sources: List of source metadata dicts
+
+    Returns:
+        FineTuneMetadata with extracted fields (None for missing fields)
+    """
+    metadata = FineTuneMetadata()
+
+    for context, source in zip(contexts, sources):
+        source_doc = source.get("source_doc", "")
+        if "README.md" not in source_doc:
+            continue
+
+        yaml_data = _parse_yaml_frontmatter(context)
+
+        if yaml_data.get("base_model"):
+            metadata.base_model = yaml_data["base_model"]
+        if yaml_data.get("datasets"):
+            datasets = yaml_data["datasets"]
+            metadata.dataset = datasets if isinstance(datasets, list) else [datasets]
+        if yaml_data.get("license"):
+            metadata.license = yaml_data["license"]
+        if yaml_data.get("language"):
+            langs = yaml_data["language"]
+            metadata.language = langs if isinstance(langs, list) else [langs]
+        if yaml_data.get("tags"):
+            tags = yaml_data["tags"]
+            metadata.tags = tags if isinstance(tags, list) else [tags]
+
+        training_text = _parse_markdown_section(context, "Training Details")
+        if training_text:
+            details: dict[str, Any] = {}
+            for line in training_text.split("\n"):
+                if ":" in line and not line.startswith("|"):
+                    key, value = line.split(":", 1)
+                    key = key.strip().replace("*", "").strip()
+                    value = value.strip()
+                    try:
+                        if "." in value:
+                            details[key] = float(value)
+                        else:
+                            details[key] = int(value)
+                    except ValueError:
+                        details[key] = value
+                elif "|" in line and line.strip().startswith("|"):
+                    parts = [p.strip() for p in line.split("|") if p.strip()]
+                    if len(parts) >= 2:
+                        key = parts[0].replace("*", "").strip()
+                        value = parts[1].strip()
+                        try:
+                            if "." in value:
+                                details[key] = float(value)
+                            else:
+                                details[key] = int(value)
+                        except ValueError:
+                            details[key] = value
+            if details:
+                metadata.training_details = details
+
+        eval_text = _parse_markdown_section(context, "Evaluation")
+        if eval_text:
+            metrics: dict[str, Any] = {}
+            for line in eval_text.split("\n"):
+                if "|" in line and "Model" not in line and "---" not in line:
+                    parts = [p.strip() for p in line.split("|") if p.strip()]
+                    if len(parts) >= 2 and "exact match" in line.lower():
+                        match = re.search(r"(\d+\.?\d*)%", line)
+                        if match:
+                            metrics["exact_match"] = float(match.group(1))
+            if metrics:
+                metadata.evaluation_metrics = metrics
+
+        lora_text = _parse_markdown_section(context, "LoRA Config")
+        if lora_text:
+            lora: dict[str, Any] = {}
+            for line in lora_text.split("\n"):
+                if "|" in line:
+                    parts = [p.strip() for p in line.split("|") if p.strip()]
+                    if len(parts) >= 2:
+                        key = parts[0].replace("*", "").strip().title()
+                        value = parts[1].strip()
+                        try:
+                            lora[key] = int(value)
+                        except ValueError:
+                            try:
+                                lora[key] = float(value)
+                            except ValueError:
+                                lora[key] = value
+            if lora:
+                metadata.lora_config = lora
+
+    return metadata
+
+
 def _looks_like_json_text(text: str) -> bool:
     stripped = text.strip()
     return (stripped.startswith("{") and stripped.endswith("}")) or (stripped.startswith("[") and stripped.endswith("]"))
@@ -529,18 +796,6 @@ def _extract_technologies(contexts: Sequence[str], query: str = "") -> list[str]
     return found
 
 
-def _format_stack_answer(query: str, contexts: Sequence[str], citations: Sequence[dict[str, Any]]) -> str:
-    technologies = _extract_technologies(contexts, query=query)
-    evidence_docs = ", ".join(dict.fromkeys(str(citation["source_doc"]) for citation in citations[:3]))
-    if technologies:
-        return f"Tecnologias encontradas: {', '.join(technologies)}. Evidencia em: {evidence_docs}."
-    return synthesize_extractive_answer("tech stack tecnologias frameworks ferramentas", contexts, max_sentences=3)
-
-
-def _format_overview_answer(query: str, contexts: Sequence[str], citations: Sequence[dict[str, Any]]) -> str:
-    summary = synthesize_extractive_answer(query, contexts, max_sentences=3)
-    evidence_docs = ", ".join(dict.fromkeys(str(citation["source_doc"]) for citation in citations[:3]))
-    return f"{summary} Evidencia em: {evidence_docs}." if evidence_docs else summary
 
 
 def synthesize_chat_answer(
@@ -549,29 +804,29 @@ def synthesize_chat_answer(
     citations: Sequence[dict[str, Any]],
     intent: str,
     sources: Sequence[dict[str, Any]],
+    fine_tune_metadata: FineTuneMetadata | None = None,
 ) -> str:
     if not contexts:
         return EMPTY_LOCAL_CONTEXT_ANSWER
     if not _has_enough_evidence(query, contexts, sources):
         return LOW_EVIDENCE_ANSWER
-    if intent == "stack":
-        return _format_stack_answer(query, contexts, citations)
-    if intent == "overview":
-        return _format_overview_answer(query, contexts, citations)
-    # Tenta síntese gerativa com LLM antes de recorrer ao fallback extraívo
+
+    # LLM-first: tenta síntese gerativa para TODAS as intents
     try:
         from synthesis import synthesize_generative_answer  # noqa: PLC0415
 
-        generative = synthesize_generative_answer(query, contexts, sources)
+        generative = synthesize_generative_answer(
+            query, contexts, sources,
+            intent=intent,
+            fine_tune_metadata=fine_tune_metadata,
+        )
         if generative is not None:
             return generative
     except Exception:
         pass
 
-    # Fallback extraívo melhorado
-    cleaned_contexts = [
-        ctx for ctx in contexts if not _is_mostly_json(ctx)
-    ]
+    # Fallback extraívo quando LLM está indisponível
+    cleaned_contexts = [ctx for ctx in contexts if not _is_mostly_json(ctx)]
     return synthesize_extractive_answer(
         query, cleaned_contexts or contexts, max_sentences=5
     )
@@ -629,7 +884,7 @@ def _context_chunks_for_file(path: Path) -> list[str]:
         chunks: list[str] = []
         for snippet in _readme_section_snippets(path):
             chunks.extend(_chunk_text(snippet))
-        return chunks
+        return [c for c in chunks if c and not _is_noise_chunk(c)]
     text = _context_text_for_file(path).strip()
     return _chunk_text(text) if text else []
 
@@ -791,10 +1046,12 @@ class LocalRAGPipeline:
 
     def _build_retriever(self):
         if self.index is None:
+            logger.info("No vector index found, using SimpleLocalRetriever (lexical-only)")
             return SimpleLocalRetriever(self.nodes or [], top_k=self.top_k)
 
         from retrieval import HybridRetriever
 
+        logger.info("Vector index available, using HybridRetriever")
         return HybridRetriever(
             self.index,
             self.nodes or [],
@@ -840,9 +1097,11 @@ class LocalRAGPipeline:
         if strategy not in SUPPORTED_STRATEGIES:
             raise ValueError(f"strategy must be one of: {', '.join(sorted(SUPPORTED_STRATEGIES))}")
 
+        logger.info("answer_query: strategy=%s, query=%s", strategy, query[:80])
         self._ensure_ready()
         results, metadata = self.retriever.ablation_retrieve(query, strategy)
         contexts = [_node_text(result) for result in results]
+        logger.info("answer_query: retrieved %d contexts, %d results", len(contexts), len(results))
         answer = synthesize_extractive_answer(query, contexts) if contexts else EMPTY_LOCAL_CONTEXT_ANSWER
         sources = self._source_rows(results)
 
@@ -879,7 +1138,10 @@ class LocalRAGPipeline:
         contexts = [_node_text(result) for result in results]
         sources = self._source_rows(results)
         citations = _make_citations(results)
-        answer = synthesize_chat_answer(message, contexts, citations, intent, sources)
+        fine_tune_metadata = None
+        if intent == "fine_tune":
+            fine_tune_metadata = _extract_fine_tune_info(contexts, sources)
+        answer = synthesize_chat_answer(message, contexts, citations, intent, sources, fine_tune_metadata=fine_tune_metadata)
         trace = self._normalize_trace(metadata, results)
         trace.update(
             {

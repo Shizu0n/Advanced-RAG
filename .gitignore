@@ -5,6 +5,7 @@ __pycache__/
 chroma_db/
 graphify-out/
 data/
+*.jsonl
 CLAUDE.md
 AGENTS.md
 FLOWS.md

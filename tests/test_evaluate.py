@@ -380,5 +380,252 @@ class GoldenDatasetTests(unittest.TestCase):
         self.assertIn("ragas==0.2.5", requirements)
 
 
+class SourceScopedEvalTests(unittest.TestCase):
+    def test_run_evaluation_writes_evaluated_source_column_to_csv(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            summary_path = Path(tmpdir) / "summary.csv"
+            detail_path = Path(tmpdir) / "detail.csv"
+            current_source_path = Path(tmpdir) / "current_source.json"
+
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "What does the project do?",
+                            "ground_truth": "It evaluates RAG strategies.",
+                            "reference_context": "It evaluates RAG strategies.",
+                            "source_doc": "data/eval/project_abstract.md",
+                            "source_slug": "test-repo",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            current_source_path.write_text(
+                json.dumps({"source_slug": "test-repo", "source_type": "local", "indexed_at": "2025-01-01"}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "STRATEGIES", ["semantic_only"]),
+                patch.object(evaluation, "EVAL_DIR", Path(tmpdir)),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.dict("os.environ", {}, clear=True),
+            ):
+                evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline())
+
+            summary = pd.read_csv(summary_path)
+            self.assertIn("evaluated_source", summary.columns)
+            self.assertEqual(summary.loc[0, "evaluated_source"], "test-repo")
+
+    def test_run_evaluation_writes_empty_evaluated_source_when_no_current_source(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            summary_path = Path(tmpdir) / "summary.csv"
+            detail_path = Path(tmpdir) / "detail.csv"
+            nonexistent_source_path = Path(tmpdir) / "nonexistent.json"
+
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "What does the project do?",
+                            "ground_truth": "It evaluates RAG strategies.",
+                            "reference_context": "It evaluates RAG strategies.",
+                            "source_doc": "data/eval/project_abstract.md",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "STRATEGIES", ["semantic_only"]),
+                patch.object(evaluation, "EVAL_DIR", Path(tmpdir)),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", nonexistent_source_path),
+                patch.dict("os.environ", {}, clear=True),
+            ):
+                evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline())
+
+            summary = pd.read_csv(summary_path)
+            self.assertIn("evaluated_source", summary.columns)
+            # Empty string becomes NaN when roundtripped through CSV
+            self.assertTrue(pd.isna(summary.loc[0, "evaluated_source"]) or summary.loc[0, "evaluated_source"] == "")
+
+    def test_load_golden_dataset_metadata_returns_correct_metadata(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "Q1?",
+                            "ground_truth": "A1",
+                            "reference_context": "ctx1",
+                            "source_doc": "doc1",
+                            "source_slug": "my-repo",
+                        },
+                        {
+                            "question": "Q2?",
+                            "ground_truth": "A2",
+                            "reference_context": "ctx2",
+                            "source_doc": "doc2",
+                            "source_slug": "my-repo",
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            metadata = evaluation.load_golden_dataset_metadata(golden_path)
+
+            self.assertIsNotNone(metadata)
+            self.assertEqual(metadata["source_slug"], "my-repo")
+            self.assertEqual(metadata["question_count"], "2")
+            self.assertIn("generation_date", metadata)
+
+    def test_load_golden_dataset_metadata_returns_none_when_missing(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "nonexistent.json"
+            self.assertIsNone(evaluation.load_golden_dataset_metadata(golden_path))
+
+    def test_load_golden_dataset_metadata_returns_none_when_empty(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text("[]", encoding="utf-8")
+            self.assertIsNone(evaluation.load_golden_dataset_metadata(golden_path))
+
+    def test_load_golden_dataset_metadata_returns_none_when_no_source_slug(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(
+                json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d"}]),
+                encoding="utf-8",
+            )
+            self.assertIsNone(evaluation.load_golden_dataset_metadata(golden_path))
+
+
+class InvalidationTests(unittest.TestCase):
+    def test_invalidate_golden_dataset_if_stale_deletes_stale_dataset(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            summary_path = Path(tmpdir) / "ragas_results.csv"
+            detail_path = Path(tmpdir) / "ragas_per_question.csv"
+            current_source_path = Path(tmpdir) / "current_source.json"
+
+            golden_path.write_text(
+                json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d", "source_slug": "old-repo"}]),
+                encoding="utf-8",
+            )
+            summary_path.write_text("strategy\n", encoding="utf-8")
+            detail_path.write_text("question\n", encoding="utf-8")
+            current_source_path.write_text(
+                json.dumps({"source_slug": "new-repo", "source_type": "local"}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", detail_path),
+            ):
+                result = evaluation.invalidate_golden_dataset_if_stale()
+
+            self.assertTrue(result)
+            self.assertFalse(golden_path.exists())
+            self.assertFalse(summary_path.exists())
+            self.assertFalse(detail_path.exists())
+
+    def test_invalidate_golden_dataset_if_stale_keeps_fresh_dataset(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+
+            golden_path.write_text(
+                json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d", "source_slug": "same-repo"}]),
+                encoding="utf-8",
+            )
+            current_source_path.write_text(
+                json.dumps({"source_slug": "same-repo", "source_type": "local"}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+            ):
+                result = evaluation.invalidate_golden_dataset_if_stale()
+
+            self.assertFalse(result)
+            self.assertTrue(golden_path.exists())
+
+    def test_invalidate_golden_dataset_if_stale_handles_missing_current_source(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "nonexistent.json"
+
+            golden_path.write_text(
+                json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d", "source_slug": "repo"}]),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+            ):
+                result = evaluation.invalidate_golden_dataset_if_stale()
+
+            self.assertFalse(result)
+            self.assertTrue(golden_path.exists())
+
+    def test_invalidate_golden_dataset_if_stale_handles_missing_golden_dataset(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+
+            current_source_path.write_text(
+                json.dumps({"source_slug": "repo", "source_type": "local"}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+            ):
+                result = evaluation.invalidate_golden_dataset_if_stale()
+
+            self.assertFalse(result)
+
+    def test_invalidate_golden_dataset_if_stale_ignores_golden_without_source_slug(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+
+            # Old-format golden dataset without source_slug field
+            golden_path.write_text(
+                json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d"}]),
+                encoding="utf-8",
+            )
+            current_source_path.write_text(
+                json.dumps({"source_slug": "new-repo", "source_type": "local"}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+            ):
+                result = evaluation.invalidate_golden_dataset_if_stale()
+
+            self.assertFalse(result)
+            self.assertTrue(golden_path.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

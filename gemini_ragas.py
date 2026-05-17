@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 import hashlib
 import json
 import os
@@ -138,6 +141,7 @@ class GeminiFreeTierClient:
 
     def generate_text(self, prompt: Any, n: int = 1, temperature: float | None = None) -> str:
         text = prompt.to_string() if hasattr(prompt, "to_string") else str(prompt)
+        logger.info("generate_text: %d chars, providers=%s", len(text), [p.name for p in self.providers])
         payload = {
             "contents": [{"parts": [{"text": text}]}],
             "generationConfig": {
@@ -146,6 +150,7 @@ class GeminiFreeTierClient:
             },
         }
         data = self._request_with_provider_fallback("generate_text", payload, self.providers)
+        logger.info("generate_text: success, response=%d chars", len(str(data)))
         return self._text_from_response(data)
 
     async def agenerate_text(self, prompt: Any, n: int = 1, temperature: float | None = None) -> str:
@@ -185,17 +190,21 @@ class GeminiFreeTierClient:
             cache_key = self._cache_key(method, provider.model, cache_payload)
             cached = self._read_cache(cache_key)
             if cached is not None:
+                logger.debug("Cache hit for %s/%s", provider.name, provider.model)
                 return cached
 
+            logger.info("Trying provider %s/%s (budget: %d/%d)", provider.name, provider.model, self.budget.calls_made, self.budget.max_calls)
             self.budget.consume()
             url, request_payload, headers = self._provider_request(provider, payload)
             response = self.post(url, json=request_payload, headers=headers, timeout=30)
             if getattr(response, "status_code", 200) in QUOTA_STATUS_CODES:
+                logger.warning("Provider %s returned HTTP %s, skipping", provider.name, response.status_code)
                 errors.append(f"{provider.name}/{provider.model}: HTTP {response.status_code}")
                 continue
             response.raise_for_status()
             data = response.json()
             self._write_cache(cache_key, data)
+            logger.info("Provider %s succeeded", provider.name)
             return data
         raise GeminiCloudUnavailable("; ".join(errors) or "cloud providers unavailable")
 

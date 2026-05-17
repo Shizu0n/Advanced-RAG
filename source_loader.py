@@ -1,7 +1,8 @@
-"""Prepare local and GitHub repository sources for ingestion."""
+"""Prepare local, GitHub repository, and HuggingFace sources for ingestion."""
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import hashlib
@@ -11,6 +12,10 @@ import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+import requests
+
+logger = logging.getLogger(__name__)
 
 
 SOURCE_EXTENSIONS = {
@@ -236,6 +241,7 @@ def _fetch_github_repository(
 ) -> Path:
     owner, repo = _github_owner_repo(source)
     url = f"https://api.github.com/repos/{owner}/{repo}/zipball"
+    logger.info("Fetching GitHub repo: %s/%s", owner, repo)
     zip_path = download_dir / f"{_slug(owner)}-{_slug(repo)}.zip"
 
     extract_dir = download_dir / f"{_slug(owner)}-{_slug(repo)}"
@@ -243,19 +249,102 @@ def _fetch_github_repository(
     return _extract_supported_zip(zip_path, extract_dir)
 
 
+def _is_huggingface_url(source: str) -> bool:
+    """Return True if *source* is a HuggingFace URL or ``hf:`` shorthand."""
+    if source.startswith("hf:"):
+        return True
+    parsed = urlparse(source)
+    return parsed.scheme in {"http", "https"} and parsed.netloc.lower() == "huggingface.co"
+
+
+def _huggingface_owner_model(source: str) -> tuple[str, str]:
+    """Parse ``(owner, model_id)`` from a HuggingFace URL or ``hf:`` shorthand."""
+    if source.startswith("hf:"):
+        path = source.removeprefix("hf:")
+        parts = [p for p in path.split("/") if p]
+        if len(parts) < 2:
+            raise ValueError(f"HuggingFace shorthand must include owner and model id: {source}")
+        return parts[0], parts[1]
+
+    parsed = urlparse(source)
+    parts = [p for p in parsed.path.split("/") if p]
+    if "datasets" in parts:
+        idx = parts.index("datasets")
+        if len(parts) < idx + 3:
+            raise ValueError(f"HuggingFace dataset URL must include owner and dataset id: {source}")
+        return parts[idx + 1], parts[idx + 2]
+    if len(parts) < 2:
+        raise ValueError(f"HuggingFace source must include owner and model id: {source}")
+    return parts[0], parts[1]
+
+
+def _huggingface_target_name(owner: str, model_id: str) -> str:
+    """Return a slug for the raw directory name."""
+    return _slug(f"{owner}-{model_id}")
+
+
+def _huggingface_network_allowed(allow_huggingface_fetch: bool) -> bool:
+    """Return True if HF fetching is permitted via param or env var."""
+    return allow_huggingface_fetch or os.getenv("ALLOW_HF_FETCH") == "1"
+
+
+def _fetch_huggingface_card(
+    source: str,
+    download_dir: Path,
+) -> Path:
+    """Fetch the README.md model/dataset card from HuggingFace.
+
+    Uses the ``/resolve/main/README.md`` endpoint so the file is returned as
+    raw markdown rather than an HTML page.
+    """
+    owner, model_id = _huggingface_owner_model(source)
+    parsed = urlparse(source)
+    is_dataset = not source.startswith("hf:") and "datasets" in parsed.path
+    base = "https://huggingface.co"
+    if is_dataset:
+        url = f"{base}/datasets/{owner}/{model_id}/resolve/main/README.md"
+    else:
+        url = f"{base}/{owner}/{model_id}/resolve/main/README.md"
+    logger.info("Fetching HuggingFace card: %s", url)
+
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+
+    readme_path = download_dir / "README.md"
+    readme_path.write_bytes(response.content)
+    return readme_path
+
+
 def prepare_sources(
     sources: list[str | Path] | tuple[str | Path, ...],
     raw_dir: Path | str = Path("data/raw"),
     allow_github_fetch: bool = False,
+    allow_huggingface_fetch: bool = False,
 ) -> list[Path]:
-    """Copy supported local/GitHub source files into raw_dir and return copied paths."""
+    """Copy supported local/GitHub/HuggingFace source files into raw_dir and return copied paths."""
 
+    logger.info("prepare_sources: %d sources, raw_dir=%s", len(sources), raw_dir)
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
     prepared_files: list[Path] = []
 
     for source in sources:
         source_text = str(source)
+        if _is_huggingface_url(source_text):
+            owner, model_id = _huggingface_owner_model(source_text)
+            if not _huggingface_network_allowed(allow_huggingface_fetch):
+                raise RuntimeError(
+                    "HuggingFace source fetching requires allow_huggingface_fetch=True "
+                    "or ALLOW_HF_FETCH=1."
+                )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                fetched = _fetch_huggingface_card(source_text, Path(tmpdir))
+                target_root = raw_dir / _huggingface_target_name(owner, model_id)
+                target_root.mkdir(parents=True, exist_ok=True)
+                target_file = target_root / fetched.name
+                _copy_without_conflict(fetched, target_file)
+                prepared_files.append(target_file)
+            continue
         if _is_github_url(source_text):
             owner, repo = _github_owner_repo(source_text)
             if not _network_allowed(allow_github_fetch):

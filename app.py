@@ -3,17 +3,31 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
+from dotenv import load_dotenv
 
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 EVAL_DIR = PROJECT_ROOT / "data" / "eval"
+QUERY_LOG_PATH = PROJECT_ROOT / "data" / "query_log.jsonl"
 RAGAS_RESULTS_PATH = EVAL_DIR / "ragas_results.csv"
 RAGAS_PER_QUESTION_PATH = EVAL_DIR / "ragas_per_question.csv"
 GOLDEN_DATASET_PATH = EVAL_DIR / "golden_dataset.json"
+RAW_DIR = PROJECT_ROOT / "data" / "raw"
+CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 CHAT_MESSAGES_KEY = "chat_messages"
@@ -54,13 +68,15 @@ def _coerce_metric_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_eval_summary(path: Path = RAGAS_RESULTS_PATH) -> pd.DataFrame:
-    frame = _read_csv(path, ["strategy", *METRICS, "summary_backend"])
+    frame = _read_csv(path, ["strategy", *METRICS, "summary_backend", "evaluated_source"])
     if "strategy" not in frame.columns:
-        frame.insert(0, "strategy", pd.NA)
+        frame.insert(0, "strategy", None)
     if "summary_backend" not in frame.columns:
         frame["summary_backend"] = "unknown"
+    if "evaluated_source" not in frame.columns:
+        frame["evaluated_source"] = ""
     frame = _coerce_metric_columns(frame)
-    return frame[["strategy", *METRICS, "summary_backend"]]
+    return frame[["strategy", *METRICS, "summary_backend", "evaluated_source"]]
 
 
 def load_per_question(path: Path = RAGAS_PER_QUESTION_PATH) -> pd.DataFrame:
@@ -110,12 +126,12 @@ def filter_questions_below_threshold(frame: pd.DataFrame, threshold: float) -> p
 
 
 def eval_backend_counts(summary: pd.DataFrame, per_question: pd.DataFrame) -> dict[str, dict[str, int]]:
-    summary_counts = {}
-    question_counts = {}
+    summary_counts: dict[str, int] = {}
+    question_counts: dict[str, int] = {}
     if "summary_backend" in summary.columns:
-        summary_counts = summary["summary_backend"].dropna().astype(str).value_counts().to_dict()
+        summary_counts = {str(k): v for k, v in summary["summary_backend"].dropna().astype(str).value_counts().items()}
     if "evaluation_backend" in per_question.columns:
-        question_counts = per_question["evaluation_backend"].dropna().astype(str).value_counts().to_dict()
+        question_counts = {str(k): v for k, v in per_question["evaluation_backend"].dropna().astype(str).value_counts().items()}
     return {"summary_backends": summary_counts, "question_backends": question_counts}
 
 
@@ -183,6 +199,99 @@ def dataset_stats(golden_path: Path = GOLDEN_DATASET_PATH, per_question_path: Pa
     return stats
 
 
+CURRENT_SOURCE_PATH = PROJECT_ROOT / "data" / "current_source.json"
+
+
+def load_current_source(path: Path = CURRENT_SOURCE_PATH) -> dict | None:
+    """Load data/current_source.json; return None if missing."""
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def is_golden_dataset_stale(current_source: dict | None, golden_path: Path = GOLDEN_DATASET_PATH) -> bool:
+    """Check if golden dataset was generated for a different source than the current one."""
+    if current_source is None:
+        return False
+    if not golden_path.exists():
+        return False
+    try:
+        golden = json.loads(golden_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+    if not isinstance(golden, list) or not golden:
+        return False
+    first = golden[0]
+    if not isinstance(first, dict):
+        return False
+    golden_slug = first.get("source_slug")
+    if golden_slug is None:
+        return False
+    return golden_slug != current_source.get("source_slug")
+
+
+def log_query(query: str, strategy: str, result: dict[str, Any], log_path: Path = QUERY_LOG_PATH) -> None:
+    """Append a query interaction to the JSONL log file."""
+    import datetime
+
+    entry = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "query": query,
+        "strategy": strategy,
+        "answer": result.get("answer", ""),
+        "sources": [s.get("source_doc", "") for s in result.get("sources", [])],
+        "contexts_count": len(result.get("contexts", [])),
+        "trace": result.get("trace"),
+        "current_source": (load_current_source() or {}).get("source_slug", ""),
+    }
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    logger.info("Query logged: %s (strategy=%s)", query[:60], strategy)
+
+
+def _has_raw_source_files(raw_dir: Path = RAW_DIR) -> bool:
+    """Return True if data/raw/ has any files (recursively)."""
+    if not raw_dir.exists():
+        return False
+    return any(raw_dir.rglob("*"))
+
+
+def get_source_badge_state(
+    current_source_path: Path = CURRENT_SOURCE_PATH,
+    chroma_dir: Path = CHROMA_DIR,
+    raw_dir: Path = RAW_DIR,
+) -> str:
+    """Return 'green' if indexed, 'yellow' if prepared, 'grey' otherwise."""
+    has_source = current_source_path.exists()
+    has_chroma = chroma_dir.exists()
+    has_raw = _has_raw_source_files(raw_dir)
+
+    if has_source and has_chroma:
+        return "green"
+    if has_raw:
+        return "yellow"
+    return "grey"
+
+
+def run_build_index() -> list:
+    """Build the vector index from data/raw/ sources. Returns the nodes list."""
+    from ingestion import build_index
+
+    _index, nodes = build_index()
+    return nodes
+
+
+def run_evaluation_inline() -> None:
+    """Run full evaluation pipeline inline (blocking). Calls evaluate.main()."""
+    from evaluate import main as eval_main
+
+    eval_main()
+
+
 def last_eval_date(path: Path = RAGAS_RESULTS_PATH) -> str:
     if not path.exists():
         return "Not available"
@@ -223,16 +332,41 @@ def run_chat_query(message: str, history: list[dict[str, Any]], strategy: str) -
     return chat_query(message, history=history, strategy=strategy, allow_index_build=False)
 
 
-def prepare_sources_for_app(sources: list[str], allow_github_fetch: bool = False) -> list[Path]:
+def prepare_sources_for_app(
+    sources: list[str],
+    allow_github_fetch: bool = False,
+    allow_huggingface_fetch: bool = False,
+) -> list[Path]:
     from source_loader import prepare_sources
 
     cleaned = [source.strip() for source in sources if source.strip()]
     if not cleaned:
         return []
-    return prepare_sources(cleaned, allow_github_fetch=allow_github_fetch)
+    return prepare_sources(
+        cast(list[str | Path], cleaned),
+        allow_github_fetch=allow_github_fetch,
+        allow_huggingface_fetch=allow_huggingface_fetch,
+    )
+
+
+def _render_source_badge(st, badge_state: str, current_source: dict | None) -> None:
+    """Render a colored source status badge in the sidebar."""
+    if badge_state == "green":
+        slug = current_source.get("source_slug", "unknown") if current_source else "unknown"
+        indexed_at = current_source.get("indexed_at", "unknown") if current_source else "unknown"
+        st.sidebar.success(f"Source indexed: {slug}")
+        st.sidebar.caption(f"Indexed at: {indexed_at}")
+    elif badge_state == "yellow":
+        st.sidebar.warning("Source prepared but not indexed")
+    else:
+        st.sidebar.error("No source prepared")
 
 
 def _render_sidebar(st) -> None:
+    current_source = load_current_source()
+    badge_state = get_source_badge_state()
+    _render_source_badge(st, badge_state, current_source)
+
     stats = dataset_stats()
     st.sidebar.header("Run metadata")
     st.sidebar.write("Model")
@@ -253,23 +387,77 @@ def _render_sidebar(st) -> None:
 
 def _render_sources_tab(st) -> None:
     st.subheader("Source preparation")
-    source_text = st.text_area(
-        "Local directories/files or public GitHub URLs",
-        placeholder="C:\\path\\to\\project\nhttps://github.com/user/repo",
+
+    source_type = st.radio(
+        "Source type",
+        ["Local directory", "GitHub repo", "HuggingFace model/dataset"],
     )
-    allow_github = st.checkbox("Allow public GitHub fetch")
+
+    # Adaptive input field
+    if source_type == "Local directory":
+        source_text = st.text_input("Local path", placeholder="C:\\path\\to\\project")
+    elif source_type == "GitHub repo":
+        source_text = st.text_input("GitHub URL", placeholder="https://github.com/user/repo")
+    else:
+        source_text = st.text_input("HuggingFace URL", placeholder="hf:owner/model or https://huggingface.co/owner/model")
+
+    allow_network = False
+    if source_type in ("GitHub repo", "HuggingFace model/dataset"):
+        allow_network = st.checkbox(f"Allow {source_type.split()[0].lower()} fetch")
+
+    # Prepare sources
     if st.button("Prepare sources"):
-        sources = source_text.splitlines()
-        try:
-            prepared = prepare_sources_for_app(sources, allow_github_fetch=allow_github)
-        except Exception as exc:
-            st.error(str(exc))
-            return
-        if prepared:
-            st.success(f"Prepared {len(prepared)} files under data/raw.")
-            st.dataframe(pd.DataFrame({"file": [path.as_posix() for path in prepared]}), use_container_width=True)
-        else:
+        if not source_text or not source_text.strip():
             st.warning("No sources were provided.")
+        else:
+            sources = [source_text.strip()]
+            try:
+                if source_type == "HuggingFace model/dataset":
+                    prepared = prepare_sources_for_app(
+                        sources, allow_github_fetch=False, allow_huggingface_fetch=allow_network,
+                    )
+                elif source_type == "GitHub repo":
+                    prepared = prepare_sources_for_app(sources, allow_github_fetch=allow_network)
+                else:
+                    prepared = prepare_sources_for_app(sources, allow_github_fetch=False, allow_huggingface_fetch=False)
+            except Exception as exc:
+                st.error(str(exc))
+                return
+            if prepared:
+                st.success(f"Prepared {len(prepared)} files under data/raw.")
+                st.session_state["prepared_files"] = prepared
+                st.dataframe(
+                    pd.DataFrame({"file": [path.as_posix() for path in prepared]}),
+                    use_container_width=True,
+                )
+            else:
+                st.warning("No sources were provided.")
+
+    # Build Index button — available when files exist in data/raw/
+    has_prepared = "prepared_files" in st.session_state or _has_raw_source_files()
+    if has_prepared:
+        current_source = load_current_source()
+        if current_source is not None:
+            st.info(f"Current index: {current_source.get('source_slug', 'unknown')}")
+
+        if st.button("Build Index"):
+            if not _has_raw_source_files():
+                st.error("No source files found in data/raw/. Prepare a source first.")
+            elif os.getenv("ALLOW_INDEX_BUILD") != "1":
+                st.error(
+                    "Index build requires the ALLOW_INDEX_BUILD=1 environment variable. "
+                    "Set it and restart the app."
+                )
+            else:
+                progress = st.progress(0.0, "Building index...")
+                try:
+                    nodes = run_build_index()
+                    progress.progress(1.0)
+                    current = load_current_source()
+                    slug = current.get("source_slug", "unknown") if current else "unknown"
+                    st.success(f"Index built successfully. {len(nodes)} chunks for source '{slug}'.")
+                except Exception as exc:
+                    st.error(f"Index build failed: {exc}")
 
 
 def _chat_history(st) -> list[dict[str, Any]]:
@@ -323,6 +511,15 @@ def _render_chat_message(st, message: dict[str, Any]) -> None:
 
 
 def _render_query_tab(st) -> None:
+    current_source = load_current_source()
+    chroma_exists = CHROMA_DIR.exists()
+
+    if current_source is None or not chroma_exists:
+        st.warning(
+            "No source is indexed yet. Go to the Sources tab to prepare and index a source. "
+            "Query will fall back to lexical-only search with degraded quality."
+        )
+
     strategy = st.selectbox("Strategy", STRATEGIES, index=STRATEGIES.index("hybrid_rerank"))
 
     messages = _chat_history(st)
@@ -344,6 +541,8 @@ def _render_query_tab(st) -> None:
         st.error(str(exc))
         return
 
+    log_query(prompt.strip(), strategy, result)
+
     assistant_message = {
         "role": "assistant",
         "content": result.get("answer", ""),
@@ -355,10 +554,49 @@ def _render_query_tab(st) -> None:
 
 
 def _render_eval_tab(st) -> None:
+    current_source = load_current_source()
     summary = load_eval_summary()
     per_question = load_per_question()
     cards = metric_card_values(summary)
     backends = eval_backend_counts(summary, per_question)
+
+    # Warning: no source indexed
+    if current_source is None:
+        st.warning("No source is indexed yet. Go to the Sources tab to prepare and index a source before running evaluation.")
+
+    # Warning: stale golden dataset
+    if current_source is not None and is_golden_dataset_stale(current_source):
+        st.warning(
+            f"The golden dataset was generated for a different source than the currently indexed one "
+            f"('{current_source.get('source_slug', '?')}'). Click 'Run Evaluation' to regenerate."
+        )
+
+    # Source info header
+    if current_source is not None:
+        slug = current_source.get("source_slug", "unknown")
+        indexed_at = current_source.get("indexed_at", "unknown")
+        st.info(f"Evaluated on: {slug} | Indexed: {indexed_at}")
+
+    # Show evaluated_source from CSV if available
+    if not summary.empty and "evaluated_source" in summary.columns:
+        evaluated_source = summary["evaluated_source"].iloc[0]
+        if evaluated_source:
+            question_count = dataset_stats().get("golden_questions", 0)
+            eval_date = last_eval_date()
+            st.caption(f"Last eval: {evaluated_source} | {question_count} questions | {eval_date}")
+
+    # Run Evaluation button
+    if st.button("Run Evaluation"):
+        if current_source is None:
+            st.error("Cannot run evaluation: no source is indexed. Go to the Sources tab first.")
+        else:
+            with st.spinner("Running evaluation... This may take a minute."):
+                try:
+                    run_evaluation_inline()
+                    st.success("Evaluation complete. Refreshing...")
+                    st.rerun()
+                except Exception as exc:
+                    st.error(f"Evaluation failed: {exc}")
 
     st.subheader("Evaluation summary")
     card_columns = st.columns(4)

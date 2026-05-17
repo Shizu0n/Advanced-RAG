@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -52,6 +53,110 @@ class IngestionTests(unittest.TestCase):
 
             self.assertEqual(files, [raw_dir / "doc.txt"])
             download.assert_called_once()
+
+
+class CurrentSourceTests(unittest.TestCase):
+    def test_write_current_source_creates_correct_json(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "my-repo"
+            raw_dir.mkdir(parents=True)
+            source_path = Path(tmpdir) / "current_source.json"
+
+            with patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path):
+                ingestion.write_current_source(raw_dir=raw_dir, file_count=5, chunk_count=42, source_input="https://example.com/repo")
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_input"], "https://example.com/repo")
+            self.assertEqual(data["source_type"], "local")
+            self.assertEqual(data["source_slug"], "my-repo")
+            self.assertEqual(data["file_count"], 5)
+            self.assertEqual(data["chunk_count"], 42)
+            self.assertIn("indexed_at", data)
+
+    def test_write_current_source_detects_huggingface_type(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "huggingface-meta-llama"
+            raw_dir.mkdir(parents=True)
+            source_path = Path(tmpdir) / "current_source.json"
+
+            with patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path):
+                ingestion.write_current_source(raw_dir=raw_dir, file_count=1, chunk_count=10)
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_type"], "huggingface")
+            self.assertEqual(data["source_slug"], "huggingface-meta-llama")
+
+    def test_write_current_source_detects_github_type(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "github-owner-repo"
+            raw_dir.mkdir(parents=True)
+            source_path = Path(tmpdir) / "current_source.json"
+
+            with patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path):
+                ingestion.write_current_source(raw_dir=raw_dir, file_count=3, chunk_count=20)
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_type"], "github")
+            self.assertEqual(data["source_slug"], "github-owner-repo")
+
+    def test_write_current_source_defaults_to_local_type(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "my-project"
+            raw_dir.mkdir(parents=True)
+            source_path = Path(tmpdir) / "current_source.json"
+
+            with patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path):
+                ingestion.write_current_source(raw_dir=raw_dir, file_count=2, chunk_count=15)
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_type"], "local")
+
+    def test_load_current_source_reads_json(self):
+        with TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "current_source.json"
+            expected = {"source_slug": "test-repo", "source_type": "local", "file_count": 3}
+            source_path.write_text(json.dumps(expected), encoding="utf-8")
+
+            with patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path):
+                result = ingestion.load_current_source()
+
+            self.assertEqual(result["source_slug"], "test-repo")
+            self.assertEqual(result["source_type"], "local")
+            self.assertEqual(result["file_count"], 3)
+
+    def test_load_current_source_returns_none_when_missing(self):
+        with TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "nonexistent.json"
+
+            with patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path):
+                result = ingestion.load_current_source()
+
+            self.assertIsNone(result)
+
+    def test_build_index_writes_current_source_json(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "test-repo"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "readme.md").write_text("# Hello\nThis is a test document with real content.", encoding="utf-8")
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_dir = Path(tmpdir) / "chroma_db"
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding") as mock_embed,
+                patch.object(ingestion, "chromadb"),
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_index.return_value = "fake_index"
+                index, nodes = ingestion.build_index(raw_dir=raw_dir)
+
+            self.assertTrue(source_path.exists())
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_slug"], "test-repo")
+            self.assertEqual(data["source_type"], "local")
+            self.assertGreaterEqual(data["file_count"], 1)
+            self.assertGreaterEqual(data["chunk_count"], 1)
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import json
 import unittest
 import os
 from pathlib import Path
@@ -22,6 +23,57 @@ class FakeContext:
         return False
 
 
+class FakeStreamlitColumn:
+    def __init__(self, parent):
+        self._parent = parent
+
+    def metric(self, label, value):
+        self._parent.events.append(("metric", label, value))
+
+    def write(self, value):
+        self._parent.events.append(("write", value))
+
+
+class FakeProgressBar:
+    def __init__(self, parent):
+        self._parent = parent
+
+    def update(self, value):
+        self._parent.events.append(("progress_update", value))
+
+    def progress(self, value):
+        self._parent.events.append(("progress_update", value))
+
+
+class FakeSidebar:
+    def __init__(self, parent):
+        self._parent = parent
+
+    def success(self, value):
+        self._parent.events.append(("sidebar_success", value))
+
+    def warning(self, value):
+        self._parent.events.append(("sidebar_warning", value))
+
+    def error(self, value):
+        self._parent.events.append(("sidebar_error", value))
+
+    def caption(self, value):
+        self._parent.events.append(("sidebar_caption", value))
+
+    def header(self, value):
+        self._parent.events.append(("sidebar_header", value))
+
+    def write(self, value):
+        self._parent.events.append(("sidebar_write", value))
+
+    def json(self, value):
+        self._parent.events.append(("sidebar_json", value))
+
+    def download_button(self, label, **kwargs):
+        self._parent.events.append(("sidebar_download_button", label))
+
+
 class FakeStreamlit:
     def __init__(self, prompt=None, messages=None):
         self.session_state = {}
@@ -29,10 +81,28 @@ class FakeStreamlit:
             self.session_state[app.CHAT_MESSAGES_KEY] = messages
         self.prompt = prompt
         self.events = []
+        self.sidebar = FakeSidebar(self)
 
     def selectbox(self, label, options, index=0):
         self.events.append(("selectbox", label, options[index]))
         return options[index]
+
+    def radio(self, label, options, index=0):
+        value = self._radio_value if hasattr(self, "_radio_value") else options[index]
+        self.events.append(("radio", label, value))
+        return value
+
+    def text_input(self, label, placeholder=""):
+        self.events.append(("text_input", label, placeholder))
+        return self._text_input_value if hasattr(self, "_text_input_value") else ""
+
+    def text_area(self, label, placeholder=""):
+        self.events.append(("text_area", label))
+        return self._text_area_value if hasattr(self, "_text_area_value") else ""
+
+    def checkbox(self, label, value=False):
+        self.events.append(("checkbox", label))
+        return self._checkbox_value if hasattr(self, "_checkbox_value") else value
 
     def chat_input(self, label):
         self.events.append(("chat_input", label))
@@ -59,6 +129,48 @@ class FakeStreamlit:
     def error(self, value):
         self.events.append(("error", value))
 
+    def info(self, value):
+        self.events.append(("info", value))
+
+    def warning(self, value):
+        self.events.append(("warning", value))
+
+    def success(self, value):
+        self.events.append(("success", value))
+
+    def button(self, label):
+        self.events.append(("button", label))
+        return self._button_return if hasattr(self, "_button_return") else False
+
+    def spinner(self, label):
+        return FakeContext()
+
+    def progress(self, value=0.0, label=None):
+        self.events.append(("progress", value))
+        return FakeProgressBar(self)
+
+    def rerun(self):
+        self.events.append(("rerun",))
+
+    def metric(self, label, value):
+        self.events.append(("metric", label, value))
+
+    def subheader(self, value):
+        self.events.append(("subheader", value))
+
+    def slider(self, label, min_value=0.0, max_value=1.0, value=0.5, step=0.05):
+        self.events.append(("slider", label))
+        return value
+
+    def columns(self, n):
+        return [FakeStreamlitColumn(self) for _ in range(n)]
+
+    def pyplot(self, fig):
+        self.events.append(("pyplot",))
+
+    def tabs(self, labels):
+        return [FakeContext() for _ in labels]
+
 
 class AppHelperTests(unittest.TestCase):
     def test_load_eval_summary_reads_expected_metric_columns(self):
@@ -75,7 +187,7 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(frame.loc[0, "strategy"], "semantic_only")
         self.assertEqual(frame.loc[0, "faithfulness"], 0.1)
         self.assertEqual(frame.loc[0, "summary_backend"], "gemini_free_tier_ragas")
-        self.assertEqual(list(frame.columns), ["strategy", *app.METRICS, "summary_backend"])
+        self.assertEqual(list(frame.columns), ["strategy", *app.METRICS, "summary_backend", "evaluated_source"])
 
     def test_load_per_question_handles_empty_csv_file(self):
         with TemporaryDirectory() as tmpdir:
@@ -234,7 +346,7 @@ class AppHelperTests(unittest.TestCase):
             files = app.prepare_sources_for_app(["https://github.com/user/repo"], allow_github_fetch=True)
 
         self.assertEqual(files, [Path("data/raw/repo/a.py")])
-        prepare.assert_called_once_with(["https://github.com/user/repo"], allow_github_fetch=True)
+        prepare.assert_called_once_with(["https://github.com/user/repo"], allow_github_fetch=True, allow_huggingface_fetch=False)
 
     def test_eval_backend_counts_summarize_summary_and_question_backends(self):
         summary = pd.DataFrame(
@@ -271,6 +383,380 @@ class AppHelperTests(unittest.TestCase):
                 os.chdir(old_cwd)
 
         self.assertNotIn("wrong", frame["strategy"].tolist())
+
+    def test_load_eval_summary_includes_evaluated_source_column(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ragas_results.csv"
+            path.write_text(
+                "strategy,faithfulness,answer_relevancy,context_recall,context_precision,summary_backend,evaluated_source\n"
+                "semantic_only,0.1,0.2,0.3,0.4,offline_heuristic,my-repo\n",
+                encoding="utf-8",
+            )
+
+            frame = app.load_eval_summary(path)
+
+        self.assertIn("evaluated_source", frame.columns)
+        self.assertEqual(frame.loc[0, "evaluated_source"], "my-repo")
+
+    def test_load_eval_summary_adds_empty_evaluated_source_when_missing(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ragas_results.csv"
+            path.write_text(
+                "strategy,faithfulness,answer_relevancy,context_recall,context_precision,summary_backend\n"
+                "semantic_only,0.1,0.2,0.3,0.4,offline_heuristic\n",
+                encoding="utf-8",
+            )
+
+            frame = app.load_eval_summary(path)
+
+        self.assertIn("evaluated_source", frame.columns)
+        self.assertEqual(frame.loc[0, "evaluated_source"], "")
+
+    def test_load_current_source_returns_dict_when_file_exists(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "current_source.json"
+            path.write_text(
+                json.dumps({"source_slug": "test-repo", "source_type": "local", "indexed_at": "2025-01-01"}),
+                encoding="utf-8",
+            )
+
+            result = app.load_current_source(path)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["source_slug"], "test-repo")
+
+    def test_load_current_source_returns_none_when_missing(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "nonexistent.json"
+            self.assertIsNone(app.load_current_source(path))
+
+    def test_is_golden_dataset_stale_returns_true_for_different_source(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(
+                json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d", "source_slug": "old-repo"}]),
+                encoding="utf-8",
+            )
+            current = {"source_slug": "new-repo"}
+
+            self.assertTrue(app.is_golden_dataset_stale(current, golden_path))
+
+    def test_is_golden_dataset_stale_returns_false_for_same_source(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(
+                json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d", "source_slug": "same-repo"}]),
+                encoding="utf-8",
+            )
+            current = {"source_slug": "same-repo"}
+
+            self.assertFalse(app.is_golden_dataset_stale(current, golden_path))
+
+    def test_is_golden_dataset_stale_returns_false_when_no_golden_dataset(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "nonexistent.json"
+            current = {"source_slug": "repo"}
+
+            self.assertFalse(app.is_golden_dataset_stale(current, golden_path))
+
+    def test_is_golden_dataset_stale_returns_false_when_no_current_source(self):
+        self.assertFalse(app.is_golden_dataset_stale(None))
+
+
+class EvalTabTests(unittest.TestCase):
+    def _render_eval_tab_with_stubs(self, current_source=None, golden_path=None, results_path=None):
+        """Helper to render the eval tab with controlled file paths."""
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.load_current_source", return_value=current_source),
+            patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
+            patch("app.last_eval_date", return_value="2025-01-15 10:00"),
+            patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+        ):
+            app._render_eval_tab(fake_st)
+        return fake_st
+
+    def test_eval_tab_shows_warning_when_no_source_indexed(self):
+        fake_st = self._render_eval_tab_with_stubs(current_source=None)
+
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("No source is indexed" in w for w in warnings))
+
+    def test_eval_tab_shows_source_info_when_current_source_exists(self):
+        current = {"source_slug": "my-repo", "source_type": "local", "indexed_at": "2025-01-01"}
+        fake_st = self._render_eval_tab_with_stubs(current_source=current)
+
+        infos = [event[1] for event in fake_st.events if event[0] == "info"]
+        self.assertTrue(any("my-repo" in i for i in infos))
+        self.assertTrue(any("2025-01-01" in i for i in infos))
+
+    def test_eval_tab_shows_warning_when_golden_dataset_is_stale(self):
+        fake_st = FakeStreamlit()
+        current = {"source_slug": "new-repo"}
+        with (
+            patch("app.load_current_source", return_value=current),
+            patch("app.is_golden_dataset_stale", return_value=True),
+            patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
+            patch("app.last_eval_date", return_value="2025-01-15 10:00"),
+            patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+        ):
+            app._render_eval_tab(fake_st)
+
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("golden dataset" in w.lower() for w in warnings))
+
+    def test_eval_tab_shows_run_evaluation_button(self):
+        fake_st = self._render_eval_tab_with_stubs(current_source={"source_slug": "repo"})
+
+        buttons = [event[1] for event in fake_st.events if event[0] == "button"]
+        self.assertIn("Run Evaluation", buttons)
+
+
+class SourceBadgeTests(unittest.TestCase):
+    def test_get_source_badge_state_green_when_indexed(self):
+        with TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_path = Path(tmpdir) / "chroma_db"
+            raw_path = Path(tmpdir) / "data" / "raw"
+            source_path.write_text("{}", encoding="utf-8")
+            chroma_path.mkdir()
+            raw_path.mkdir(parents=True)
+            (raw_path / "file.py").write_text("content", encoding="utf-8")
+
+            result = app.get_source_badge_state(source_path, chroma_path, raw_path)
+
+        self.assertEqual(result, "green")
+
+    def test_get_source_badge_state_yellow_when_prepared_only(self):
+        with TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "missing.json"
+            chroma_path = Path(tmpdir) / "no_chroma"
+            raw_path = Path(tmpdir) / "data" / "raw"
+            raw_path.mkdir(parents=True)
+            (raw_path / "file.py").write_text("content", encoding="utf-8")
+
+            result = app.get_source_badge_state(source_path, chroma_path, raw_path)
+
+        self.assertEqual(result, "yellow")
+
+    def test_get_source_badge_state_grey_when_nothing(self):
+        with TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "missing.json"
+            chroma_path = Path(tmpdir) / "no_chroma"
+            raw_path = Path(tmpdir) / "empty_raw"
+
+            result = app.get_source_badge_state(source_path, chroma_path, raw_path)
+
+        self.assertEqual(result, "grey")
+
+    def test_get_source_badge_state_yellow_when_chroma_missing_but_source_file_exists(self):
+        with TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_path = Path(tmpdir) / "no_chroma"
+            raw_path = Path(tmpdir) / "data" / "raw"
+            source_path.write_text("{}", encoding="utf-8")
+            raw_path.mkdir(parents=True)
+            (raw_path / "file.py").write_text("content", encoding="utf-8")
+
+            result = app.get_source_badge_state(source_path, chroma_path, raw_path)
+
+        self.assertEqual(result, "yellow")
+
+
+class SourcesTabTests(unittest.TestCase):
+    def test_source_type_radio_renders_options(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=False),
+        ):
+            app._render_sources_tab(fake_st)
+
+        radio_events = [event for event in fake_st.events if event[0] == "radio"]
+        self.assertEqual(len(radio_events), 1)
+        self.assertEqual(radio_events[0][1], "Source type")
+        self.assertEqual(radio_events[0][2], "Local directory")
+
+    def test_input_field_adapts_to_source_type(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=False),
+        ):
+            app._render_sources_tab(fake_st)
+
+        text_inputs = [event for event in fake_st.events if event[0] == "text_input"]
+        self.assertEqual(len(text_inputs), 1)
+        self.assertEqual(text_inputs[0][1], "Local path")
+        self.assertIn("path", text_inputs[0][2].lower())
+
+    def test_build_index_button_appears_when_source_prepared(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+            patch("app.load_current_source", return_value={"source_slug": "test-repo"}),
+        ):
+            app._render_sources_tab(fake_st)
+
+        buttons = [event[1] for event in fake_st.events if event[0] == "button"]
+        self.assertIn("Build Index", buttons)
+
+    def test_build_index_button_hidden_when_no_raw_files(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=False),
+        ):
+            app._render_sources_tab(fake_st)
+
+        buttons = [event[1] for event in fake_st.events if event[0] == "button"]
+        self.assertNotIn("Build Index", buttons)
+
+    def test_build_index_button_builds_index_on_click(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return = True
+        nodes = [{"text": "chunk 1"}, {"text": "chunk 2"}]
+
+        def _mock_getenv(key, default=None):
+            if key == "ALLOW_INDEX_BUILD":
+                return "1"
+            return os.environ.get(key, default)
+
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+            patch("app.load_current_source", return_value={"source_slug": "test-repo"}),
+            patch("os.getenv", side_effect=_mock_getenv),
+            patch("app.run_build_index", return_value=nodes),
+        ):
+            app._render_sources_tab(fake_st)
+
+        progress_events = [event for event in fake_st.events if event[0] == "progress"]
+        self.assertTrue(len(progress_events) > 0)
+
+        success_events = [event[1] for event in fake_st.events if event[0] == "success"]
+        self.assertTrue(any("2 chunks" in s for s in success_events))
+        self.assertTrue(any("test-repo" in s for s in success_events))
+
+    def test_build_index_requires_allow_index_build_env(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return = True
+
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+            patch("app.load_current_source", return_value=None),
+            patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "0"}),
+        ):
+            app._render_sources_tab(fake_st)
+
+        errors = [event[1] for event in fake_st.events if event[0] == "error"]
+        self.assertTrue(any("ALLOW_INDEX_BUILD" in e for e in errors))
+
+    def test_prepare_sources_passes_huggingface_flag(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return = True
+        fake_st._radio_value = "HuggingFace model/dataset"
+        fake_st._text_input_value = "hf:owner/model"
+
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]) as mock_prepare,
+            patch("app._has_raw_source_files", return_value=False),
+        ):
+            app._render_sources_tab(fake_st)
+
+        mock_prepare.assert_called_once_with(
+            ["hf:owner/model"], allow_github_fetch=False, allow_huggingface_fetch=False,
+        )
+
+    def test_sidebar_shows_green_badge_when_indexed(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.load_current_source", return_value={"source_slug": "test-repo", "indexed_at": "2025-01-01"}),
+            patch("app.get_source_badge_state", return_value="green"),
+            patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
+            patch("app.last_eval_date", return_value="2025-01-15 10:00"),
+        ):
+            app._render_sidebar(fake_st)
+
+        sidebar_successes = [event[1] for event in fake_st.events if event[0] == "sidebar_success"]
+        self.assertTrue(any("test-repo" in s for s in sidebar_successes))
+
+    def test_sidebar_shows_yellow_badge_when_prepared(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.load_current_source", return_value=None),
+            patch("app.get_source_badge_state", return_value="yellow"),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+        ):
+            app._render_sidebar(fake_st)
+
+        sidebar_warnings = [event[1] for event in fake_st.events if event[0] == "sidebar_warning"]
+        self.assertTrue(any("prepared" in w.lower() for w in sidebar_warnings))
+
+    def test_sidebar_shows_grey_badge_when_no_source(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.load_current_source", return_value=None),
+            patch("app.get_source_badge_state", return_value="grey"),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+        ):
+            app._render_sidebar(fake_st)
+
+        sidebar_errors = [event[1] for event in fake_st.events if event[0] == "sidebar_error"]
+        self.assertTrue(any("no source" in e.lower() for e in sidebar_errors))
+
+
+class QueryTabWarningTests(unittest.TestCase):
+    def test_query_tab_shows_warning_when_no_source_indexed(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.load_current_source", return_value=None),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = False
+            app._render_query_tab(fake_st)
+
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("No source is indexed" in w for w in warnings))
+
+    def test_query_tab_no_warning_when_source_is_indexed(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.load_current_source", return_value={"source_slug": "repo"}),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = True
+            app._render_query_tab(fake_st)
+
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertFalse(any("No source is indexed" in w for w in warnings))
+
+    def test_query_tab_still_renders_strategy_selectbox_with_warning(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.load_current_source", return_value=None),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = False
+            app._render_query_tab(fake_st)
+
+        selectboxes = [event for event in fake_st.events if event[0] == "selectbox"]
+        self.assertTrue(len(selectboxes) >= 1)
+        self.assertEqual(selectboxes[0][1], "Strategy")
 
 
 if __name__ == "__main__":

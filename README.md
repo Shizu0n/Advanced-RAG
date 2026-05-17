@@ -73,7 +73,7 @@ flowchart LR
 
 ```bash
 # Clone and install
-git clone <repo-url> && cd Advanced-RAG
+git clone https://github.com/Shizu0n/Advanced-RAG && cd Advanced-RAG
 pip install -r requirements.txt
 
 # Configure (optional — works offline without any keys)

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 import os
 import re
 from dataclasses import dataclass
@@ -21,8 +24,58 @@ EVAL_DIR = PROJECT_ROOT / "data" / "eval"
 GOLDEN_DATASET_PATH = EVAL_DIR / "golden_dataset.json"
 RAGAS_RESULTS_PATH = EVAL_DIR / "ragas_results.csv"
 RAGAS_PER_QUESTION_PATH = EVAL_DIR / "ragas_per_question.csv"
+CURRENT_SOURCE_PATH = PROJECT_ROOT / "data" / "current_source.json"
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 REQUIRED_GOLDEN_FIELDS = {"question", "ground_truth", "reference_context", "source_doc"}
+
+
+def load_current_source() -> dict | None:
+    """Load data/current_source.json; return None if missing or malformed."""
+    if not CURRENT_SOURCE_PATH.exists():
+        return None
+    try:
+        return json.loads(CURRENT_SOURCE_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def invalidate_golden_dataset_if_stale() -> bool:
+    """Delete golden dataset and RAGAS results if they were generated for a different source.
+
+    Returns True if invalidation happened.
+    """
+    current = load_current_source()
+    if current is None:
+        return False
+
+    if not GOLDEN_DATASET_PATH.exists():
+        return False
+
+    try:
+        golden = json.loads(GOLDEN_DATASET_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return False
+
+    if not isinstance(golden, list) or not golden:
+        return False
+
+    first_item = golden[0]
+    if not isinstance(first_item, dict):
+        return False
+
+    golden_slug = first_item.get("source_slug")
+    if golden_slug is None:
+        # Golden dataset predates source tracking; leave it alone.
+        return False
+
+    if golden_slug == current.get("source_slug"):
+        return False
+
+    # Source changed -- invalidate stale eval artifacts.
+    for path in [GOLDEN_DATASET_PATH, RAGAS_RESULTS_PATH, RAGAS_PER_QUESTION_PATH]:
+        if path.exists():
+            path.unlink()
+    return True
 
 
 class QuestionProvider(Protocol):
@@ -133,15 +186,18 @@ def _specificity_score(item: dict[str, str]) -> tuple[int, int]:
 
 def filter_best_golden_items(candidates: Sequence[dict[str, str]], limit: int = 30) -> list[dict[str, str]]:
     ranked = sorted(candidates, key=_specificity_score, reverse=True)
-    return [
-        {
+    filtered: list[dict[str, str]] = []
+    for item in ranked[:limit]:
+        entry: dict[str, str] = {
             "question": item["question"],
             "ground_truth": item["ground_truth"],
             "reference_context": item["reference_context"],
             "source_doc": item["source_doc"],
         }
-        for item in ranked[:limit]
-    ]
+        if "source_slug" in item:
+            entry["source_slug"] = item["source_slug"]
+        filtered.append(entry)
+    return filtered
 
 
 def generate_golden_dataset(
@@ -152,11 +208,23 @@ def generate_golden_dataset(
     final_limit: int = 30,
 ) -> list[dict[str, str]]:
     providers = list(providers or default_question_providers())
-    candidates = [generate_golden_item(node, providers) for node in list(nodes)[:chunk_limit]]
+    current_source = load_current_source()
+    source_slug = current_source.get("source_slug", "") if current_source else ""
+
+    candidates = []
+    for node in list(nodes)[:chunk_limit]:
+        item = generate_golden_item(node, providers)
+        if source_slug:
+            item["source_slug"] = source_slug
+        candidates.append(item)
+
     dataset = filter_best_golden_items(candidates, limit=final_limit)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(dataset, indent=2, ensure_ascii=False), encoding="utf-8")
     return dataset
+
+
+OPTIONAL_GOLDEN_FIELDS = {"source_slug"}
 
 
 def validate_golden_dataset(dataset: Any) -> list[dict[str, str]]:
@@ -178,9 +246,36 @@ def validate_golden_dataset(dataset: Any) -> list[dict[str, str]]:
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"Golden dataset record {index} field {field} must be a non-empty string.")
             cleaned[field] = value.strip()
+        for field in OPTIONAL_GOLDEN_FIELDS:
+            if field in item and isinstance(item[field], str) and item[field].strip():
+                cleaned[field] = item[field].strip()
         validated.append(cleaned)
 
     return validated
+
+
+def load_golden_dataset_metadata(path: Path = GOLDEN_DATASET_PATH) -> dict[str, str] | None:
+    """Return source_slug and generation date from golden dataset without loading all items.
+
+    Returns None if dataset is missing, empty, or lacks source_slug.
+    """
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    first = data[0]
+    if not isinstance(first, dict):
+        return None
+    source_slug = first.get("source_slug")
+    if not source_slug:
+        return None
+    mtime = path.stat().st_mtime
+    generation_date = pd.Timestamp(mtime, unit="s").strftime("%Y-%m-%d %H:%M")
+    return {"source_slug": source_slug, "generation_date": generation_date, "question_count": str(len(data))}
 
 
 def load_golden_dataset(path: Path = GOLDEN_DATASET_PATH) -> list[dict[str, str]]:
@@ -294,7 +389,9 @@ def run_evaluation(
     pipeline: LocalRAGPipeline | None = None,
     gemini_client: gemini_ragas.GeminiFreeTierClient | None = None,
 ) -> dict[str, dict[str, float]]:
+    logger.info("run_evaluation: loading golden dataset from %s", golden_path)
     dataset = load_golden_dataset(golden_path)
+    logger.info("run_evaluation: %d golden items, %d strategies", len(dataset), len(STRATEGIES))
     pipeline = pipeline or LocalRAGPipeline()
     if _real_ragas_enabled() and gemini_client is None:
         gemini_client = gemini_ragas.client_from_config(gemini_ragas.config_from_env())
@@ -303,6 +400,7 @@ def run_evaluation(
     detail_rows: list[dict[str, Any]] = []
 
     for strategy in STRATEGIES:
+        logger.info("Evaluating strategy: %s", strategy)
         summary, rows = evaluate_strategy(dataset, strategy, pipeline)
         real_scores = maybe_run_real_ragas(rows, gemini_client=gemini_client)
         summary_backend = "gemini_free_tier_ragas" if real_scores else "offline_heuristic"
@@ -311,10 +409,14 @@ def run_evaluation(
         summaries[strategy] = real_scores or summary
         summary_backends[strategy] = summary_backend
         detail_rows.extend(rows)
+        logger.info("Strategy %s: %s (backend=%s)", strategy, summary, summary_backend)
 
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
+    current_source = load_current_source()
+    evaluated_source = current_source.get("source_slug", "") if current_source else ""
     summary_frame = pd.DataFrame.from_dict(summaries, orient="index")
     summary_frame["summary_backend"] = pd.Series(summary_backends)
+    summary_frame["evaluated_source"] = evaluated_source
     summary_frame.to_csv(RAGAS_RESULTS_PATH, index_label="strategy")
     pd.DataFrame(detail_rows).to_csv(RAGAS_PER_QUESTION_PATH, index=False)
     print_markdown_report(summaries)
@@ -358,6 +460,7 @@ def main() -> None:
     gemini_client = (
         gemini_ragas.client_from_config(gemini_ragas.config_from_env()) if _real_ragas_enabled() else None
     )
+    invalidate_golden_dataset_if_stale()
     try:
         load_golden_dataset(GOLDEN_DATASET_PATH)
     except (FileNotFoundError, json.JSONDecodeError, ValueError):

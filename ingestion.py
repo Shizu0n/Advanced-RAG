@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import re
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 from urllib.parse import urljoin, urlparse
@@ -74,6 +76,49 @@ IGNORED_DIR_NAMES = {
     "venv",
     "__pycache__",
 }
+
+CURRENT_SOURCE_PATH = Path("data/current_source.json")
+
+
+def _detect_source_type(raw_dir: Path) -> str:
+    """Inspect files in raw_dir to detect 'local', 'github', or 'huggingface'."""
+    dir_name = raw_dir.name.lower()
+    if "huggingface" in dir_name or "hf" in dir_name:
+        return "huggingface"
+    if "github" in dir_name or "gh" in dir_name:
+        return "github"
+    return "local"
+
+
+def _source_slug_from_raw(raw_dir: Path) -> str:
+    """Extract the slug from the raw_dir subdirectory name (first-level under data/raw/)."""
+    return raw_dir.name
+
+
+def write_current_source(
+    raw_dir: Path,
+    file_count: int,
+    chunk_count: int,
+    source_input: str = "",
+) -> None:
+    """Write data/current_source.json with metadata about the indexed source."""
+    data = {
+        "source_input": source_input,
+        "source_type": _detect_source_type(raw_dir),
+        "source_slug": _source_slug_from_raw(raw_dir),
+        "indexed_at": datetime.now(timezone.utc).isoformat(),
+        "file_count": file_count,
+        "chunk_count": chunk_count,
+    }
+    CURRENT_SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CURRENT_SOURCE_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_current_source() -> dict | None:
+    """Load data/current_source.json; return None if missing."""
+    if not CURRENT_SOURCE_PATH.exists():
+        return None
+    return json.loads(CURRENT_SOURCE_PATH.read_text(encoding="utf-8"))
 
 
 def _safe_filename(url: str) -> str:
@@ -181,12 +226,19 @@ def load_or_download_sources(raw_dir: Path = RAW_DIR, limit: int = PAGE_LIMIT) -
     return download_python_tutorial_pages(raw_dir=raw_dir, limit=limit)
 
 
-def build_index(source_files: Iterable[Path] | None = None) -> tuple[VectorStoreIndex, list]:
+def build_index(
+    source_files: Iterable[Path] | None = None,
+    raw_dir: Path = RAW_DIR,
+) -> tuple[VectorStoreIndex, list]:
     """Chunk source files, embed them locally, and persist vectors in ChromaDB."""
 
-    files = list(source_files) if source_files is not None else load_or_download_sources()
+    import logging
+    logger = logging.getLogger(__name__)
+
+    files = list(source_files) if source_files is not None else load_or_download_sources(raw_dir=raw_dir)
     if not files:
         raise RuntimeError("No source documents found in data/raw and download produced no files.")
+    logger.info("Building index from %d source files", len(files))
 
     documents = []
     for path in files:
@@ -220,9 +272,9 @@ def build_index(source_files: Iterable[Path] | None = None) -> tuple[VectorStore
     index = VectorStoreIndex(nodes, storage_context=storage_context, embed_model=embed_model)
     embedding_time = time.perf_counter() - start
 
-    print(f"total documents: {len(documents)}")
-    print(f"total chunks: {len(nodes)}")
-    print(f"embedding time: {embedding_time:.2f}s")
+    logger.info("Index built: %d documents, %d chunks, %.2fs embedding", len(documents), len(nodes), embedding_time)
+
+    write_current_source(raw_dir=raw_dir, file_count=len(documents), chunk_count=len(nodes))
 
     return index, nodes
 

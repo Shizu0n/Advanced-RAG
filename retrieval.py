@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import os
+
+logger = logging.getLogger(__name__)
 from collections import defaultdict
 from typing import Iterable, Sequence
 
@@ -140,15 +143,18 @@ class HybridRetriever:
         return sorted(reranked, key=lambda item: item.score or 0.0, reverse=True)[: self.top_k]
 
     def ablation_retrieve(self, query: str, strategy: str) -> tuple[list[NodeWithScore], dict]:
+        logger.info("ablation_retrieve: strategy=%s, query=%s", strategy, query[:80])
         vector_results: list[NodeWithScore] = []
         bm25_results: list[NodeWithScore] = []
         fused_results: list[NodeWithScore] = []
 
         if strategy in {"semantic_only", "hybrid_no_rerank", "hybrid_rerank"}:
             vector_results = self.vector_retriever.retrieve(query)[: self.vector_top_k]
+            logger.debug("vector retrieval: %d results", len(vector_results))
 
         if strategy in {"bm25_only", "hybrid_no_rerank", "hybrid_rerank"}:
             bm25_results = self.bm25_retriever.retrieve(query)[: self.bm25_top_k]
+            logger.debug("bm25 retrieval: %d results", len(bm25_results))
 
         if strategy == "semantic_only":
             results = vector_results[: self.top_k]

@@ -1,8 +1,8 @@
-llama-index-core==0.11.23
-llama-index-vector-stores-chroma==0.2.0
-llama-index-embeddings-huggingface==0.3.1
-llama-index-readers-file==0.2.2
-chromadb==0.5.15
+llama-index-core==0.14.22
+llama-index-vector-stores-chroma==0.5.5
+llama-index-embeddings-huggingface==0.7.0
+llama-index-readers-file==0.6.0
+chromadb>=0.5.17
 rank-bm25==0.2.2
 sentence-transformers==3.2.1
 streamlit==1.39.0

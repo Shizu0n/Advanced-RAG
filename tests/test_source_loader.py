@@ -3,7 +3,7 @@ import zipfile
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import source_loader
 
@@ -260,6 +260,234 @@ class SourceLoaderTests(unittest.TestCase):
             self.assertFalse((root / "package-lock.json").exists())
             self.assertFalse((root / "node_modules" / "pkg" / "index.js").exists())
             self.assertFalse((root / "assets" / "logo.png").exists())
+
+
+class HuggingFaceSourceLoaderTests(unittest.TestCase):
+    def test_is_huggingface_url_model_url(self):
+        self.assertTrue(source_loader._is_huggingface_url("https://huggingface.co/meta-llama/Llama-2-7b"))
+        self.assertTrue(source_loader._is_huggingface_url("http://huggingface.co/meta-llama/Llama-2-7b"))
+
+    def test_is_huggingface_url_dataset_url(self):
+        self.assertTrue(source_loader._is_huggingface_url("https://huggingface.co/datasets/squad/squad"))
+
+    def test_is_huggingface_url_shorthand(self):
+        self.assertTrue(source_loader._is_huggingface_url("hf:meta-llama/Llama-2-7b"))
+
+    def test_is_huggingface_url_rejects_github(self):
+        self.assertFalse(source_loader._is_huggingface_url("https://github.com/example/project"))
+
+    def test_is_huggingface_url_rejects_local_path(self):
+        self.assertFalse(source_loader._is_huggingface_url("/home/user/project"))
+        self.assertFalse(source_loader._is_huggingface_url("some-local-dir"))
+
+    def test_huggingface_owner_model_full_url(self):
+        owner, model_id = source_loader._huggingface_owner_model("https://huggingface.co/meta-llama/Llama-2-7b")
+        self.assertEqual(owner, "meta-llama")
+        self.assertEqual(model_id, "Llama-2-7b")
+
+    def test_huggingface_owner_model_dataset_url(self):
+        owner, model_id = source_loader._huggingface_owner_model("https://huggingface.co/datasets/squad/squad")
+        self.assertEqual(owner, "squad")
+        self.assertEqual(model_id, "squad")
+
+    def test_huggingface_owner_model_shorthand(self):
+        owner, model_id = source_loader._huggingface_owner_model("hf:meta-llama/Llama-2-7b")
+        self.assertEqual(owner, "meta-llama")
+        self.assertEqual(model_id, "Llama-2-7b")
+
+    def test_huggingface_owner_model_rejects_short_url(self):
+        with self.assertRaisesRegex(ValueError, "must include owner"):
+            source_loader._huggingface_owner_model("https://huggingface.co/only-owner")
+
+    def test_huggingface_owner_model_rejects_short_shorthand(self):
+        with self.assertRaisesRegex(ValueError, "must include owner"):
+            source_loader._huggingface_owner_model("hf:only-owner")
+
+    def test_huggingface_owner_model_rejects_empty_dataset_path(self):
+        with self.assertRaisesRegex(ValueError, "must include owner"):
+            source_loader._huggingface_owner_model("https://huggingface.co/datasets/only-owner")
+
+    def test_huggingface_target_name_slug(self):
+        self.assertEqual(source_loader._huggingface_target_name("meta-llama", "Llama-2-7b"), "meta-llama-Llama-2-7b")
+
+    def test_huggingface_target_name_special_chars(self):
+        result = source_loader._huggingface_target_name("my org", "my model v1.0")
+        self.assertEqual(result, "my-org-my-model-v1.0")
+
+    def test_huggingface_network_allowed_by_param(self):
+        self.assertTrue(source_loader._huggingface_network_allowed(True))
+        self.assertFalse(source_loader._huggingface_network_allowed(False))
+
+    def test_huggingface_network_allowed_by_env(self):
+        with patch.dict(os.environ, {"ALLOW_HF_FETCH": "1"}):
+            self.assertTrue(source_loader._huggingface_network_allowed(False))
+
+    def test_huggingface_network_allowed_env_other_value(self):
+        with patch.dict(os.environ, {"ALLOW_HF_FETCH": "yes"}):
+            self.assertFalse(source_loader._huggingface_network_allowed(False))
+
+    def test_fetch_huggingface_card_model(self):
+        with TemporaryDirectory() as tmpdir:
+            download_dir = Path(tmpdir)
+            fake_response = MagicMock()
+            fake_response.status_code = 200
+            fake_response.raise_for_status = MagicMock()
+            fake_response.content = b"# Model Card\nA model.\n"
+
+            with patch.object(source_loader.requests, "get", return_value=fake_response) as mock_get:
+                result = source_loader._fetch_huggingface_card(
+                    "https://huggingface.co/meta-llama/Llama-2-7b",
+                    download_dir,
+                )
+
+            mock_get.assert_called_once_with(
+                "https://huggingface.co/meta-llama/Llama-2-7b/resolve/main/README.md",
+                timeout=30,
+            )
+            self.assertEqual(result.name, "README.md")
+            self.assertEqual(result.read_bytes(), b"# Model Card\nA model.\n")
+            self.assertEqual(result.parent, download_dir)
+
+    def test_fetch_huggingface_card_dataset(self):
+        with TemporaryDirectory() as tmpdir:
+            download_dir = Path(tmpdir)
+            fake_response = MagicMock()
+            fake_response.status_code = 200
+            fake_response.raise_for_status = MagicMock()
+            fake_response.content = b"# Dataset Card\nA dataset.\n"
+
+            with patch.object(source_loader.requests, "get", return_value=fake_response) as mock_get:
+                result = source_loader._fetch_huggingface_card(
+                    "https://huggingface.co/datasets/squad/squad",
+                    download_dir,
+                )
+
+            mock_get.assert_called_once_with(
+                "https://huggingface.co/datasets/squad/squad/resolve/main/README.md",
+                timeout=30,
+            )
+            self.assertEqual(result.name, "README.md")
+            self.assertEqual(result.read_bytes(), b"# Dataset Card\nA dataset.\n")
+
+    def test_fetch_huggingface_card_shorthand(self):
+        with TemporaryDirectory() as tmpdir:
+            download_dir = Path(tmpdir)
+            fake_response = MagicMock()
+            fake_response.status_code = 200
+            fake_response.raise_for_status = MagicMock()
+            fake_response.content = b"# Model\nShorthand test.\n"
+
+            with patch.object(source_loader.requests, "get", return_value=fake_response) as mock_get:
+                result = source_loader._fetch_huggingface_card(
+                    "hf:meta-llama/Llama-2-7b",
+                    download_dir,
+                )
+
+            mock_get.assert_called_once_with(
+                "https://huggingface.co/meta-llama/Llama-2-7b/resolve/main/README.md",
+                timeout=30,
+            )
+            self.assertEqual(result.name, "README.md")
+
+    def test_fetch_huggingface_card_raises_on_http_error(self):
+        import requests as req
+
+        with TemporaryDirectory() as tmpdir:
+            download_dir = Path(tmpdir)
+            fake_response = MagicMock()
+            fake_response.raise_for_status.side_effect = req.HTTPError("404 Not Found")
+
+            with patch.object(source_loader.requests, "get", return_value=fake_response):
+                with self.assertRaises(req.HTTPError):
+                    source_loader._fetch_huggingface_card(
+                        "https://huggingface.co/nonexistent/model",
+                        download_dir,
+                    )
+
+    def test_prepare_sources_rejects_hf_url_without_opt_in(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            with self.assertRaisesRegex(RuntimeError, "allow_huggingface_fetch"):
+                source_loader.prepare_sources(
+                    ["https://huggingface.co/meta-llama/Llama-2-7b"],
+                    raw_dir=raw_dir,
+                    allow_huggingface_fetch=False,
+                )
+
+    def test_prepare_sources_rejects_hf_shorthand_without_opt_in(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            with self.assertRaisesRegex(RuntimeError, "allow_huggingface_fetch"):
+                source_loader.prepare_sources(
+                    ["hf:meta-llama/Llama-2-7b"],
+                    raw_dir=raw_dir,
+                )
+
+    def test_prepare_sources_copies_hf_card_to_raw_dir(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            raw_dir = base_dir / "raw"
+            fake_response = MagicMock()
+            fake_response.status_code = 200
+            fake_response.raise_for_status = MagicMock()
+            fake_response.content = b"# Model Card\n\nA great model.\n"
+
+            with patch.object(source_loader.requests, "get", return_value=fake_response):
+                files = source_loader.prepare_sources(
+                    ["https://huggingface.co/meta-llama/Llama-2-7b"],
+                    raw_dir=raw_dir,
+                    allow_huggingface_fetch=True,
+                )
+
+            self.assertEqual(len(files), 1)
+            relative = files[0].relative_to(raw_dir).as_posix()
+            self.assertEqual(relative, "meta-llama-Llama-2-7b/README.md")
+            self.assertEqual(files[0].read_text(encoding="utf-8"), "# Model Card\n\nA great model.\n")
+
+    def test_prepare_sources_copies_hf_card_via_env(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            raw_dir = base_dir / "raw"
+            fake_response = MagicMock()
+            fake_response.status_code = 200
+            fake_response.raise_for_status = MagicMock()
+            fake_response.content = b"# Card\n"
+
+            with patch.dict(os.environ, {"ALLOW_HF_FETCH": "1"}):
+                with patch.object(source_loader.requests, "get", return_value=fake_response):
+                    files = source_loader.prepare_sources(
+                        ["hf:meta-llama/Llama-2-7b"],
+                        raw_dir=raw_dir,
+                    )
+
+            self.assertEqual(len(files), 1)
+            relative = files[0].relative_to(raw_dir).as_posix()
+            self.assertEqual(relative, "meta-llama-Llama-2-7b/README.md")
+
+    def test_prepare_sources_hf_mixed_with_local(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            raw_dir = base_dir / "raw"
+            local_dir = base_dir / "project"
+            local_dir.mkdir()
+            (local_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+
+            fake_response = MagicMock()
+            fake_response.status_code = 200
+            fake_response.raise_for_status = MagicMock()
+            fake_response.content = b"# HF Card\n"
+
+            with patch.object(source_loader.requests, "get", return_value=fake_response):
+                files = source_loader.prepare_sources(
+                    [local_dir, "https://huggingface.co/meta-llama/Llama-2-7b"],
+                    raw_dir=raw_dir,
+                    allow_huggingface_fetch=True,
+                )
+
+            relative_paths = sorted(path.relative_to(raw_dir).as_posix() for path in files)
+            self.assertEqual(len(relative_paths), 2)
+            self.assertTrue(any("Llama-2-7b/README.md" in p for p in relative_paths))
+            self.assertTrue(any("app.py" in p for p in relative_paths))
 
 
 if __name__ == "__main__":

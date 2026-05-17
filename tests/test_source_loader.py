@@ -1,0 +1,266 @@
+import os
+import zipfile
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+import source_loader
+
+
+class SourceLoaderTests(unittest.TestCase):
+    def test_prepare_sources_copies_supported_files_from_local_directory(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            repo_dir = base_dir / "sample-repo"
+            raw_dir = base_dir / "raw"
+            (repo_dir / "src").mkdir(parents=True)
+            (repo_dir / "docs").mkdir()
+            (repo_dir / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (repo_dir / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            (repo_dir / "src" / "image.png").write_bytes(b"not text")
+
+            files = source_loader.prepare_sources([repo_dir], raw_dir=raw_dir)
+
+            relative_paths = sorted(path.relative_to(raw_dir).as_posix() for path in files)
+            target_root = Path(relative_paths[0]).parts[0]
+
+            self.assertRegex(target_root, r"^sample-repo-[0-9a-f]{12}$")
+            self.assertEqual(
+                relative_paths,
+                [f"{target_root}/docs/guide.md", f"{target_root}/src/app.py"],
+            )
+            self.assertEqual((raw_dir / target_root / "src" / "app.py").read_text(encoding="utf-8"), "print('ok')\n")
+
+    def test_prepare_sources_ignores_generated_and_private_directories(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            repo_dir = base_dir / "repo"
+            raw_dir = base_dir / "raw"
+            (repo_dir / "src").mkdir(parents=True)
+            (repo_dir / ".git").mkdir()
+            (repo_dir / "node_modules").mkdir()
+            (repo_dir / "__pycache__").mkdir()
+            (repo_dir / "src" / "main.ts").write_text("export const ok = true;\n", encoding="utf-8")
+            (repo_dir / "package-lock.json").write_text('{"name":"ignored"}\n', encoding="utf-8")
+            (repo_dir / "pnpm-lock.yaml").write_text("ignored: true\n", encoding="utf-8")
+            (repo_dir / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+            (repo_dir / "node_modules" / "pkg.js").write_text("ignored\n", encoding="utf-8")
+            (repo_dir / "__pycache__" / "cache.py").write_text("ignored\n", encoding="utf-8")
+
+            files = source_loader.prepare_sources([repo_dir], raw_dir=raw_dir)
+
+            relative_paths = sorted(path.relative_to(raw_dir).as_posix() for path in files)
+            target_root = Path(relative_paths[0]).parts[0]
+
+            self.assertEqual(relative_paths, [f"{target_root}/src/main.ts"])
+
+    def test_prepare_sources_skips_raw_dir_when_it_is_inside_source(self):
+        with TemporaryDirectory() as tmpdir:
+            project_dir = Path(tmpdir) / "project"
+            raw_dir = project_dir / "data" / "raw"
+            (project_dir / "src").mkdir(parents=True)
+            (raw_dir / "existing-output").mkdir(parents=True)
+            (project_dir / "src" / "app.py").write_text("print('source')\n", encoding="utf-8")
+            (raw_dir / "existing-output" / "old.md").write_text("# already prepared\n", encoding="utf-8")
+
+            files = source_loader.prepare_sources([project_dir], raw_dir=raw_dir)
+
+            relative_paths = sorted(path.relative_to(raw_dir).as_posix() for path in files)
+
+            self.assertEqual(len(relative_paths), 1)
+            self.assertTrue(relative_paths[0].endswith("/src/app.py"))
+            self.assertNotIn("existing-output/old.md", relative_paths)
+
+    def test_prepare_sources_keeps_same_basename_sources_separate(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            first = base_dir / "one" / "repo"
+            second = base_dir / "two" / "repo"
+            raw_dir = base_dir / "raw"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            (first / "README.md").write_text("# first\n", encoding="utf-8")
+            (second / "README.md").write_text("# second\n", encoding="utf-8")
+
+            files = source_loader.prepare_sources([first, second], raw_dir=raw_dir)
+
+            relative_paths = sorted(path.relative_to(raw_dir).as_posix() for path in files)
+            target_roots = sorted({Path(path).parts[0] for path in relative_paths})
+
+            self.assertEqual(len(target_roots), 2)
+            self.assertTrue(all(root.startswith("repo-") for root in target_roots))
+            self.assertEqual([Path(path).parts[-1] for path in relative_paths], ["README.md", "README.md"])
+
+    def test_prepare_sources_does_not_follow_symlinked_files(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            outside = base_dir / "outside"
+            repo_dir = base_dir / "repo"
+            raw_dir = base_dir / "raw"
+            outside.mkdir()
+            repo_dir.mkdir()
+            (outside / "secret.py").write_text("SECRET = True\n", encoding="utf-8")
+            link = repo_dir / "secret.py"
+
+            try:
+                link.symlink_to(outside / "secret.py")
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are unavailable in this environment")
+
+            files = source_loader.prepare_sources([repo_dir], raw_dir=raw_dir)
+
+            self.assertEqual(files, [])
+
+    def test_supported_file_rejects_symlinks(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            target = base_dir / "target.py"
+            link = base_dir / "link.py"
+            target.write_text("print('secret')\n", encoding="utf-8")
+            try:
+                link.symlink_to(target)
+            except (OSError, NotImplementedError):
+                self.skipTest("symlinks are unavailable in this environment")
+
+            self.assertFalse(source_loader._is_supported_file(link))
+
+    def test_prepare_sources_rejects_github_url_without_opt_in(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+
+            with self.assertRaisesRegex(RuntimeError, "allow_github_fetch"):
+                source_loader.prepare_sources(
+                    ["https://github.com/example/project"],
+                    raw_dir=raw_dir,
+                    allow_github_fetch=False,
+                )
+
+    def test_prepare_sources_uses_mocked_github_fetch_when_opted_in(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            fetched_dir = base_dir / "downloaded"
+            raw_dir = base_dir / "raw"
+            (fetched_dir / "project-main").mkdir(parents=True)
+            (fetched_dir / "project-main" / "README.md").write_text("# fetched\n", encoding="utf-8")
+
+            with patch.object(source_loader, "_fetch_github_repository", return_value=fetched_dir / "project-main") as fetch:
+                files = source_loader.prepare_sources(
+                    ["https://github.com/example/project"],
+                    raw_dir=raw_dir,
+                    allow_github_fetch=True,
+                )
+
+            fetch.assert_called_once()
+            self.assertEqual([path.relative_to(raw_dir).as_posix() for path in files], ["example-project/README.md"])
+
+    def test_prepare_sources_keeps_same_repo_names_separate_by_owner(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            raw_dir = base_dir / "raw"
+            first_fetch = base_dir / "downloads" / "first"
+            second_fetch = base_dir / "downloads" / "second"
+            first_fetch.mkdir(parents=True)
+            second_fetch.mkdir(parents=True)
+            (first_fetch / "README.md").write_text("# first\n", encoding="utf-8")
+            (second_fetch / "README.md").write_text("# second\n", encoding="utf-8")
+
+            def fake_fetch(source, download_dir):
+                if "first" in source:
+                    return first_fetch
+                return second_fetch
+
+            with patch.object(source_loader, "_fetch_github_repository", side_effect=fake_fetch):
+                files = source_loader.prepare_sources(
+                    [
+                        "https://github.com/first/project",
+                        "https://github.com/second/project",
+                    ],
+                    raw_dir=raw_dir,
+                    allow_github_fetch=True,
+                )
+
+            self.assertEqual(
+                sorted(path.relative_to(raw_dir).as_posix() for path in files),
+                ["first-project/README.md", "second-project/README.md"],
+            )
+
+    def test_prepare_sources_allows_github_fetch_from_env(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            fetched_dir = base_dir / "downloaded" / "repo-main"
+            raw_dir = base_dir / "raw"
+            fetched_dir.mkdir(parents=True)
+            (fetched_dir / "README.md").write_text("# env\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"ALLOW_GITHUB_FETCH": "1"}):
+                with patch.object(source_loader, "_fetch_github_repository", return_value=fetched_dir):
+                    files = source_loader.prepare_sources(
+                        ["https://github.com/acme/repo"],
+                        raw_dir=raw_dir,
+                    )
+
+            self.assertEqual([path.relative_to(raw_dir).as_posix() for path in files], ["acme-repo/README.md"])
+
+    def test_fetch_github_repository_rejects_zip_over_size_limit(self):
+        with TemporaryDirectory() as tmpdir:
+            download_dir = Path(tmpdir)
+
+            class FakeResponse:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, exc_type, exc, tb):
+                    return False
+
+                def read(self, size=-1):
+                    return b"x" * 8
+
+            with patch.object(source_loader, "urlopen", return_value=FakeResponse()):
+                with self.assertRaisesRegex(RuntimeError, "exceeds maximum"):
+                    source_loader._fetch_github_repository(
+                        "https://github.com/acme/repo",
+                        download_dir,
+                        max_zip_bytes=4,
+                    )
+
+    def test_safe_zip_extraction_skips_unsupported_ignored_and_unsafe_paths(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            zip_path = base_dir / "repo.zip"
+            extract_dir = base_dir / "extract"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("repo-main/README.md", "# ok\n")
+                archive.writestr("repo-main/node_modules/pkg/index.js", "ignored\n")
+                archive.writestr("repo-main/assets/logo.png", "ignored\n")
+                archive.writestr("../escape.md", "bad\n")
+
+            with self.assertRaisesRegex(RuntimeError, "unsafe zip path"):
+                source_loader._extract_supported_zip(zip_path, extract_dir)
+
+            self.assertFalse((base_dir / "escape.md").exists())
+
+    def test_safe_zip_extraction_only_extracts_supported_non_ignored_files(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            zip_path = base_dir / "repo.zip"
+            extract_dir = base_dir / "extract"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("repo-main/README.md", "# ok\n")
+                archive.writestr("repo-main/src/app.py", "print('ok')\n")
+                archive.writestr("repo-main/package-lock.json", '{"name":"ignored"}\n')
+                archive.writestr("repo-main/node_modules/pkg/index.js", "ignored\n")
+                archive.writestr("repo-main/assets/logo.png", "ignored\n")
+
+            root = source_loader._extract_supported_zip(zip_path, extract_dir)
+
+            self.assertEqual(root, extract_dir / "repo-main")
+            self.assertTrue((root / "README.md").exists())
+            self.assertTrue((root / "src" / "app.py").exists())
+            self.assertFalse((root / "package-lock.json").exists())
+            self.assertFalse((root / "node_modules" / "pkg" / "index.js").exists())
+            self.assertFalse((root / "assets" / "logo.png").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

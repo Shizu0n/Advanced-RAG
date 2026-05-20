@@ -1198,10 +1198,11 @@ def _render_eval_tab(st) -> None:
 
     if not _eval_should_allow_run(st):
         _render_eval_blocked(st)
-    else:
-        if indexed_source is not None and is_golden_dataset_stale(indexed_source):
-            _show_stale_dataset_warning(st, indexed_source)
-        _render_eval_ready(st, summary)
+        return
+
+    if indexed_source is not None and is_golden_dataset_stale(indexed_source):
+        _show_stale_dataset_warning(st, indexed_source)
+    _render_eval_ready(st, summary)
 
     if st.button("Run Evaluation"):
         if not _eval_should_allow_run(st):

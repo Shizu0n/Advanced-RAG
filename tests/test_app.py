@@ -95,21 +95,21 @@ class FakeStreamlit:
         return options[index]
 
     def radio(self, label, options, index=0):
-        value = self._radio_value if hasattr(self, "_radio_value") else options[index]
+        value = self._radio_value if self._radio_value is not None else options[index]
         self.events.append(("radio", label, value))
         return value
 
     def text_input(self, label, placeholder=""):
         self.events.append(("text_input", label, placeholder))
-        return self._text_input_value if hasattr(self, "_text_input_value") else ""
+        return self._text_input_value
 
     def text_area(self, label, placeholder=""):
         self.events.append(("text_area", label))
-        return self._text_area_value if hasattr(self, "_text_area_value") else ""
+        return self._text_area_value
 
     def checkbox(self, label, value=False):
         self.events.append(("checkbox", label))
-        return self._checkbox_value if hasattr(self, "_checkbox_value") else value
+        return self._checkbox_value if self._checkbox_value is not None else value
 
     def chat_input(self, label):
         self.events.append(("chat_input", label))
@@ -725,7 +725,7 @@ class EvalTabTests(unittest.TestCase):
         self.assertTrue(any("golden dataset" in w.lower() for w in warnings))
 
     def test_eval_tab_shows_run_evaluation_button(self):
-        fake_st = self._render_eval_tab_with_stubs(current_source={"source_slug": "repo"})
+        fake_st = self._render_eval_tab_with_stubs(current_source={"source_slug": "repo", "indexed_at": "2026-05-20T00:00:00+00:00"})
 
         buttons = [event[1] for event in fake_st.events if event[0] == "button"]
         self.assertIn("Run Evaluation", buttons)
@@ -1132,8 +1132,9 @@ class QueryTabWarningTests(unittest.TestCase):
             app._render_eval_tab(fake_st)
 
         run_eval.assert_not_called()
-        errors = [event[1] for event in fake_st.events if event[0] == "error"]
-        self.assertTrue(any("prepared but not indexed" in e for e in errors))
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("prepared but not indexed" in w for w in warnings))
+        self.assertNotIn("Run Evaluation", [event[1] for event in fake_st.events if event[0] == "button"])
 
     def test_query_tab_no_warning_when_source_is_indexed(self):
         fake_st = FakeStreamlit()
@@ -1312,8 +1313,11 @@ class QueryTabWarningTests(unittest.TestCase):
         run_eval.assert_not_called()
         warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
         self.assertTrue(any("prepared but not indexed" in w for w in warnings))
-        errors = [event[1] for event in fake_st.events if event[0] == "error"]
-        self.assertTrue(any("prepared but not indexed" in e for e in errors))
+        infos = [event[1] for event in fake_st.events if event[0] == "info"]
+        self.assertTrue(any("Prepared source pending index" in i for i in infos))
+        self.assertNotIn("Run Evaluation", [event[1] for event in fake_st.events if event[0] == "button"])
+        self.assertFalse(any(event[0] == "metric" for event in fake_st.events))
+        self.assertFalse(any(event[0] == "subheader" and event[1] == "Evaluation summary" for event in fake_st.events))
 
     def test_query_tab_does_not_render_chat_input_for_stale_prepared_source(self):
         fake_st = FakeStreamlit(prompt="dataset?")

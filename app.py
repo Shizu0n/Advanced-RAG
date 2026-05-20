@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -32,9 +33,9 @@ METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precis
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 CHAT_MESSAGES_KEY = "chat_messages"
 MODEL_INFO = {
-    "primary_configured": "Gemini 2.5 Flash",
-    "mode": "opt-in metadata only; no API call from Streamlit",
-    "offline_answering": "local extractive synthesis",
+    "retrieval": "local hybrid retrieval with explicit index-build opt-in",
+    "cloud_chat": "optional; requires ALLOW_CLOUD_CHAT=1 and a configured free-tier provider key",
+    "offline_answering": "extractive fallback with visible synthesis status",
 }
 PER_QUESTION_COLUMNS = [
     "strategy",
@@ -46,6 +47,19 @@ PER_QUESTION_COLUMNS = [
     "summary_backend",
     *METRICS,
 ]
+SENSITIVE_TRACE_KEYS = {"message", "retrieval_query"}
+ALLOWED_SYNTHESIS_KEYS = {
+    "mode",
+    "code",
+    "schema_version",
+    "provider_chain",
+    "provider_timeout_seconds",
+    "total_timeout_seconds",
+    "provider_attempts",
+    "synthesis_error",
+}
+ALLOWED_SYNTHESIS_ERROR_KEYS = {"code", "stage", "retryable", "provider"}
+ALLOWED_PROVIDER_ATTEMPT_KEYS = {"provider", "model", "attempt", "outcome", "status_code", "duration_ms", "error_class"}
 
 
 def _empty_frame(columns: list[str]) -> pd.DataFrame:
@@ -160,6 +174,68 @@ def _normalize_score_row(item: Any) -> dict[str, Any]:
     return {"source": str(item), "score": None}
 
 
+def _hash_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sanitize_provider_attempts(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    attempts: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        attempts.append({key: item[key] for key in ALLOWED_PROVIDER_ATTEMPT_KEYS if key in item})
+    return attempts
+
+
+def _sanitize_synthesis_trace(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    sanitized: dict[str, Any] = {}
+    for key in ALLOWED_SYNTHESIS_KEYS:
+        if key not in value:
+            continue
+        if key == "provider_attempts":
+            sanitized[key] = _sanitize_provider_attempts(value.get(key))
+        elif key == "synthesis_error" and isinstance(value.get(key), dict):
+            sanitized[key] = {
+                inner_key: value[key][inner_key]
+                for inner_key in ALLOWED_SYNTHESIS_ERROR_KEYS
+                if inner_key in value[key]
+            }
+        else:
+            sanitized[key] = value[key]
+    return sanitized
+
+
+def _sanitize_trace_metadata(trace: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    for key, value in trace.items():
+        if key in SENSITIVE_TRACE_KEYS:
+            continue
+        if key == "synthesis":
+            metadata[key] = _sanitize_synthesis_trace(value)
+            continue
+        metadata[key] = value
+    return metadata
+
+
+def _query_log_entry(query: str, strategy: str, result: dict[str, Any]) -> dict[str, Any]:
+    import datetime
+
+    return {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "query_hash": _hash_text(query),
+        "answer_hash": _hash_text(str(result.get("answer", ""))),
+        "strategy": strategy,
+        "sources": [s.get("source_doc", "") for s in result.get("sources", [])],
+        "contexts_count": len(result.get("contexts", [])),
+        "trace": normalize_trace(result.get("trace") if isinstance(result.get("trace"), dict) else None),
+        "current_source": (load_current_source() or {}).get("source_slug", ""),
+    }
+
+
 def normalize_trace(trace: dict[str, Any] | None) -> dict[str, Any]:
     trace = trace or {}
     bm25 = trace.get("bm25_scores") or trace.get("bm25_results")
@@ -184,7 +260,7 @@ def normalize_trace(trace: dict[str, Any] | None) -> dict[str, Any]:
         "vector_scores": _score_rows(vector),
         "rrf_scores": _score_rows(rrf),
         "reranker_scores": _score_rows(reranker),
-        "metadata": {key: value for key, value in trace.items() if key not in score_keys},
+        "metadata": _sanitize_trace_metadata({key: value for key, value in trace.items() if key not in score_keys}),
     }
 
 
@@ -235,22 +311,11 @@ def is_golden_dataset_stale(current_source: dict | None, golden_path: Path = GOL
 
 def log_query(query: str, strategy: str, result: dict[str, Any], log_path: Path = QUERY_LOG_PATH) -> None:
     """Append a query interaction to the JSONL log file."""
-    import datetime
-
-    entry = {
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "query": query,
-        "strategy": strategy,
-        "answer": result.get("answer", ""),
-        "sources": [s.get("source_doc", "") for s in result.get("sources", [])],
-        "contexts_count": len(result.get("contexts", [])),
-        "trace": result.get("trace"),
-        "current_source": (load_current_source() or {}).get("source_slug", ""),
-    }
+    entry = _query_log_entry(query, strategy, result)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    logger.info("Query logged: %s (strategy=%s)", query[:60], strategy)
+    logger.info("Query logged: hash=%s (strategy=%s)", entry["query_hash"][:12], strategy)
 
 
 def _has_raw_source_files(raw_dir: Path = RAW_DIR) -> bool:
@@ -484,9 +549,24 @@ def _render_citations(st, citations: list[dict[str, Any]]) -> None:
         st.caption(_citation_text(citation))
 
 
+def _synthesis_status_caption(synthesis: dict[str, Any] | None) -> str:
+    if not isinstance(synthesis, dict):
+        return "Synthesis status unavailable."
+    mode = str(synthesis.get("mode") or "unknown")
+    code = str(synthesis.get("code") or "unavailable")
+    provider_chain = synthesis.get("provider_chain")
+    providers = ", ".join(str(provider) for provider in provider_chain) if isinstance(provider_chain, list) else "none"
+    label = "Generative answer" if mode == "generative" else "Extractive fallback" if mode == "extractive" else "Unknown synthesis mode"
+    return f"{label}: {code}. Providers: {providers}."
+
+
 def _render_trace_debug(st, trace: dict[str, Any] | None) -> None:
     with st.expander("Retrieval trace / debug", expanded=False):
         normalized = normalize_trace(trace)
+        synthesis = normalized["metadata"].get("synthesis") if isinstance(normalized["metadata"], dict) else None
+        st.write("Synthesis status")
+        st.json(synthesis or {"mode": "unknown", "code": "unavailable"})
+        st.caption(_synthesis_status_caption(synthesis))
         for label, rows in [
             ("BM25 scores", normalized["bm25_scores"]),
             ("Vector scores", normalized["vector_scores"]),

@@ -149,14 +149,16 @@ def synthesize_generative_answer(
     return _post_process_llm_response(raw_answer)
 
 
-def _post_process_llm_response(raw: str) -> str:
+def _strip_wrapping_code_fences(raw: str) -> str:
     text = raw.strip()
-    # Remove blocos de código markdown
     if text.startswith("```"):
         text = re.sub(r"^```[\w]*\n?", "", text)
         text = re.sub(r"\n?```$", "", text)
-    # Remove sujeira comum de LLMs
-    text = text.strip()
+    return text.strip()
+
+
+def _post_process_llm_response(raw: str) -> str:
+    text = _strip_wrapping_code_fences(raw)
     if not text:
         return None
     return text

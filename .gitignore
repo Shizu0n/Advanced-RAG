@@ -12,3 +12,6 @@ FLOWS.md
 ROADMAP.md
 HANDOFF.md
 ERRORS.md
+.gstack/
+.claude/
+docs/

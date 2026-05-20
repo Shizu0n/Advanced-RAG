@@ -7,7 +7,7 @@ Retrieval-Augmented Generation system that indexes local codebases and documenta
 Most RAG implementations depend on paid APIs (OpenAI, Anthropic) for embeddings, retrieval, and synthesis. This creates a barrier for experimentation and raises concerns about sending proprietary code to third-party services. Advanced-RAG solves this by:
 
 - Running entirely on local infrastructure with open-source models
-- Providing a multi-provider fallback chain (Gemini, Groq, OpenRouter, GitHub Models, Cloudflare Workers AI) when cloud access is desired
+- Providing a multi-provider fallback chain (Gemini, Groq, GitHub Models) when cloud access is desired
 - Evaluating retrieval quality with both offline heuristics and real RAGAS metrics
 - Making every external operation explicitly opt-in through environment variables
 
@@ -19,7 +19,7 @@ flowchart TD
     PIPE["pipeline.py (Orchestrator)<br/>Intent detection → Query rewriting → Strategy selection<br/>→ Confidence scoring → Answer synthesis"]
     RET["retrieval.py<br/>BM25 + Vector + RRF + Reranker<br/>4 strategies: semantic, bm25, hybrid, hybrid+rerank"]
     SYN["synthesis.py<br/>Generative (Gemini) + Extractive fallback"]
-    GEM["gemini_ragas.py<br/>Multi-provider client with budget enforcement & caching<br/>Gemini → Groq → OpenRouter → GH → CF"]
+    GEM["gemini_ragas.py<br/>Multi-provider client with budget enforcement & caching<br/>Gemini → Groq → GitHub Models"]
     ING["ingestion.py<br/>Chunking → Embedding → ChromaDB"]
     SRC["source_loader.py<br/>Local files + GitHub repos<br/>Filtered, symlink-safe"]
     EVA["evaluate.py<br/>Golden dataset + Offline heuristics + RAGAS integration"]
@@ -119,6 +119,59 @@ Outputs:
 - `data/eval/ragas_per_question.csv` — per-question breakdown
 - `data/eval/golden_dataset.json` — generated evaluation dataset
 
+## Manual retrieval and evaluation commands
+
+These commands are intentionally explicit. Network, model download, index build, and cloud calls require opt-in environment variables.
+
+### 1. Prepare a HuggingFace source
+
+```bash
+ALLOW_HF_FETCH=1 python - <<'PY'
+from source_loader import prepare_sources
+prepare_sources(["hf:Shizu0n/phi3-mini-sql-generator"], allow_huggingface_fetch=True)
+PY
+```
+
+### 2. Build the local index
+
+```bash
+ALLOW_INDEX_BUILD=1 python - <<'PY'
+from ingestion import build_index
+build_index()
+PY
+```
+
+### 3. Ask the portfolio fine-tune question offline
+
+```bash
+python - <<'PY'
+from pipeline import chat_query
+result = chat_query("qual a dataset usada no fine tunning desse model do hugging face?", strategy="hybrid_rerank")
+print(result["answer"])
+print(result["trace"].get("synthesis", {}))
+PY
+```
+
+### 4. Run source-scoped evaluation
+
+Offline heuristic evaluation:
+
+```bash
+python evaluate.py
+```
+
+Cloud RAGAS evaluation requires explicit gates and provider keys:
+
+```bash
+ALLOW_CLOUD_FREE_TIER=1 USE_GEMINI_FREE_RAGAS=1 python evaluate.py
+```
+
+Cloud chat in the Streamlit query tab requires its own gate:
+
+```bash
+ALLOW_CLOUD_CHAT=1 streamlit run app.py
+```
+
 ## Evaluation Metrics
 
 The system evaluates 4 retrieval strategies across 4 dimensions:
@@ -140,7 +193,7 @@ Offline heuristics use term-overlap scoring. RAGAS evaluation uses Gemini as the
 
 **No paid SDKs.** The codebase does not import OpenAI, Anthropic, or their LangChain wrappers. Enforced by test assertions.
 
-**Provider fallback chain.** When cloud access is enabled, requests flow through Gemini → Groq → OpenRouter → GitHub Models → Cloudflare Workers AI, with automatic retry on 429/403/5xx and a shared call budget (default: 120 calls).
+**Provider fallback chain.** When cloud access is enabled, requests flow through Gemini → Groq → GitHub Models, with automatic retry on 429/403/5xx and a shared call budget (default: 120 calls).
 
 ## Tech Stack
 
@@ -165,8 +218,6 @@ All configuration via environment variables. Copy `.env.example` to `.env`.
 | `GEMINI_MODEL` | Gemini model | `gemini-2.5-flash` |
 | `GROQ_API_KEY` / `GROQ_MODEL` | Groq fallback | `llama-3.3-70b-versatile` |
 | `GITHUB_MODELS_TOKEN` / `GITHUB_MODELS_MODEL` | GitHub Models fallback | — |
-| `OPENROUTER_API_KEY` / `OPENROUTER_MODEL` | OpenRouter fallback | `meta-llama/llama-3.1-8b-instruct:free` |
-| `CF_ACCOUNT_ID` / `CF_WORKERS_AI_TOKEN` | Cloudflare Workers AI fallback | — |
 | `ALLOW_INDEX_BUILD` | Permit ChromaDB index building | `0` |
 | `ALLOW_MODEL_DOWNLOADS` | Permit cross-encoder download | `0` |
 | `ALLOW_GITHUB_FETCH` | Permit GitHub repo download | `0` |

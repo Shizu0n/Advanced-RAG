@@ -8,6 +8,8 @@ import os
 import json
 import unicodedata
 import hashlib
+import time
+import concurrent.futures
 
 logger = logging.getLogger(__name__)
 from pathlib import Path
@@ -163,6 +165,14 @@ INTENT_REWRITES = {
     "evaluation": "evaluation avaliacao metricas tests testes qualidade benchmark ragas",
     "fine_tune": "fine tune training dataset hyperparameters lora qlora phi training_details",
 }
+SYNTHESIS_SUCCESS = "success"
+SYNTHESIS_NO_CONTEXTS = "no_contexts"
+SYNTHESIS_INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+SYNTHESIS_CLOUD_CHAT_DISABLED = "cloud_chat_disabled"
+SYNTHESIS_NO_PROVIDER_CONFIGURED = "no_provider_configured"
+SYNTHESIS_BUDGET_EXCEEDED = "budget_exceeded"
+SYNTHESIS_PROVIDER_TIMEOUT = "provider_timeout"
+SYNTHESIS_PROVIDER_EXHAUSTED = "provider_exhausted"
 
 
 @dataclass(frozen=True)
@@ -171,6 +181,77 @@ class QueryAnalysis:
     rewritten_query: str
     intents: list[str]
     terms: set[str]
+
+
+@dataclass(frozen=True)
+class SynthesisError:
+    code: str
+    stage: str
+    retryable: bool
+    provider: str | None = None
+
+    def to_trace(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "stage": self.stage,
+            "retryable": self.retryable,
+            "provider": self.provider,
+        }
+
+
+@dataclass(frozen=True)
+class SynthesisResult:
+    answer: str
+    mode: str
+    error: SynthesisError | None = None
+    provider_chain: list[str] | None = None
+    provider_timeout_seconds: float | None = None
+    total_timeout_seconds: float | None = None
+    provider_attempts: list[dict[str, Any]] | None = None
+
+    @property
+    def code(self) -> str:
+        return self.error.code if self.error else SYNTHESIS_SUCCESS
+
+    def to_trace(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "mode": self.mode,
+            "code": self.code,
+            "synthesis_error": self.error.to_trace() if self.error else None,
+            "provider_chain": self.provider_chain or [],
+            "provider_timeout_seconds": self.provider_timeout_seconds,
+            "total_timeout_seconds": self.total_timeout_seconds,
+            "provider_attempts": self.provider_attempts or [],
+        }
+
+
+@dataclass(frozen=True)
+class ChatProviderPolicy:
+    enabled: bool
+    providers: tuple[Any, ...]
+    max_calls: int = 1
+    provider_timeout_seconds: float = 30.0
+    total_timeout_seconds: float = 60.0
+    cache_enabled: bool = False
+
+    @classmethod
+    def from_env(cls) -> "ChatProviderPolicy":
+        if os.getenv("ALLOW_CLOUD_CHAT") != "1":
+            return cls(enabled=False, providers=())
+        import gemini_ragas
+
+        return cls(
+            enabled=True,
+            providers=tuple(gemini_ragas.providers_from_env()),
+            max_calls=int(os.getenv("MAX_CLOUD_CHAT_CALLS", "1")),
+            provider_timeout_seconds=float(os.getenv("CLOUD_CHAT_PROVIDER_TIMEOUT_SECONDS", "30")),
+            total_timeout_seconds=float(os.getenv("CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS", "60")),
+            cache_enabled=os.getenv("CLOUD_CHAT_CACHE", "0") == "1",
+        )
+
+    def provider_chain(self) -> list[str]:
+        return [provider.name for provider in self.providers]
 
 
 def _tokenize(text: str) -> set[str]:
@@ -491,20 +572,85 @@ class FineTuneMetadata:
         return " | ".join(parts) if parts else None
 
 
+def _fine_tune_has_brief_fields(metadata: FineTuneMetadata) -> bool:
+    return any(
+        (
+            metadata.base_model,
+            metadata.dataset,
+            metadata.training_details,
+            metadata.evaluation_metrics,
+        )
+    )
+
+
+def _format_fine_tune_value(value: Any) -> str:
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _format_fine_tune_mapping(values: dict[str, Any], key_overrides: dict[str, str] | None = None) -> str:
+    key_overrides = key_overrides or {}
+    return ", ".join(
+        f"{key_overrides.get(key, key)}={_format_fine_tune_value(value)}"
+        for key, value in values.items()
+    )
+
+
+def _format_fine_tune_extract_answer(metadata: FineTuneMetadata) -> str | None:
+    if not _fine_tune_has_brief_fields(metadata):
+        return None
+
+    dataset = metadata.dataset
+    if isinstance(dataset, list):
+        dataset_text = ", ".join(dataset) if dataset else "Unknown"
+    else:
+        dataset_text = dataset or "Unknown"
+
+    training_text = "Unknown"
+    if metadata.training_details:
+        training_text = _format_fine_tune_mapping(metadata.training_details, {"Alpha": "alpha"})
+
+    metrics_text = "Unknown"
+    if metadata.evaluation_metrics:
+        metrics_text = _format_fine_tune_mapping(metadata.evaluation_metrics)
+
+    unknowns = []
+    if not metadata.base_model:
+        unknowns.append("Base model")
+    if not metadata.dataset:
+        unknowns.append("Dataset")
+    if not metadata.training_details:
+        unknowns.append("Training")
+    if not metadata.evaluation_metrics:
+        unknowns.append("Metrics")
+
+    return "\n".join(
+        (
+            f"Base model: {metadata.base_model or 'Unknown'}",
+            f"Dataset: {dataset_text}",
+            f"Training: {training_text}",
+            f"Metrics: {metrics_text}",
+            f"Unknowns: {', '.join(unknowns) if unknowns else 'None'}",
+        )
+    )
+
+
 def _parse_yaml_frontmatter(text: str) -> dict[str, Any]:
     """Parse YAML frontmatter from HuggingFace README.md.
 
     Returns dict of parsed values or empty dict if no frontmatter.
     Does not require external YAML library - uses simple line-by-line parsing.
     """
-    text = text.strip()
-    if not text.startswith("---"):
+    lines = text.strip().split("\n")
+    try:
+        start = next(index for index, line in enumerate(lines) if line.strip() == "---")
+    except StopIteration:
         return {}
 
-    lines = text.split("\n")[1:]
     yaml_lines: list[str] = []
 
-    for line in lines:
+    for line in lines[start + 1:]:
         if line.strip() == "---":
             break
         yaml_lines.append(line)
@@ -650,11 +796,21 @@ def _extract_fine_tune_info(contexts: Sequence[str], sources: Sequence[dict[str,
         eval_text = _parse_markdown_section(context, "Evaluation")
         if eval_text:
             metrics: dict[str, Any] = {}
+            table_headers: list[str] = []
             for line in eval_text.split("\n"):
-                if "|" in line and "Model" not in line and "---" not in line:
-                    parts = [p.strip() for p in line.split("|") if p.strip()]
-                    if len(parts) >= 2 and "exact match" in line.lower():
-                        match = re.search(r"(\d+\.?\d*)%", line)
+                if "|" not in line:
+                    continue
+                parts = [p.strip() for p in line.split("|") if p.strip()]
+                if not parts or all(set(part) <= {"-", ":"} for part in parts):
+                    continue
+                if any("exact match" in part.lower() for part in parts):
+                    table_headers = parts
+                    continue
+                if table_headers:
+                    for header, value in zip(table_headers, parts):
+                        if "exact match" not in header.lower():
+                            continue
+                        match = re.search(r"(\d+\.?\d*)%?", value)
                         if match:
                             metrics["exact_match"] = float(match.group(1))
             if metrics:
@@ -798,37 +954,172 @@ def _extract_technologies(contexts: Sequence[str], query: str = "") -> list[str]
 
 
 
+class ChatLLMClient:
+    def __init__(self, policy: ChatProviderPolicy) -> None:
+        import gemini_ragas
+
+        api_key = next((provider.api_key for provider in policy.providers if provider.name == "gemini"), policy.providers[0].api_key)
+        self.cache_enabled = policy.cache_enabled
+        self.client = gemini_ragas.GeminiFreeTierClient(
+            api_key=api_key,
+            budget=gemini_ragas.GeminiCallBudget(max_calls=policy.max_calls),
+            providers=policy.providers,
+        )
+
+    def generate_text(self, prompt: str, temperature: float | None = None) -> str:
+        return self.client.generate_text(prompt, temperature=temperature)
+
+
+def _get_chat_llm_client(policy: ChatProviderPolicy) -> Any:
+    return ChatLLMClient(policy)
+
+
+def _chat_cloud_error(code: str, retryable: bool, stage: str = "policy", provider: str | None = None) -> SynthesisError:
+    return SynthesisError(code=code, stage=stage, retryable=retryable, provider=provider)
+
+
+def _provider_attempts(policy: ChatProviderPolicy, *, outcome: str, error_class: str | None = None) -> list[dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    for index, provider in enumerate(policy.providers, start=1):
+        attempt = {
+            "provider": provider.name,
+            "model": getattr(provider, "model", None),
+            "attempt": index,
+            "outcome": outcome,
+        }
+        if error_class:
+            attempt["error_class"] = error_class
+        attempts.append(attempt)
+    return attempts
+
+
+def _extractive_synthesis_result(
+    query: str,
+    contexts: Sequence[str],
+    error: SynthesisError,
+    policy: ChatProviderPolicy | None = None,
+    provider_attempts: list[dict[str, Any]] | None = None,
+    fine_tune_metadata: FineTuneMetadata | None = None,
+) -> SynthesisResult:
+    answer = _format_fine_tune_extract_answer(fine_tune_metadata) if fine_tune_metadata else None
+    return SynthesisResult(
+        answer=answer or synthesize_extractive_answer(query, contexts, max_sentences=5),
+        mode="extractive",
+        error=error,
+        provider_chain=policy.provider_chain() if policy else [],
+        provider_timeout_seconds=policy.provider_timeout_seconds if policy else None,
+        total_timeout_seconds=policy.total_timeout_seconds if policy else None,
+        provider_attempts=provider_attempts or [],
+    )
+
+
+def _generate_text_with_timeout(client: Any, prompt: str, policy: ChatProviderPolicy) -> str:
+    start = time.monotonic()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(client.generate_text, prompt, temperature=0.2)
+        per_provider_timeout = max(policy.provider_timeout_seconds, 0.0)
+        total_timeout = max(policy.total_timeout_seconds, 0.0)
+
+        if total_timeout == 0.0 or per_provider_timeout == 0.0:
+            future.cancel()
+            raise TimeoutError("chat timeout exceeded")
+
+        timeout = min(per_provider_timeout, total_timeout)
+        try:
+            result = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise TimeoutError("chat timeout exceeded") from exc
+
+    if time.monotonic() - start > total_timeout:
+        raise TimeoutError("chat timeout exceeded")
+    return result
+
+
 def synthesize_chat_answer(
     query: str,
     contexts: Sequence[str],
-    citations: Sequence[dict[str, Any]],
     intent: str,
     sources: Sequence[dict[str, Any]],
     fine_tune_metadata: FineTuneMetadata | None = None,
-) -> str:
+) -> SynthesisResult:
     if not contexts:
-        return EMPTY_LOCAL_CONTEXT_ANSWER
+        error = SynthesisError(code=SYNTHESIS_NO_CONTEXTS, stage="precheck", retryable=False, provider=None)
+        return SynthesisResult(answer=EMPTY_LOCAL_CONTEXT_ANSWER, mode="extractive", error=error)
     if not _has_enough_evidence(query, contexts, sources):
-        return LOW_EVIDENCE_ANSWER
+        error = SynthesisError(code=SYNTHESIS_INSUFFICIENT_EVIDENCE, stage="precheck", retryable=False, provider=None)
+        return SynthesisResult(answer=LOW_EVIDENCE_ANSWER, mode="extractive", error=error)
 
-    # LLM-first: tenta síntese gerativa para TODAS as intents
-    try:
-        from synthesis import synthesize_generative_answer  # noqa: PLC0415
-
-        generative = synthesize_generative_answer(
-            query, contexts, sources,
-            intent=intent,
+    policy = ChatProviderPolicy.from_env()
+    if not policy.enabled:
+        return _extractive_synthesis_result(
+            query,
+            contexts,
+            _chat_cloud_error(SYNTHESIS_CLOUD_CHAT_DISABLED, retryable=False),
+            policy,
             fine_tune_metadata=fine_tune_metadata,
         )
-        if generative is not None:
-            return generative
-    except Exception:
-        pass
+    if not policy.providers:
+        return _extractive_synthesis_result(
+            query,
+            contexts,
+            _chat_cloud_error(SYNTHESIS_NO_PROVIDER_CONFIGURED, retryable=False),
+            policy,
+            fine_tune_metadata=fine_tune_metadata,
+        )
+    if policy.max_calls <= 0:
+        return _extractive_synthesis_result(
+            query,
+            contexts,
+            _chat_cloud_error(SYNTHESIS_BUDGET_EXCEEDED, retryable=False),
+            policy,
+            fine_tune_metadata=fine_tune_metadata,
+        )
 
-    # Fallback extraívo quando LLM está indisponível
-    cleaned_contexts = [ctx for ctx in contexts if not _is_mostly_json(ctx)]
-    return synthesize_extractive_answer(
-        query, cleaned_contexts or contexts, max_sentences=5
+    provider_attempts = _provider_attempts(policy, outcome="started")
+
+    from synthesis import _build_prompt, _post_process_llm_response  # noqa: PLC0415
+
+    prompt = _build_prompt(query, contexts, sources, intent=intent, fine_tune_metadata=fine_tune_metadata)
+
+    try:
+        raw_answer = _generate_text_with_timeout(_get_chat_llm_client(policy), prompt, policy)
+    except TimeoutError:
+        return _extractive_synthesis_result(
+            query,
+            contexts,
+            _chat_cloud_error(SYNTHESIS_PROVIDER_TIMEOUT, retryable=True, stage="provider"),
+            policy,
+            provider_attempts=_provider_attempts(policy, outcome="timeout", error_class="TimeoutError"),
+            fine_tune_metadata=fine_tune_metadata,
+        )
+    except Exception as exc:
+        return _extractive_synthesis_result(
+            query,
+            contexts,
+            _chat_cloud_error(SYNTHESIS_PROVIDER_EXHAUSTED, retryable=True, stage="provider"),
+            policy,
+            provider_attempts=_provider_attempts(policy, outcome="error", error_class=type(exc).__name__),
+            fine_tune_metadata=fine_tune_metadata,
+        )
+
+    answer = _post_process_llm_response(raw_answer)
+    if answer is None:
+        return _extractive_synthesis_result(
+            query,
+            contexts,
+            _chat_cloud_error(SYNTHESIS_PROVIDER_EXHAUSTED, retryable=False, stage="provider"),
+            policy,
+            provider_attempts=_provider_attempts(policy, outcome="empty_response"),
+            fine_tune_metadata=fine_tune_metadata,
+        )
+    return SynthesisResult(
+        answer=answer,
+        mode="generative",
+        provider_chain=policy.provider_chain(),
+        provider_timeout_seconds=policy.provider_timeout_seconds,
+        total_timeout_seconds=policy.total_timeout_seconds,
+        provider_attempts=_provider_attempts(policy, outcome="success"),
     )
 
 
@@ -935,6 +1226,8 @@ def load_local_context_nodes(paths: Sequence[Path] | None = None) -> list[LocalT
 def synthesize_extractive_answer(query: str, contexts: Sequence[str], max_sentences: int = 3) -> str:
     """Pick the context sentences with the strongest lexical overlap with the query."""
 
+    from synthesis import _strip_wrapping_code_fences  # noqa: PLC0415
+
     query_terms = _tokenize(query)
     ranked: list[tuple[float, int, str]] = []
 
@@ -952,7 +1245,7 @@ def synthesize_extractive_answer(query: str, contexts: Sequence[str], max_senten
 
     best = sorted(ranked, key=lambda item: (-item[0], item[1]))[:max_sentences]
     answer = " ".join(sentence for _, _, sentence in sorted(best, key=lambda item: item[1]))
-    return answer or contexts[0][:500]
+    return _strip_wrapping_code_fences(answer or contexts[0][:500])
 
 
 class LocalLexicalCrossEncoder:
@@ -1024,12 +1317,68 @@ class LocalRAGPipeline:
         if self.retriever is None and (self.index is not None or self.nodes):
             self.retriever = self._build_retriever()
 
+    def _load_existing_index(self):
+        """Try to load the persisted ChromaDB index without rebuilding.
+
+        Returns (VectorStoreIndex, nodes) if chroma_db exists and has documents,
+        otherwise (None, None). Only uses local embedding model — no network calls.
+        """
+        chroma_dir = Path("chroma_db")
+        if not chroma_dir.exists():
+            return None, None
+
+        try:
+            import os as _os
+
+            _os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+            import chromadb
+
+            from llama_index.core import VectorStoreIndex
+            from llama_index.core.schema import TextNode
+            from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+            from llama_index.vector_stores.chroma import ChromaVectorStore
+
+            chroma_client = chromadb.PersistentClient(path=str(chroma_dir))
+            collection = chroma_client.get_collection("advanced_rag")
+            if collection.count() == 0:
+                return None, None
+            vector_store = ChromaVectorStore(chroma_collection=collection)
+            embed_model = HuggingFaceEmbedding(
+                model_name="BAAI/bge-small-en-v1.5",
+            )
+            index = VectorStoreIndex.from_vector_store(
+                vector_store, embed_model=embed_model
+            )
+            all_data = collection.get(include=["documents", "metadatas"])
+            nodes = [
+                TextNode(
+                    text=doc,
+                    metadata=meta or {},
+                )
+                for doc, meta in zip(
+                    all_data.get("documents", []) or [],
+                    all_data.get("metadatas", []) or [],
+                )
+                if doc
+            ]
+            return index, nodes
+        except Exception:
+            logger.debug("Failed to load existing ChromaDB index", exc_info=True)
+            return None, None
+
     def _ensure_ready(self) -> None:
         if self.retriever is not None:
             return
 
         if not self.allow_index_build:
             self.nodes = load_local_context_nodes()
+            index, chroma_nodes = self._load_existing_index()
+            if index is not None and chroma_nodes:
+                self.index = index
+                self.nodes = chroma_nodes
+                self.retriever = self._build_retriever()
+                return
             self.retriever = SimpleLocalRetriever(self.nodes, top_k=self.top_k)
             return
 
@@ -1141,21 +1490,20 @@ class LocalRAGPipeline:
         fine_tune_metadata = None
         if intent == "fine_tune":
             fine_tune_metadata = _extract_fine_tune_info(contexts, sources)
-        answer = synthesize_chat_answer(message, contexts, citations, intent, sources, fine_tune_metadata=fine_tune_metadata)
+        synthesis_result = synthesize_chat_answer(message, contexts, intent, sources, fine_tune_metadata=fine_tune_metadata)
         trace = self._normalize_trace(metadata, results)
         trace.update(
             {
-                "message": message,
                 "history_items": len(history),
-                "retrieval_query": retrieval_query,
                 "intent": intent,
                 "intents": analysis.intents,
                 "evidence_score": round(_evidence_score(message, contexts), 3),
+                "synthesis": synthesis_result.to_trace(),
             }
         )
 
         return {
-            "answer": answer,
+            "answer": synthesis_result.answer,
             "citations": citations,
             "contexts": contexts,
             "sources": sources,

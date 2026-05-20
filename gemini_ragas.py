@@ -66,27 +66,6 @@ def providers_from_env() -> list[CloudProvider]:
         model = os.environ["GITHUB_MODELS_MODEL"]
         if _is_allowed_fallback_model(model):
             providers.append(CloudProvider("github", model, os.environ["GITHUB_MODELS_TOKEN"]))
-    if os.getenv("OPENROUTER_API_KEY"):
-        model = os.getenv("OPENROUTER_MODEL", "meta-llama/llama-3.1-8b-instruct:free")
-        if _is_allowed_fallback_model(model):
-            providers.append(
-                CloudProvider(
-                    "openrouter",
-                    model,
-                    os.environ["OPENROUTER_API_KEY"],
-                )
-            )
-    if os.getenv("CF_ACCOUNT_ID") and os.getenv("CF_WORKERS_AI_TOKEN"):
-        model = os.getenv("CF_WORKERS_AI_MODEL", "@cf/meta/llama-3-8b-instruct")
-        if _is_allowed_fallback_model(model):
-            providers.append(
-                CloudProvider(
-                    "cloudflare",
-                    model,
-                    os.environ["CF_WORKERS_AI_TOKEN"],
-                    account_id=os.environ["CF_ACCOUNT_ID"],
-                )
-            )
     return providers
 
 
@@ -221,12 +200,6 @@ class GeminiFreeTierClient:
                 {"model": provider.model, "messages": messages, "temperature": temperature},
                 {"Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json"},
             )
-        if provider.name == "openrouter":
-            return (
-                "https://openrouter.ai/api/v1/chat/completions",
-                {"model": provider.model, "messages": messages, "temperature": temperature},
-                {"Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json"},
-            )
         if provider.name == "github":
             return (
                 "https://models.github.ai/inference/chat/completions",
@@ -237,14 +210,6 @@ class GeminiFreeTierClient:
                     "Content-Type": "application/json",
                     "X-GitHub-Api-Version": "2022-11-28",
                 },
-            )
-        if provider.name == "cloudflare":
-            if not provider.account_id:
-                raise RuntimeError("Cloudflare provider requires account_id.")
-            return (
-                f"https://api.cloudflare.com/client/v4/accounts/{provider.account_id}/ai/run/{provider.model}",
-                {"messages": messages},
-                {"Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json"},
             )
         raise RuntimeError(f"Unsupported cloud provider: {provider.name}")
 

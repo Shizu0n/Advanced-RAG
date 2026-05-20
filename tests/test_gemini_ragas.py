@@ -138,16 +138,14 @@ class GeminiRagasTests(unittest.TestCase):
                 "GEMINI_MODEL": "gemini-2.5-pro",
                 "GROQ_API_KEY": "groq",
                 "GROQ_MODEL": "llama-3.3-70b-versatile",
-                "OPENROUTER_API_KEY": "router",
-                "OPENROUTER_MODEL": "meta-llama/llama-3.1-8b-instruct:free",
-                "CF_ACCOUNT_ID": "acct",
-                "CF_WORKERS_AI_TOKEN": "cf",
+                "GITHUB_MODELS_TOKEN": "github",
+                "GITHUB_MODELS_MODEL": "openai/gpt-4o-mini",
             },
             clear=True,
         ):
             providers = gemini_ragas.providers_from_env()
 
-        self.assertEqual([provider.name for provider in providers], ["gemini", "groq", "openrouter", "cloudflare"])
+        self.assertEqual([provider.name for provider in providers], ["gemini", "groq", "github"])
         self.assertEqual([provider.model for provider in providers].count("gemini-2.5-flash"), 1)
         self.assertTrue(all(gemini_ragas._is_allowed_fallback_model(provider.model) for provider in providers[1:]))
 
@@ -160,17 +158,12 @@ class GeminiRagasTests(unittest.TestCase):
                 "GROQ_MODEL": "gemma2-9b-it",
                 "GITHUB_MODELS_TOKEN": "github",
                 "GITHUB_MODELS_MODEL": "google/gemini-2.5-pro",
-                "OPENROUTER_API_KEY": "router",
-                "OPENROUTER_MODEL": "google/gemma-3-27b-it:free",
-                "CF_ACCOUNT_ID": "acct",
-                "CF_WORKERS_AI_TOKEN": "cf",
-                "CF_WORKERS_AI_MODEL": "@cf/meta/llama-3-8b-instruct",
             },
             clear=True,
         ):
             providers = gemini_ragas.providers_from_env()
 
-        self.assertEqual([provider.name for provider in providers], ["gemini", "cloudflare"])
+        self.assertEqual([provider.name for provider in providers], ["gemini"])
 
     def test_cache_prevents_repeat_calls_and_max_guard_blocks_uncached_calls(self):
         post = Mock(

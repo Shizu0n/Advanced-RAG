@@ -14,6 +14,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+st: Any | None = None
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -32,6 +34,7 @@ CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 CHAT_MESSAGES_KEY = "chat_messages"
+PREPARED_SOURCE_KEY = "prepared_source"
 MODEL_INFO = {
     "retrieval": "local hybrid retrieval with explicit index-build opt-in",
     "cloud_chat": "optional; requires ALLOW_CLOUD_CHAT=1 and a configured free-tier provider key",
@@ -278,7 +281,7 @@ def dataset_stats(golden_path: Path = GOLDEN_DATASET_PATH, per_question_path: Pa
 CURRENT_SOURCE_PATH = PROJECT_ROOT / "data" / "current_source.json"
 
 
-def load_current_source(path: Path = CURRENT_SOURCE_PATH) -> dict | None:
+def load_current_source(path: Path = CURRENT_SOURCE_PATH) -> dict[str, Any] | None:
     """Load data/current_source.json; return None if missing."""
     if not path.exists():
         return None
@@ -414,7 +417,551 @@ def prepare_sources_for_app(
     )
 
 
-def _render_source_badge(st, badge_state: str, current_source: dict | None) -> None:
+def _prepared_source_state(st) -> dict[str, Any] | None:
+    value = st.session_state.get(PREPARED_SOURCE_KEY)
+    return value if isinstance(value, dict) else None
+
+
+def _current_source_for_ui(st) -> dict[str, Any] | None:
+    prepared = _prepared_source_state(st)
+    indexed = load_current_source()
+    if prepared and prepared.get("source_slug") != (indexed or {}).get("source_slug"):
+        return prepared
+    return indexed
+
+
+def _source_is_indexed(current_source: dict[str, Any] | None) -> bool:
+    if current_source is None or not CHROMA_DIR.exists():
+        return False
+    if current_source.get("indexed_at"):
+        indexed = load_current_source()
+        if indexed is None:
+            return True
+        return current_source.get("source_slug") == indexed.get("source_slug")
+    return False
+
+
+def _active_indexed_source(st) -> dict[str, Any] | None:
+    current_source = _current_source_for_ui(st)
+    return current_source if _source_is_indexed(current_source) else None
+
+
+def _active_prepared_only_source(st) -> dict[str, Any] | None:
+    current_source = _current_source_for_ui(st)
+    if current_source is None:
+        return None
+    return None if _source_is_indexed(current_source) else current_source
+
+
+def _pending_index_message(current_source: dict[str, Any]) -> str:
+    return (
+        f"Source '{current_source.get('source_slug', 'unknown')}' is prepared but not indexed yet. "
+        "Build the index in the Sources tab first."
+    )
+
+
+def _degraded_query_message(current_source: dict[str, Any]) -> str:
+    return (
+        f"Source '{current_source.get('source_slug', 'unknown')}' is prepared but not indexed yet. "
+        "Build the index in the Sources tab before querying. "
+        "Query will fall back to lexical-only search with degraded quality."
+    )
+
+
+def _sources_status_message(current_source: dict[str, Any]) -> str:
+    return f"Prepared source pending index: {current_source.get('source_slug', 'unknown')}"
+
+
+def _indexed_status_message(current_source: dict[str, Any]) -> str:
+    return f"Current index: {current_source.get('source_slug', 'unknown')}"
+
+
+def _indexed_caption(current_source: dict[str, Any]) -> str:
+    return f"Indexed source: {current_source.get('source_slug', 'unknown')}"
+
+
+def _evaluated_info(current_source: dict[str, Any]) -> str:
+    return f"Evaluated on: {current_source.get('source_slug', 'unknown')} | Indexed: {current_source.get('indexed_at', 'unknown')}"
+
+
+def _last_eval_caption(evaluated_source: str, question_count: int, eval_date: str) -> str:
+    return f"Last eval: {evaluated_source} | {question_count} questions | {eval_date}"
+
+
+def _source_prepared(current_source: dict | None) -> bool:
+    return current_source is not None and not _source_is_indexed(current_source)
+
+
+def _can_query(current_source: dict | None) -> bool:
+    return _source_is_indexed(current_source)
+
+
+def _can_evaluate(current_source: dict | None) -> bool:
+    return _source_is_indexed(current_source)
+
+
+def _has_any_indexed_source() -> bool:
+    indexed = load_current_source()
+    return indexed is not None and CHROMA_DIR.exists()
+
+
+def _source_for_eval_staleness(st) -> dict | None:
+    return _active_indexed_source(st)
+
+
+def _source_for_eval_header(st) -> dict | None:
+    return _active_indexed_source(st)
+
+
+def _source_for_query(st) -> dict | None:
+    return _active_indexed_source(st)
+
+
+def _source_for_prepared_warning(st) -> dict | None:
+    return _active_prepared_only_source(st)
+
+
+def _source_for_sources_tab(st) -> dict | None:
+    return _current_source_for_ui(st)
+
+
+def _source_for_sidebar(st) -> dict | None:
+    return _current_source_for_ui(st)
+
+
+def _source_for_eval_run(st) -> dict | None:
+    return _active_indexed_source(st)
+
+
+def _source_for_eval_pending(st) -> dict | None:
+    return _active_prepared_only_source(st)
+
+
+def _source_for_query_pending(st) -> dict | None:
+    return _active_prepared_only_source(st)
+
+
+def _has_index_for_current_source(st) -> bool:
+    return _active_indexed_source(st) is not None
+
+
+def _show_index_required_error(st, current_source: dict[str, Any]) -> None:
+    st.error(_pending_index_message(current_source))
+
+
+def _show_query_warning(st, current_source: dict[str, Any]) -> None:
+    st.warning(_degraded_query_message(current_source))
+
+
+def _show_eval_warning(st, current_source: dict[str, Any]) -> None:
+    st.warning(_pending_index_message(current_source))
+
+
+def _show_sources_pending_info(st, current_source: dict[str, Any]) -> None:
+    st.info(_sources_status_message(current_source))
+
+
+def _show_sources_index_info(st, current_source: dict[str, Any]) -> None:
+    st.info(_indexed_status_message(current_source))
+
+
+def _show_query_caption(st, current_source: dict[str, Any]) -> None:
+    st.caption(_indexed_caption(current_source))
+
+
+def _show_eval_header(st, current_source: dict[str, Any]) -> None:
+    st.info(_evaluated_info(current_source))
+
+
+def _show_last_eval_caption(st, evaluated_source: str, question_count: int, eval_date: str) -> None:
+    st.caption(_last_eval_caption(evaluated_source, question_count, eval_date))
+
+
+def _has_indexed_source_for_eval(st) -> bool:
+    return _active_indexed_source(st) is not None
+
+
+def _prepared_source_for_eval(st) -> dict | None:
+    return _active_prepared_only_source(st)
+
+
+def _prepared_source_for_query(st) -> dict | None:
+    return _active_prepared_only_source(st)
+
+
+def _indexed_source_for_query(st) -> dict | None:
+    return _active_indexed_source(st)
+
+
+def _indexed_source_for_eval(st) -> dict | None:
+    return _active_indexed_source(st)
+
+
+def _show_general_no_source_warning(st) -> None:
+    st.warning(
+        "No source is indexed yet. Go to the Sources tab to prepare and index a source. "
+        "Query will fall back to lexical-only search with degraded quality."
+    )
+
+
+def _show_general_no_eval_source_warning(st) -> None:
+    st.warning("No source is indexed yet. Go to the Sources tab to prepare and index a source before running evaluation.")
+
+
+def _show_general_no_eval_source_error(st) -> None:
+    st.error("Cannot run evaluation: no source is indexed. Go to the Sources tab first.")
+
+
+def _show_allow_index_build_error(st) -> None:
+    st.error(
+        "Index build requires the ALLOW_INDEX_BUILD=1 environment variable. "
+        "Set it and restart the app."
+    )
+
+
+def _has_indexed_source_matching_current(st) -> bool:
+    return _active_indexed_source(st) is not None
+
+
+def _show_stale_dataset_warning(st, current_source: dict[str, Any]) -> None:
+    st.warning(
+        f"The golden dataset was generated for a different source than the currently indexed one "
+        f"('{current_source.get('source_slug', '?')}'). Click 'Run Evaluation' to regenerate."
+    )
+
+
+def _show_no_raw_files_error(st) -> None:
+    st.error("No source files found in data/raw/. Prepare a source first.")
+
+
+def _show_eval_success(st) -> None:
+    st.success("Evaluation complete. Refreshing...")
+
+
+def _show_build_success(st, nodes: list, slug: str) -> None:
+    st.success(f"Index built successfully. {len(nodes)} chunks for source '{slug}'.")
+
+
+def _show_build_failure(st, exc: Exception) -> None:
+    st.error(f"Index build failed: {exc}")
+
+
+def _show_eval_failure(st, exc: Exception) -> None:
+    st.error(f"Evaluation failed: {exc}")
+
+
+def _show_prepare_failure(st, exc: Exception) -> None:
+    st.error(str(exc))
+
+
+def _show_prepare_empty(st) -> None:
+    st.warning("No sources were provided.")
+
+
+def _show_prepare_success(st, prepared: list[Path]) -> None:
+    st.success(f"Prepared {len(prepared)} files under data/raw.")
+
+
+def _store_prepared_source(st, prepared: list[Path], source_input: str, source_type: str) -> None:
+    st.session_state["prepared_files"] = prepared
+    st.session_state[PREPARED_SOURCE_KEY] = {
+        "source_slug": prepared[0].parent.name,
+        "source_input": source_input,
+        "source_type": source_type,
+        "indexed_at": None,
+    }
+
+
+def _clear_prepared_source(st) -> None:
+    st.session_state.pop(PREPARED_SOURCE_KEY, None)
+
+
+def _prepared_source_type(source_type: str) -> str:
+    return "huggingface" if source_type == "HuggingFace model/dataset" else "github" if source_type == "GitHub repo" else "local"
+
+
+def _render_prepared_files(st, prepared: list[Path]) -> None:
+    st.dataframe(
+        pd.DataFrame({"file": [path.as_posix() for path in prepared]}),
+        use_container_width=True,
+    )
+
+
+def _prepared_source_slug(prepared: list[Path]) -> str:
+    return prepared[0].parent.name
+
+
+def _show_prepared_source_info(st, prepared: list[Path]) -> None:
+    st.info(f"Prepared source: {_prepared_source_slug(prepared)}")
+
+
+def _current_or_prepared_source(st) -> dict | None:
+    return _current_source_for_ui(st)
+
+
+def _current_or_prepared_source_is_indexed(st) -> bool:
+    return _source_is_indexed(_current_source_for_ui(st))
+
+
+def _prepared_source_exists(st) -> bool:
+    return _active_prepared_only_source(st) is not None
+
+
+def _indexed_source_exists(st) -> bool:
+    return _active_indexed_source(st) is not None
+
+
+def _current_index_slug(st) -> str | None:
+    source = _active_indexed_source(st)
+    return source.get("source_slug") if source else None
+
+
+def _prepared_index_slug(st) -> str | None:
+    source = _active_prepared_only_source(st)
+    return source.get("source_slug") if source else None
+
+
+def _allow_index_build_enabled() -> bool:
+    return os.getenv("ALLOW_INDEX_BUILD") == "1"
+
+
+def _has_prepared_files(st) -> bool:
+    return "prepared_files" in st.session_state or _has_raw_source_files()
+
+
+def _build_index_ready(st) -> bool:
+    return _has_prepared_files(st)
+
+
+def _source_status_for_sidebar(st) -> tuple[str, dict[str, Any] | None]:
+    return get_source_badge_state(), _source_for_sidebar(st)
+
+
+def _render_sidebar_status(st) -> None:
+    badge_state, current_source = _source_status_for_sidebar(st)
+    _render_source_badge(st, badge_state, current_source)
+
+
+def _render_query_unavailable(st, current_source: dict[str, Any] | None) -> None:
+    if current_source is None:
+        _show_general_no_source_warning(st)
+        return
+    if _source_prepared(current_source):
+        _show_query_warning(st, current_source)
+    else:
+        _show_general_no_source_warning(st)
+
+
+def _render_eval_unavailable(st, current_source: dict[str, Any] | None) -> None:
+    if current_source is None:
+        _show_general_no_eval_source_warning(st)
+        return
+    if _source_prepared(current_source):
+        _show_eval_warning(st, current_source)
+    else:
+        _show_general_no_eval_source_warning(st)
+
+
+def _run_evaluation_available(st, current_source: dict[str, Any] | None) -> None:
+    if current_source is None:
+        _show_general_no_eval_source_error(st)
+        return
+    if _source_prepared(current_source):
+        _show_index_required_error(st, current_source)
+    else:
+        _show_general_no_eval_source_error(st)
+
+
+def _source_eval_caption_available(summary: pd.DataFrame) -> bool:
+    return not summary.empty and "evaluated_source" in summary.columns
+
+
+def _source_eval_caption_values(summary: pd.DataFrame) -> tuple[str, int, str] | None:
+    if summary.empty or "evaluated_source" not in summary.columns:
+        return None
+    evaluated_source = summary["evaluated_source"].iloc[0]
+    if not evaluated_source:
+        return None
+    question_count = dataset_stats().get("golden_questions", 0)
+    eval_date = last_eval_date()
+    return str(evaluated_source), question_count, eval_date
+
+
+def _show_eval_caption_if_available(st, summary: pd.DataFrame) -> None:
+    values = _source_eval_caption_values(summary)
+    if values is not None:
+        _show_last_eval_caption(st, *values)
+
+
+def _show_eval_header_if_available(st, current_source: dict[str, Any] | None) -> None:
+    if current_source is not None:
+        _show_eval_header(st, current_source)
+
+
+def _show_sources_status_info(st, current_source: dict[str, Any] | None) -> None:
+    if current_source is not None:
+        if _source_is_indexed(current_source):
+            _show_sources_index_info(st, current_source)
+        else:
+            _show_sources_pending_info(st, current_source)
+
+
+def _render_query_caption_if_available(st, current_source: dict[str, Any] | None) -> None:
+    if current_source is not None and _source_is_indexed(current_source):
+        _show_query_caption(st, current_source)
+
+
+def _active_current_source(st) -> dict[str, Any] | None:
+    return _current_source_for_ui(st)
+
+
+def _active_current_source_indexed(st) -> dict[str, Any] | None:
+    return _active_indexed_source(st)
+
+
+def _active_current_source_prepared(st) -> dict[str, Any] | None:
+    return _active_prepared_only_source(st)
+
+
+def _needs_query_block(st) -> bool:
+    return not _has_index_for_current_source(st)
+
+
+def _needs_eval_block(st) -> bool:
+    return not _has_indexed_source_for_eval(st)
+
+
+def _show_query_block_message(st) -> None:
+    current_source = _active_current_source_prepared(st)
+    if current_source is not None:
+        _show_query_warning(st, current_source)
+    else:
+        _show_general_no_source_warning(st)
+
+
+def _show_eval_block_message(st) -> None:
+    current_source = _active_current_source_prepared(st)
+    if current_source is not None:
+        _show_eval_warning(st, current_source)
+    else:
+        _show_general_no_eval_source_warning(st)
+
+
+def _show_eval_run_block_message(st) -> None:
+    current_source = _active_current_source_prepared(st)
+    if current_source is not None:
+        _show_index_required_error(st, current_source)
+    else:
+        _show_general_no_eval_source_error(st)
+
+
+def _render_query_caption_ready(st) -> None:
+    current_source = _active_current_source_indexed(st)
+    if current_source is not None:
+        _show_query_caption(st, current_source)
+
+
+def _render_eval_header_ready(st) -> None:
+    current_source = _active_current_source_indexed(st)
+    if current_source is not None:
+        _show_eval_header(st, current_source)
+
+
+def _render_sources_status_ready(st) -> None:
+    current_source = _active_current_source(st)
+    _show_sources_status_info(st, current_source)
+
+
+def _prepared_source_for_message(st) -> dict[str, Any] | None:
+    return _active_current_source_prepared(st)
+
+
+def _indexed_source_for_message(st) -> dict[str, Any] | None:
+    return _active_current_source_indexed(st)
+
+
+def _query_should_render_controls(st) -> bool:
+    return _indexed_source_for_message(st) is not None
+
+
+def _eval_should_allow_run(st) -> bool:
+    return _indexed_source_for_message(st) is not None
+
+
+def _maybe_show_eval_caption(st, summary: pd.DataFrame) -> None:
+    _show_eval_caption_if_available(st, summary)
+
+
+def _maybe_show_eval_header(st) -> None:
+    _render_eval_header_ready(st)
+
+
+def _maybe_show_query_caption(st) -> None:
+    _render_query_caption_ready(st)
+
+
+def _maybe_show_sources_status(st) -> None:
+    _render_sources_status_ready(st)
+
+
+def _render_query_blocked(st) -> None:
+    _show_query_block_message(st)
+
+
+def _render_eval_blocked(st) -> None:
+    current_source = _active_current_source_prepared(st)
+    if current_source is not None:
+        _show_sources_pending_info(st, current_source)
+    _show_eval_block_message(st)
+
+
+def _render_eval_run_blocked(st) -> None:
+    _show_eval_run_block_message(st)
+
+
+def _render_build_index_status(st) -> None:
+    _maybe_show_sources_status(st)
+
+
+def _render_query_ready(st) -> None:
+    _maybe_show_query_caption(st)
+
+
+def _render_eval_ready(st, summary: pd.DataFrame) -> None:
+    _maybe_show_eval_header(st)
+    _maybe_show_eval_caption(st, summary)
+
+
+def _prepared_source_session_exists(st) -> bool:
+    return PREPARED_SOURCE_KEY in st.session_state
+
+
+def _pending_source_slug_from_session(st) -> str | None:
+    prepared = _prepared_source_state(st)
+    return prepared.get("source_slug") if prepared else None
+
+
+def _pending_source_matches_index(st) -> bool:
+    prepared = _prepared_source_state(st)
+    indexed = load_current_source()
+    return bool(prepared and indexed and prepared.get("source_slug") == indexed.get("source_slug"))
+
+
+def _cleanup_pending_source_if_index_matches(st) -> None:
+    if _pending_source_matches_index(st):
+        _clear_prepared_source(st)
+
+
+def _initialize_current_source_ui_state(st) -> None:
+    _cleanup_pending_source_if_index_matches(st)
+
+
+def _source_ui_state(st) -> dict[str, Any] | None:
+    _initialize_current_source_ui_state(st)
+    return _current_source_for_ui(st)
+
+
+def _render_source_badge(st, badge_state: str, current_source: dict[str, Any] | None) -> None:
     """Render a colored source status badge in the sidebar."""
     if badge_state == "green":
         slug = current_source.get("source_slug", "unknown") if current_source else "unknown"
@@ -422,13 +969,14 @@ def _render_source_badge(st, badge_state: str, current_source: dict | None) -> N
         st.sidebar.success(f"Source indexed: {slug}")
         st.sidebar.caption(f"Indexed at: {indexed_at}")
     elif badge_state == "yellow":
-        st.sidebar.warning("Source prepared but not indexed")
+        slug = current_source.get("source_slug", "unknown") if current_source else "unknown"
+        st.sidebar.warning(f"Source prepared but not indexed: {slug}")
     else:
         st.sidebar.error("No source prepared")
 
 
 def _render_sidebar(st) -> None:
-    current_source = load_current_source()
+    current_source = _source_ui_state(st)
     badge_state = get_source_badge_state()
     _render_source_badge(st, badge_state, current_source)
 
@@ -491,19 +1039,25 @@ def _render_sources_tab(st) -> None:
             if prepared:
                 st.success(f"Prepared {len(prepared)} files under data/raw.")
                 st.session_state["prepared_files"] = prepared
+                st.session_state[PREPARED_SOURCE_KEY] = {
+                    "source_slug": prepared[0].parent.name,
+                    "source_input": sources[0],
+                    "source_type": "huggingface" if source_type == "HuggingFace model/dataset" else "github" if source_type == "GitHub repo" else "local",
+                    "indexed_at": None,
+                }
                 st.dataframe(
                     pd.DataFrame({"file": [path.as_posix() for path in prepared]}),
                     use_container_width=True,
                 )
+                st.info(f"Prepared source: {prepared[0].parent.name}")
             else:
                 st.warning("No sources were provided.")
 
     # Build Index button — available when files exist in data/raw/
     has_prepared = "prepared_files" in st.session_state or _has_raw_source_files()
     if has_prepared:
-        current_source = load_current_source()
-        if current_source is not None:
-            st.info(f"Current index: {current_source.get('source_slug', 'unknown')}")
+        current_source = _source_ui_state(st)
+        _show_sources_status_info(st, current_source)
 
         if st.button("Build Index"):
             if not _has_raw_source_files():
@@ -520,6 +1074,7 @@ def _render_sources_tab(st) -> None:
                     progress.progress(1.0)
                     current = load_current_source()
                     slug = current.get("source_slug", "unknown") if current else "unknown"
+                    st.session_state.pop(PREPARED_SOURCE_KEY, None)
                     st.success(f"Index built successfully. {len(nodes)} chunks for source '{slug}'.")
                 except Exception as exc:
                     st.error(f"Index build failed: {exc}")
@@ -591,14 +1146,14 @@ def _render_chat_message(st, message: dict[str, Any]) -> None:
 
 
 def _render_query_tab(st) -> None:
-    current_source = load_current_source()
-    chroma_exists = CHROMA_DIR.exists()
+    current_source = _source_ui_state(st)
 
-    if current_source is None or not chroma_exists:
-        st.warning(
-            "No source is indexed yet. Go to the Sources tab to prepare and index a source. "
-            "Query will fall back to lexical-only search with degraded quality."
-        )
+    if not _query_should_render_controls(st):
+        _render_query_blocked(st)
+        return
+
+    _render_query_ready(st)
+
 
     strategy = st.selectbox("Strategy", STRATEGIES, index=STRATEGIES.index("hybrid_rerank"))
 
@@ -634,49 +1189,31 @@ def _render_query_tab(st) -> None:
 
 
 def _render_eval_tab(st) -> None:
-    current_source = load_current_source()
+    current_source = _source_ui_state(st)
+    indexed_source = _indexed_source_for_eval(st)
     summary = load_eval_summary()
     per_question = load_per_question()
     cards = metric_card_values(summary)
     backends = eval_backend_counts(summary, per_question)
 
-    # Warning: no source indexed
-    if current_source is None:
-        st.warning("No source is indexed yet. Go to the Sources tab to prepare and index a source before running evaluation.")
+    if not _eval_should_allow_run(st):
+        _render_eval_blocked(st)
+    else:
+        if indexed_source is not None and is_golden_dataset_stale(indexed_source):
+            _show_stale_dataset_warning(st, indexed_source)
+        _render_eval_ready(st, summary)
 
-    # Warning: stale golden dataset
-    if current_source is not None and is_golden_dataset_stale(current_source):
-        st.warning(
-            f"The golden dataset was generated for a different source than the currently indexed one "
-            f"('{current_source.get('source_slug', '?')}'). Click 'Run Evaluation' to regenerate."
-        )
-
-    # Source info header
-    if current_source is not None:
-        slug = current_source.get("source_slug", "unknown")
-        indexed_at = current_source.get("indexed_at", "unknown")
-        st.info(f"Evaluated on: {slug} | Indexed: {indexed_at}")
-
-    # Show evaluated_source from CSV if available
-    if not summary.empty and "evaluated_source" in summary.columns:
-        evaluated_source = summary["evaluated_source"].iloc[0]
-        if evaluated_source:
-            question_count = dataset_stats().get("golden_questions", 0)
-            eval_date = last_eval_date()
-            st.caption(f"Last eval: {evaluated_source} | {question_count} questions | {eval_date}")
-
-    # Run Evaluation button
     if st.button("Run Evaluation"):
-        if current_source is None:
-            st.error("Cannot run evaluation: no source is indexed. Go to the Sources tab first.")
+        if not _eval_should_allow_run(st):
+            _render_eval_run_blocked(st)
         else:
             with st.spinner("Running evaluation... This may take a minute."):
                 try:
                     run_evaluation_inline()
-                    st.success("Evaluation complete. Refreshing...")
+                    _show_eval_success(st)
                     st.rerun()
                 except Exception as exc:
-                    st.error(f"Evaluation failed: {exc}")
+                    _show_eval_failure(st, exc)
 
     st.subheader("Evaluation summary")
     card_columns = st.columns(4)

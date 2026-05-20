@@ -76,6 +76,12 @@ class FakeSidebar:
 
 
 class FakeStreamlit:
+    _radio_value: str | None = None
+    _text_input_value: str = ""
+    _text_area_value: str = ""
+    _checkbox_value: bool = False
+    _button_return: bool = False
+
     def __init__(self, prompt=None, messages=None):
         self.session_state = {}
         if messages is not None:
@@ -614,6 +620,7 @@ class AppHelperTests(unittest.TestCase):
             result = app.load_current_source(path)
 
         self.assertIsNotNone(result)
+        assert result is not None
         self.assertEqual(result["source_slug"], "test-repo")
 
     def test_load_current_source_returns_none_when_missing(self):
@@ -697,9 +704,11 @@ class EvalTabTests(unittest.TestCase):
 
     def test_eval_tab_shows_warning_when_golden_dataset_is_stale(self):
         fake_st = FakeStreamlit()
-        current = {"source_slug": "new-repo"}
+        current = {"source_slug": "new-repo", "indexed_at": "2025-01-15T10:00:00+00:00"}
         with (
+            patch("app._current_source_for_ui", return_value=current),
             patch("app.load_current_source", return_value=current),
+            patch("app._indexed_source_for_eval", return_value=current),
             patch("app.is_golden_dataset_stale", return_value=True),
             patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
             patch("app.last_eval_date", return_value="2025-01-15 10:00"),
@@ -805,7 +814,7 @@ class SourcesTabTests(unittest.TestCase):
         with (
             patch("app.prepare_sources_for_app", return_value=[]),
             patch("app._has_raw_source_files", return_value=True),
-            patch("app.load_current_source", return_value={"source_slug": "test-repo"}),
+            patch("app._current_source_for_ui", return_value={"source_slug": "test-repo", "indexed_at": None}),
         ):
             app._render_sources_tab(fake_st)
 
@@ -836,6 +845,7 @@ class SourcesTabTests(unittest.TestCase):
         with (
             patch("app.prepare_sources_for_app", return_value=[]),
             patch("app._has_raw_source_files", return_value=True),
+            patch("app._current_source_for_ui", return_value={"source_slug": "test-repo", "indexed_at": None}),
             patch("app.load_current_source", return_value={"source_slug": "test-repo"}),
             patch("os.getenv", side_effect=_mock_getenv),
             patch("app.run_build_index", return_value=nodes),
@@ -925,6 +935,7 @@ class QueryTabWarningTests(unittest.TestCase):
         fake_st = FakeStreamlit()
         with (
             patch("app.load_current_source", return_value=None),
+            patch("app._current_source_for_ui", return_value=None),
             patch("app.CHROMA_DIR") as mock_chroma,
         ):
             mock_chroma.exists.return_value = False
@@ -932,6 +943,197 @@ class QueryTabWarningTests(unittest.TestCase):
 
         warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
         self.assertTrue(any("No source is indexed" in w for w in warnings))
+
+    def test_query_tab_shows_prepared_source_warning_before_index(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = False
+            app._render_query_tab(fake_st)
+
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("prepared but not indexed" in w for w in warnings))
+        self.assertTrue(any("phi3-mini-sql-generator" in w for w in warnings))
+
+    def test_query_tab_returns_early_when_source_is_only_prepared(self):
+        fake_st = FakeStreamlit(prompt="What is the dataset?")
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.run_chat_query") as run_chat_query,
+        ):
+            mock_chroma.exists.return_value = False
+            app._render_query_tab(fake_st)
+
+        run_chat_query.assert_not_called()
+
+    def test_query_tab_shows_indexed_source_caption_when_ready(self):
+        fake_st = FakeStreamlit()
+        current = {"source_slug": "phi3-mini-sql-generator", "indexed_at": "2026-05-20T00:00:00+00:00"}
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = True
+            app._render_query_tab(fake_st)
+
+        captions = [event[1] for event in fake_st.events if event[0] == "caption"]
+        self.assertTrue(any("Indexed source: phi3-mini-sql-generator" in c for c in captions))
+
+    def test_eval_tab_shows_prepared_source_pending_index_message(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.load_current_source", return_value=None),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+            patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+        ):
+            app._render_eval_tab(fake_st)
+
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        infos = [event[1] for event in fake_st.events if event[0] == "info"]
+        self.assertTrue(any("prepared but not indexed" in w for w in warnings))
+        self.assertTrue(any("Prepared source pending index: phi3-mini-sql-generator" in i for i in infos))
+
+    def test_sources_tab_shows_prepared_source_pending_index_message(self):
+        fake_st = FakeStreamlit()
+        fake_st._radio_value = "HuggingFace model/dataset"
+        fake_st._text_input_value = "https://huggingface.co/Shizu0n/phi3-mini-sql-generator"
+        fake_st._checkbox_value = True
+        fake_st._button_return = True
+        prepared = [Path("data/raw/shizu0n-phi3-mini-sql-generator/README.md")]
+
+        with (
+            patch("app.prepare_sources_for_app", return_value=prepared),
+            patch("app._has_raw_source_files", return_value=True),
+        ):
+            app._render_sources_tab(fake_st)
+
+        infos = [event[1] for event in fake_st.events if event[0] == "info"]
+        self.assertTrue(any("Prepared source: shizu0n-phi3-mini-sql-generator" in i for i in infos))
+        self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_slug"], "shizu0n-phi3-mini-sql-generator")
+
+    def test_build_index_message_prefers_prepared_source_over_stale_current_index(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "shizu0n-phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+        ):
+            app._render_sources_tab(fake_st)
+
+        infos = [event[1] for event in fake_st.events if event[0] == "info"]
+        self.assertTrue(any("Prepared source pending index: shizu0n-phi3-mini-sql-generator" in i for i in infos))
+
+    def test_prepared_source_is_cleared_after_successful_index_build(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "pending", "indexed_at": None}
+        fake_st._button_return = True
+        nodes = [{"text": "chunk 1"}]
+
+        def _mock_getenv(key, default=None):
+            if key == "ALLOW_INDEX_BUILD":
+                return "1"
+            return os.environ.get(key, default)
+
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+            patch("app._current_source_for_ui", return_value={"source_slug": "pending", "indexed_at": None}),
+            patch("app.load_current_source", return_value={"source_slug": "indexed-source"}),
+            patch("os.getenv", side_effect=_mock_getenv),
+            patch("app.run_build_index", return_value=nodes),
+        ):
+            app._render_sources_tab(fake_st)
+
+        self.assertNotIn(app.PREPARED_SOURCE_KEY, fake_st.session_state)
+
+    def test_current_source_for_ui_prefers_prepared_source_when_it_differs(self):
+        prepared = {"source_slug": "prepared-source", "indexed_at": None}
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = prepared
+        app.st = fake_st
+        with patch("app.load_current_source", return_value={"source_slug": "indexed-source", "indexed_at": "2026-05-20"}):
+            current = app._current_source_for_ui(fake_st)
+
+        self.assertEqual(current, prepared)
+
+    def test_current_source_for_ui_falls_back_to_indexed_source_when_same_slug(self):
+        prepared = {"source_slug": "same-source", "indexed_at": None}
+        indexed = {"source_slug": "same-source", "indexed_at": "2026-05-20"}
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = prepared
+        app.st = fake_st
+        with patch("app.load_current_source", return_value=indexed):
+            current = app._current_source_for_ui(fake_st)
+
+        self.assertEqual(current, indexed)
+
+    def test_current_source_for_ui_returns_indexed_source_without_prepared_state(self):
+        fake_st = FakeStreamlit()
+        app.st = fake_st
+        indexed = {"source_slug": "indexed-source", "indexed_at": "2026-05-20"}
+        with patch("app.load_current_source", return_value=indexed):
+            current = app._current_source_for_ui(fake_st)
+
+        self.assertEqual(current, indexed)
+
+    def test_current_source_for_ui_returns_none_when_nothing_exists(self):
+        fake_st = FakeStreamlit()
+        app.st = fake_st
+        with patch("app.load_current_source", return_value=None):
+            current = app._current_source_for_ui(fake_st)
+
+        self.assertIsNone(current)
+
+    def test_prepared_source_state_returns_none_for_missing_or_invalid_value(self):
+        fake_st = FakeStreamlit()
+        app.st = fake_st
+        self.assertIsNone(app._prepared_source_state(fake_st))
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = "not-a-dict"
+        self.assertIsNone(app._prepared_source_state(fake_st))
+
+    def test_prepared_source_state_returns_dict_value(self):
+        fake_st = FakeStreamlit()
+        app.st = fake_st
+        prepared = {"source_slug": "prepared-source"}
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = prepared
+        self.assertEqual(app._prepared_source_state(fake_st), prepared)
+
+    def test_eval_tab_blocks_run_evaluation_for_prepared_but_unindexed_source(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return = True
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.load_current_source", return_value=None),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+            patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.run_evaluation_inline") as run_eval,
+        ):
+            app._render_eval_tab(fake_st)
+
+        run_eval.assert_not_called()
+        errors = [event[1] for event in fake_st.events if event[0] == "error"]
+        self.assertTrue(any("prepared but not indexed" in e for e in errors))
 
     def test_query_tab_no_warning_when_source_is_indexed(self):
         fake_st = FakeStreamlit()
@@ -945,18 +1147,358 @@ class QueryTabWarningTests(unittest.TestCase):
         warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
         self.assertFalse(any("No source is indexed" in w for w in warnings))
 
-    def test_query_tab_still_renders_strategy_selectbox_with_warning(self):
+    def test_query_tab_returns_before_rendering_controls_when_no_source_is_indexed(self):
         fake_st = FakeStreamlit()
         with (
             patch("app.load_current_source", return_value=None),
+            patch("app._current_source_for_ui", return_value=None),
             patch("app.CHROMA_DIR") as mock_chroma,
         ):
             mock_chroma.exists.return_value = False
             app._render_query_tab(fake_st)
 
         selectboxes = [event for event in fake_st.events if event[0] == "selectbox"]
+        self.assertEqual(selectboxes, [])
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("No source is indexed" in w for w in warnings))
+
+    def test_query_tab_returns_before_rendering_controls_when_source_is_only_prepared(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = False
+            app._render_query_tab(fake_st)
+
+        selectboxes = [event for event in fake_st.events if event[0] == "selectbox"]
+        self.assertEqual(selectboxes, [])
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("prepared but not indexed" in w for w in warnings))
+
+    def test_query_tab_renders_strategy_selectbox_when_source_is_indexed(self):
+        fake_st = FakeStreamlit()
+        current = {"source_slug": "repo", "indexed_at": "2026-05-20T00:00:00+00:00"}
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = True
+            app._render_query_tab(fake_st)
+
+        selectboxes = [event for event in fake_st.events if event[0] == "selectbox"]
         self.assertTrue(len(selectboxes) >= 1)
         self.assertEqual(selectboxes[0][1], "Strategy")
+        captions = [event[1] for event in fake_st.events if event[0] == "caption"]
+        self.assertTrue(any("Indexed source: repo" in c for c in captions))
+
+    def test_eval_tab_uses_indexed_source_header_after_eval(self):
+        fake_st = FakeStreamlit()
+        current = {"source_slug": "raw", "indexed_at": "2026-05-18T00:04:28.665787+00:00"}
+        summary = pd.DataFrame([
+            {"strategy": "semantic_only", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069, "summary_backend": "offline_heuristic", "evaluated_source": "raw"}
+        ])
+        per_question = pd.DataFrame([{"strategy": "semantic_only", "question": "q", "answer": "a", "ground_truth": "g", "source_doc": "doc", "evaluation_backend": "offline_heuristic", "summary_backend": "offline_heuristic", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069}])
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.is_golden_dataset_stale", return_value=False),
+            patch("app.dataset_stats", return_value={"golden_questions": 3, "evaluated_rows": 12}),
+            patch("app.last_eval_date", return_value="2026-05-20 15:46"),
+            patch("app.load_eval_summary", return_value=summary),
+            patch("app.load_per_question", return_value=per_question),
+            patch("app.metric_card_values", return_value={"strategy": "semantic_only", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {"offline_heuristic": 4}, "question_backends": {"offline_heuristic": 12}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=per_question),
+        ):
+            app._render_eval_tab(fake_st)
+
+        infos = [event[1] for event in fake_st.events if event[0] == "info"]
+        self.assertTrue(any("Evaluated on: raw" in i for i in infos))
+        captions = [event[1] for event in fake_st.events if event[0] == "caption"]
+        self.assertTrue(any("Last eval: raw | 3 questions | 2026-05-20 15:46" in c for c in captions))
+
+    def test_query_tab_keeps_prompt_box_disabled_until_source_is_indexed(self):
+        fake_st = FakeStreamlit(prompt="What is the dataset?")
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.run_chat_query") as run_chat_query,
+        ):
+            mock_chroma.exists.return_value = False
+            app._render_query_tab(fake_st)
+
+        run_chat_query.assert_not_called()
+        chat_inputs = [event for event in fake_st.events if event[0] == "chat_input"]
+        self.assertEqual(chat_inputs, [])
+
+    def test_eval_tab_does_not_show_stale_last_eval_caption_without_summary_source(self):
+        fake_st = FakeStreamlit()
+        current = {"source_slug": "raw", "indexed_at": "2026-05-18T00:04:28.665787+00:00"}
+        summary = pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.is_golden_dataset_stale", return_value=False),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+            patch("app.load_eval_summary", return_value=summary),
+            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+        ):
+            app._render_eval_tab(fake_st)
+
+        captions = [event[1] for event in fake_st.events if event[0] == "caption"]
+        self.assertFalse(any("Last eval:" in c for c in captions))
+
+    def test_build_index_without_allow_index_build_surfaces_actionable_error(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return = True
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "0"}),
+        ):
+            app._render_sources_tab(fake_st)
+
+        errors = [event[1] for event in fake_st.events if event[0] == "error"]
+        self.assertTrue(any("ALLOW_INDEX_BUILD=1" in e for e in errors))
+
+    def test_prepared_source_info_overrides_stale_current_index_message(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+        ):
+            app._render_sources_tab(fake_st)
+
+        infos = [event[1] for event in fake_st.events if event[0] == "info"]
+        self.assertFalse(any("Current index:" in i for i in infos))
+        self.assertTrue(any("Prepared source pending index:" in i for i in infos))
+
+    def test_eval_tab_blocks_prepared_source_from_reusing_old_eval_context(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return = True
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        indexed = None
+        summary = pd.DataFrame([
+            {"strategy": "semantic_only", "faithfulness": 1.0, "answer_relevancy": 0.369, "context_recall": 0.198, "context_precision": 0.017, "summary_backend": "offline_heuristic", "evaluated_source": "raw"}
+        ])
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.load_current_source", return_value=indexed),
+            patch("app.dataset_stats", return_value={"golden_questions": 3, "evaluated_rows": 12}),
+            patch("app.last_eval_date", return_value="2026-05-20 15:46"),
+            patch("app.load_eval_summary", return_value=summary),
+            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.metric_card_values", return_value={"strategy": "semantic_only", "faithfulness": 1.0, "answer_relevancy": 0.369, "context_recall": 0.198, "context_precision": 0.017}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {"offline_heuristic": 4}, "question_backends": {"offline_heuristic": 12}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.run_evaluation_inline") as run_eval,
+        ):
+            app._render_eval_tab(fake_st)
+
+        run_eval.assert_not_called()
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("prepared but not indexed" in w for w in warnings))
+        errors = [event[1] for event in fake_st.events if event[0] == "error"]
+        self.assertTrue(any("prepared but not indexed" in e for e in errors))
+
+    def test_query_tab_does_not_render_chat_input_for_stale_prepared_source(self):
+        fake_st = FakeStreamlit(prompt="dataset?")
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = False
+            app._render_query_tab(fake_st)
+
+        self.assertEqual([event for event in fake_st.events if event[0] == "chat_input"], [])
+
+    def test_eval_tab_uses_prepared_source_info_when_no_index_exists(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.load_current_source", return_value=None),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+            patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+        ):
+            app._render_eval_tab(fake_st)
+
+        infos = [event[1] for event in fake_st.events if event[0] == "info"]
+        self.assertTrue(any("Prepared source pending index: phi3-mini-sql-generator" in i for i in infos))
+
+    def test_sources_tab_preserves_prepared_state_until_index_build(self):
+        fake_st = FakeStreamlit()
+        fake_st._radio_value = "HuggingFace model/dataset"
+        fake_st._text_input_value = "https://huggingface.co/Shizu0n/phi3-mini-sql-generator"
+        fake_st._checkbox_value = True
+        fake_st._button_return = True
+        prepared = [Path("data/raw/shizu0n-phi3-mini-sql-generator/README.md")]
+
+        with (
+            patch("app.prepare_sources_for_app", return_value=prepared),
+            patch("app._has_raw_source_files", return_value=True),
+        ):
+            app._render_sources_tab(fake_st)
+            self.assertIn(app.PREPARED_SOURCE_KEY, fake_st.session_state)
+
+        self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_slug"], "shizu0n-phi3-mini-sql-generator")
+
+    def test_sources_tab_shows_build_index_button_for_prepared_state(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+        ):
+            app._render_sources_tab(fake_st)
+
+        buttons = [event[1] for event in fake_st.events if event[0] == "button"]
+        self.assertIn("Build Index", buttons)
+
+    def test_sidebar_shows_prepared_source_slug(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.get_source_badge_state", return_value="yellow"),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+        ):
+            app._render_sidebar(fake_st)
+
+        sidebar_warnings = [event[1] for event in fake_st.events if event[0] == "sidebar_warning"]
+        self.assertTrue(any("phi3-mini-sql-generator" in w for w in sidebar_warnings))
+
+    def test_build_index_success_clears_pending_prepared_info(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "phi3-mini-sql-generator", "indexed_at": None}
+        fake_st._button_return = True
+        nodes = [{"text": "chunk 1"}]
+
+        def _mock_getenv(key, default=None):
+            if key == "ALLOW_INDEX_BUILD":
+                return "1"
+            return os.environ.get(key, default)
+
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+            patch("app._current_source_for_ui", return_value={"source_slug": "phi3-mini-sql-generator", "indexed_at": None}),
+            patch("app.load_current_source", return_value={"source_slug": "phi3-mini-sql-generator"}),
+            patch("os.getenv", side_effect=_mock_getenv),
+            patch("app.run_build_index", return_value=nodes),
+        ):
+            app._render_sources_tab(fake_st)
+
+        self.assertNotIn(app.PREPARED_SOURCE_KEY, fake_st.session_state)
+
+    def test_prepared_source_state_is_ignored_when_not_dict(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = ["unexpected"]
+        self.assertIsNone(app._prepared_source_state(fake_st))
+
+    def test_current_source_for_ui_prefers_indexed_when_no_prepared_source(self):
+        fake_st = FakeStreamlit()
+        indexed = {"source_slug": "repo", "indexed_at": "2026-05-20T00:00:00+00:00"}
+        with patch("app.load_current_source", return_value=indexed):
+            current = app._current_source_for_ui(fake_st)
+
+        self.assertEqual(current, indexed)
+
+    def test_current_source_for_ui_prefers_prepared_when_index_is_different(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "new-repo", "indexed_at": None}
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = prepared
+        with patch("app.load_current_source", return_value={"source_slug": "old-repo", "indexed_at": "2026-05-20T00:00:00+00:00"}):
+            current = app._current_source_for_ui(fake_st)
+
+        self.assertEqual(current, prepared)
+
+    def test_query_tab_warning_mentions_prepared_source_name(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "new-repo", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = False
+            app._render_query_tab(fake_st)
+
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("new-repo" in w for w in warnings))
+
+    def test_eval_tab_warning_mentions_prepared_source_name(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "new-repo", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.load_current_source", return_value=None),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+            patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+        ):
+            app._render_eval_tab(fake_st)
+
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("new-repo" in w for w in warnings))
+
+    def test_sources_tab_pending_message_uses_prepared_slug(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "prepared-slug", "indexed_at": None}
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=True),
+        ):
+            app._render_sources_tab(fake_st)
+
+        infos = [event[1] for event in fake_st.events if event[0] == "info"]
+        self.assertTrue(any("prepared-slug" in i for i in infos))
+
+    def test_eval_tab_does_not_call_run_evaluation_when_index_missing(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return = True
+        with (
+            patch("app._current_source_for_ui", return_value=None),
+            patch("app.load_current_source", return_value=None),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+            patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+            patch("app.build_grouped_bar_chart", return_value=None),
+            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            patch("app.run_evaluation_inline") as run_eval,
+        ):
+            app._render_eval_tab(fake_st)
+
+        run_eval.assert_not_called()
 
 
 if __name__ == "__main__":

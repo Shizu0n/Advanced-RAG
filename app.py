@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Iterable, cast
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -307,8 +307,6 @@ def is_golden_dataset_stale(current_source: dict | None, golden_path: Path = GOL
     if not isinstance(first, dict):
         return False
     golden_slug = first.get("source_slug")
-    if golden_slug is None:
-        return False
     return golden_slug != current_source.get("source_slug")
 
 
@@ -345,11 +343,13 @@ def get_source_badge_state(
     return "grey"
 
 
-def run_build_index() -> list:
+def run_build_index(source_files: Iterable[Path] | None = None) -> list:
     """Build the vector index from data/raw/ sources. Returns the nodes list."""
     from ingestion import build_index
 
-    _index, nodes = build_index()
+    files = list(source_files) if source_files is not None else None
+    raw_dir = files[0].parent if files else RAW_DIR
+    _index, nodes = build_index(source_files=files, raw_dir=raw_dir)
     return nodes
 
 
@@ -630,6 +630,13 @@ def _show_stale_dataset_warning(st, current_source: dict[str, Any]) -> None:
     )
 
 
+def _show_stale_eval_results_warning(st, current_source: dict[str, Any]) -> None:
+    st.warning(
+        f"The saved evaluation results were generated for a different source than the currently indexed one "
+        f"('{current_source.get('source_slug', '?')}'). Click 'Run Evaluation' to regenerate."
+    )
+
+
 def _show_no_raw_files_error(st) -> None:
     st.error("No source files found in data/raw/. Prepare a source first.")
 
@@ -785,6 +792,26 @@ def _source_eval_caption_values(summary: pd.DataFrame) -> tuple[str, int, str] |
     question_count = dataset_stats().get("golden_questions", 0)
     eval_date = last_eval_date()
     return str(evaluated_source), question_count, eval_date
+
+
+def _eval_summary_matches_source(summary: pd.DataFrame, current_source: dict[str, Any] | None) -> bool:
+    if summary.empty or current_source is None or "evaluated_source" not in summary.columns:
+        return True
+    evaluated_sources = summary["evaluated_source"].dropna().astype(str)
+    evaluated_sources = evaluated_sources[evaluated_sources != ""]
+    if evaluated_sources.empty:
+        return True
+    return set(evaluated_sources) == {str(current_source.get("source_slug", ""))}
+
+
+def _discard_stale_eval_results(
+    summary: pd.DataFrame,
+    per_question: pd.DataFrame,
+    current_source: dict[str, Any] | None,
+) -> tuple[pd.DataFrame, pd.DataFrame, bool]:
+    if _eval_summary_matches_source(summary, current_source):
+        return summary, per_question, False
+    return _empty_frame(["strategy", *METRICS, "summary_backend", "evaluated_source"]), _empty_frame(PER_QUESTION_COLUMNS), True
 
 
 def _show_eval_caption_if_available(st, summary: pd.DataFrame) -> None:
@@ -1070,7 +1097,7 @@ def _render_sources_tab(st) -> None:
             else:
                 progress = st.progress(0.0, "Building index...")
                 try:
-                    nodes = run_build_index()
+                    nodes = run_build_index(st.session_state.get("prepared_files"))
                     progress.progress(1.0)
                     current = load_current_source()
                     slug = current.get("source_slug", "unknown") if current else "unknown"
@@ -1193,15 +1220,19 @@ def _render_eval_tab(st) -> None:
     indexed_source = _indexed_source_for_eval(st)
     summary = load_eval_summary()
     per_question = load_per_question()
-    cards = metric_card_values(summary)
-    backends = eval_backend_counts(summary, per_question)
 
     if not _eval_should_allow_run(st):
         _render_eval_blocked(st)
         return
 
+    summary, per_question, stale_eval_results = _discard_stale_eval_results(summary, per_question, indexed_source)
+    cards = metric_card_values(summary)
+    backends = eval_backend_counts(summary, per_question)
+
     if indexed_source is not None and is_golden_dataset_stale(indexed_source):
         _show_stale_dataset_warning(st, indexed_source)
+    if stale_eval_results and indexed_source is not None:
+        _show_stale_eval_results_warning(st, indexed_source)
     _render_eval_ready(st, summary)
 
     if st.button("Run Evaluation"):

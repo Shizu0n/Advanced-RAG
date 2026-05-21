@@ -666,6 +666,17 @@ class AppHelperTests(unittest.TestCase):
 
             self.assertFalse(app.is_golden_dataset_stale(current, golden_path))
 
+    def test_is_golden_dataset_stale_returns_true_for_legacy_dataset_without_source_slug(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(
+                json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d"}]),
+                encoding="utf-8",
+            )
+            current = {"source_slug": "repo"}
+
+            self.assertTrue(app.is_golden_dataset_stale(current, golden_path))
+
     def test_is_golden_dataset_stale_returns_false_when_no_current_source(self):
         self.assertFalse(app.is_golden_dataset_stale(None))
 
@@ -835,6 +846,8 @@ class SourcesTabTests(unittest.TestCase):
     def test_build_index_button_builds_index_on_click(self):
         fake_st = FakeStreamlit()
         fake_st._button_return = True
+        prepared = [Path("data/raw/test-repo/README.md")]
+        fake_st.session_state["prepared_files"] = prepared
         nodes = [{"text": "chunk 1"}, {"text": "chunk 2"}]
 
         def _mock_getenv(key, default=None):
@@ -848,10 +861,11 @@ class SourcesTabTests(unittest.TestCase):
             patch("app._current_source_for_ui", return_value={"source_slug": "test-repo", "indexed_at": None}),
             patch("app.load_current_source", return_value={"source_slug": "test-repo"}),
             patch("os.getenv", side_effect=_mock_getenv),
-            patch("app.run_build_index", return_value=nodes),
+            patch("app.run_build_index", return_value=nodes) as run_build,
         ):
             app._render_sources_tab(fake_st)
 
+        run_build.assert_called_once_with(prepared)
         progress_events = [event for event in fake_st.events if event[0] == "progress"]
         self.assertTrue(len(progress_events) > 0)
 
@@ -1258,6 +1272,37 @@ class QueryTabWarningTests(unittest.TestCase):
 
         captions = [event[1] for event in fake_st.events if event[0] == "caption"]
         self.assertFalse(any("Last eval:" in c for c in captions))
+
+    def test_eval_tab_does_not_render_results_for_different_indexed_source(self):
+        fake_st = FakeStreamlit()
+        current = {"source_slug": "qa-fixture", "indexed_at": "2026-05-21T19:22:53.345777+00:00"}
+        summary = pd.DataFrame([
+            {"strategy": "semantic_only", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069, "summary_backend": "offline_heuristic", "evaluated_source": "raw"}
+        ])
+        per_question = pd.DataFrame([
+            {"strategy": "semantic_only", "question": "q", "answer": "a", "ground_truth": "g", "source_doc": "doc", "evaluation_backend": "offline_heuristic", "summary_backend": "offline_heuristic", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069}
+        ])
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.is_golden_dataset_stale", return_value=False),
+            patch("app.dataset_stats", return_value={"golden_questions": 3, "evaluated_rows": 12}),
+            patch("app.last_eval_date", return_value="2026-05-20 15:46"),
+            patch("app.load_eval_summary", return_value=summary),
+            patch("app.load_per_question", return_value=per_question),
+        ):
+            app._render_eval_tab(fake_st)
+
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        captions = [event[1] for event in fake_st.events if event[0] == "caption"]
+        metrics = [event for event in fake_st.events if event[0] == "metric"]
+        dataframes = [event for event in fake_st.events if event[0] == "dataframe"]
+
+        self.assertTrue(any("saved evaluation results" in w for w in warnings))
+        self.assertFalse(any("Last eval: raw" in c for c in captions))
+        self.assertTrue(all(value == "n/a" for _, _, value in metrics))
+        self.assertEqual(dataframes[-1][1], app.PER_QUESTION_COLUMNS)
+        self.assertIn("Run Evaluation", [event[1] for event in fake_st.events if event[0] == "button"])
 
     def test_build_index_without_allow_index_build_surfaces_actionable_error(self):
         fake_st = FakeStreamlit()

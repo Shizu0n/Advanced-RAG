@@ -29,6 +29,9 @@ class StaticProvider:
 
 
 class StaticPipeline:
+    def __init__(self, nodes=None):
+        self.nodes = list(nodes or [])
+
     def answer_query(self, question, strategy):
         return {
             "answer": f"answer for {question}",
@@ -150,6 +153,7 @@ class GoldenDatasetTests(unittest.TestCase):
                 patch.object(evaluation, "build_index") as build,
                 patch.object(evaluation, "load_local_context_nodes", return_value=[node]),
                 patch.object(evaluation, "generate_golden_dataset") as generate,
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=None),
                 patch.object(evaluation, "LocalRAGPipeline", return_value="pipeline"),
                 patch.object(evaluation, "run_evaluation") as run,
             ):
@@ -169,6 +173,7 @@ class GoldenDatasetTests(unittest.TestCase):
                 patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
                 patch.object(evaluation, "build_index", return_value=("index", ["node"])) as build,
                 patch.object(evaluation, "generate_golden_dataset") as generate,
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=None),
                 patch.object(evaluation, "LocalRAGPipeline", return_value="pipeline"),
                 patch.object(evaluation, "run_evaluation") as run,
             ):
@@ -177,6 +182,33 @@ class GoldenDatasetTests(unittest.TestCase):
             build.assert_called_once()
             generate.assert_called_once_with(["node"], output_path=golden_path)
             run.assert_called_once_with(pipeline="pipeline")
+
+    def test_main_reuses_existing_indexed_pipeline_when_golden_dataset_is_stale(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+            node = TextNode(id_="indexed", text="Indexed source context explains the current repository.")
+            indexed_pipeline = StaticPipeline(nodes=[node])
+            golden_path.write_text(
+                json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d"}]),
+                encoding="utf-8",
+            )
+            current_source_path.write_text(json.dumps({"source_slug": "current-repo"}), encoding="utf-8")
+
+            with (
+                patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "1"}, clear=True),
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "build_index") as build,
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=indexed_pipeline),
+                patch.object(evaluation, "generate_golden_dataset") as generate,
+                patch.object(evaluation, "run_evaluation") as run,
+            ):
+                evaluation.main()
+
+            build.assert_not_called()
+            generate.assert_called_once_with([node], output_path=golden_path)
+            run.assert_called_once_with(pipeline=indexed_pipeline)
 
     def test_gemini_ragas_opt_in_requires_cloud_free_tier_and_key(self):
         rows = [
@@ -602,16 +634,19 @@ class InvalidationTests(unittest.TestCase):
 
             self.assertFalse(result)
 
-    def test_invalidate_golden_dataset_if_stale_ignores_golden_without_source_slug(self):
+    def test_invalidate_golden_dataset_if_stale_deletes_legacy_dataset_without_source_slug(self):
         with TemporaryDirectory() as tmpdir:
             golden_path = Path(tmpdir) / "golden_dataset.json"
+            summary_path = Path(tmpdir) / "ragas_results.csv"
+            detail_path = Path(tmpdir) / "ragas_per_question.csv"
             current_source_path = Path(tmpdir) / "current_source.json"
 
-            # Old-format golden dataset without source_slug field
             golden_path.write_text(
                 json.dumps([{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "d"}]),
                 encoding="utf-8",
             )
+            summary_path.write_text("strategy\n", encoding="utf-8")
+            detail_path.write_text("question\n", encoding="utf-8")
             current_source_path.write_text(
                 json.dumps({"source_slug": "new-repo", "source_type": "local"}),
                 encoding="utf-8",
@@ -620,11 +655,15 @@ class InvalidationTests(unittest.TestCase):
             with (
                 patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
                 patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", detail_path),
             ):
                 result = evaluation.invalidate_golden_dataset_if_stale()
 
-            self.assertFalse(result)
-            self.assertTrue(golden_path.exists())
+            self.assertTrue(result)
+            self.assertFalse(golden_path.exists())
+            self.assertFalse(summary_path.exists())
+            self.assertFalse(detail_path.exists())
 
 
 if __name__ == "__main__":

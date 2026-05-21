@@ -24,6 +24,7 @@ from source_loader import prepare_sources
 
 RAW_DIR = Path("data/raw")
 CHROMA_DIR = Path("chroma_db")
+CHROMA_COLLECTION_NAME = "advanced_rag"
 PYTHON_TUTORIAL_URL = "https://docs.python.org/3/tutorial/"
 PAGE_LIMIT = 50
 EMBED_MODEL = "BAAI/bge-small-en-v1.5"
@@ -263,7 +264,11 @@ def build_index(
 
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-    chroma_collection = chroma_client.get_or_create_collection("advanced_rag")
+    try:
+        chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
+    except chromadb.errors.NotFoundError:
+        pass
+    chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
     vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
     storage_context = StorageContext.from_defaults(vector_store=vector_store)
     embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)

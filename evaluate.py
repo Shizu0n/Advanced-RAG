@@ -64,10 +64,6 @@ def invalidate_golden_dataset_if_stale() -> bool:
         return False
 
     golden_slug = first_item.get("source_slug")
-    if golden_slug is None:
-        # Golden dataset predates source tracking; leave it alone.
-        return False
-
     if golden_slug == current.get("source_slug"):
         return False
 
@@ -454,8 +450,16 @@ def print_markdown_report(results: dict[str, dict[str, float]]) -> None:
     )
 
 
+def _load_indexed_pipeline() -> LocalRAGPipeline | None:
+    if load_current_source() is None:
+        return None
+    pipeline = LocalRAGPipeline(allow_index_build=False)
+    pipeline._ensure_ready()
+    return pipeline if pipeline.index is not None and pipeline.nodes else None
+
+
 def main() -> None:
-    index = None
+    pipeline = _load_indexed_pipeline()
     nodes: Sequence[Any] | None = None
     gemini_client = (
         gemini_ragas.client_from_config(gemini_ragas.config_from_env()) if _real_ragas_enabled() else None
@@ -464,8 +468,11 @@ def main() -> None:
     try:
         load_golden_dataset(GOLDEN_DATASET_PATH)
     except (FileNotFoundError, json.JSONDecodeError, ValueError):
-        if _index_build_enabled():
+        if pipeline is not None:
+            nodes = pipeline.nodes
+        elif _index_build_enabled():
             index, nodes = build_index()
+            pipeline = LocalRAGPipeline(index=index, nodes=nodes, allow_index_build=False)
         else:
             nodes = load_local_context_nodes()
             if not nodes:
@@ -483,11 +490,7 @@ def main() -> None:
         else:
             generate_golden_dataset(nodes, output_path=GOLDEN_DATASET_PATH)
 
-    pipeline = LocalRAGPipeline(
-        index=index,
-        nodes=nodes,
-        allow_index_build=_index_build_enabled(),
-    )
+    pipeline = pipeline or LocalRAGPipeline(nodes=nodes, allow_index_build=False)
     if gemini_client:
         run_evaluation(pipeline=pipeline, gemini_client=gemini_client)
     else:

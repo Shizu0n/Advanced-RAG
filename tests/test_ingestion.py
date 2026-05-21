@@ -158,6 +158,53 @@ class CurrentSourceTests(unittest.TestCase):
             self.assertGreaterEqual(data["file_count"], 1)
             self.assertGreaterEqual(data["chunk_count"], 1)
 
+    def test_build_index_replaces_existing_chroma_collection(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "test-repo"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "readme.md").write_text("# Hello\nThis is a test document with real content.", encoding="utf-8")
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_dir = Path(tmpdir) / "chroma_db"
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb") as mock_chromadb,
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(raw_dir=raw_dir)
+
+            client = mock_chromadb.PersistentClient.return_value
+            client.delete_collection.assert_called_once_with(ingestion.CHROMA_COLLECTION_NAME)
+            client.create_collection.assert_called_once_with(ingestion.CHROMA_COLLECTION_NAME)
+            client.get_or_create_collection.assert_not_called()
+
+    def test_build_index_allows_first_chroma_collection_creation(self):
+        not_found_error = ingestion.chromadb.errors.NotFoundError
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "test-repo"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "readme.md").write_text("# Hello\nThis is a test document with real content.", encoding="utf-8")
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_dir = Path(tmpdir) / "chroma_db"
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb") as mock_chromadb,
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_chromadb.errors.NotFoundError = not_found_error
+                mock_chromadb.PersistentClient.return_value.delete_collection.side_effect = not_found_error("missing")
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(raw_dir=raw_dir)
+
+            client = mock_chromadb.PersistentClient.return_value
+            client.create_collection.assert_called_once_with(ingestion.CHROMA_COLLECTION_NAME)
+
 
 if __name__ == "__main__":
     unittest.main()

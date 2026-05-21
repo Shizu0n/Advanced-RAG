@@ -241,9 +241,12 @@ npm install.
             self.assertIn(key, result["trace"])
 
     def test_default_answer_query_uses_local_lexical_fallback_without_index_build_opt_in(self):
-        with patch.object(pipeline_module.LocalRAGPipeline, "_load_existing_index", return_value=(None, None)):
-            with patch.dict("os.environ", {}, clear=True):
-                result = answer_query("What is the Advanced-RAG project?", strategy="hybrid_rerank")
+        with (
+            patch.object(pipeline_module.LocalRAGPipeline, "_load_existing_index", return_value=(None, None)),
+            patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", [pipeline_module.PROJECT_ROOT / "README.md"]),
+            patch.dict("os.environ", {}, clear=True),
+        ):
+            result = answer_query("What is the Advanced-RAG project?", strategy="hybrid_rerank")
 
         self.assertIn("Advanced-RAG", result["answer"])
         self.assertEqual(result["sources"][0]["source_doc"], "README.md")
@@ -283,7 +286,8 @@ npm install.
             Path(tmpdir, "README.md").write_text("Unrelated cwd-only document.", encoding="utf-8")
             try:
                 os.chdir(tmpdir)
-                result = answer_query("What is the Advanced-RAG project?", strategy="bm25_only")
+                with patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", [pipeline_module.PROJECT_ROOT / "README.md"]):
+                    result = answer_query("What is the Advanced-RAG project?", strategy="bm25_only")
             finally:
                 os.chdir(old_cwd)
 

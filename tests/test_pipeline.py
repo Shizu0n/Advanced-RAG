@@ -246,7 +246,7 @@ npm install.
             patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", [pipeline_module.PROJECT_ROOT / "README.md"]),
             patch.dict("os.environ", {}, clear=True),
         ):
-            result = answer_query("What is the Advanced-RAG project?", strategy="hybrid_rerank")
+            result = answer_query("What is the Advanced-RAG project?", strategy="hybrid_rerank", allow_index_build=False)
 
         self.assertIn("Advanced-RAG", result["answer"])
         self.assertEqual(result["sources"][0]["source_doc"], "README.md")
@@ -263,12 +263,42 @@ npm install.
             patch.dict("os.environ", {}, clear=True),
             patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", []),
         ):
-            result = answer_query("What exists locally?", strategy="bm25_only")
+            result = answer_query("What exists locally?", strategy="bm25_only", allow_index_build=False)
 
         self.assertEqual(result["answer"], "No local context files were found for offline retrieval.")
         self.assertEqual(result["sources"], [])
         for key in ["bm25_scores", "vector_scores", "rrf_scores", "reranker_scores"]:
             self.assertIn(key, result["trace"])
+
+    def test_top_level_answer_query_allows_index_build_by_default(self):
+        fake_pipeline = Mock()
+        fake_pipeline.answer_query.return_value = {"answer": "ok"}
+
+        with patch("pipeline.LocalRAGPipeline", return_value=fake_pipeline) as pipeline_cls:
+            result = answer_query("What exists locally?", strategy="bm25_only")
+
+        self.assertEqual(result["answer"], "ok")
+        pipeline_cls.assert_called_once_with(allow_index_build=True)
+
+    def test_pipeline_index_build_env_defaults_enabled_when_requested(self):
+        pipeline = LocalRAGPipeline(allow_index_build=True)
+        build_index = Mock(return_value=(None, []))
+        fake_ingestion = SimpleNamespace(build_index=build_index)
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.dict(sys.modules, {"ingestion": fake_ingestion}),
+        ):
+            pipeline._ensure_ready()
+
+        build_index.assert_called_once_with()
+
+    def test_pipeline_index_build_allows_explicit_opt_out(self):
+        pipeline = LocalRAGPipeline(allow_index_build=True)
+
+        with patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "0"}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "ALLOW_INDEX_BUILD=0"):
+                pipeline._ensure_ready()
 
     def test_answer_query_can_ignore_ambient_index_build_environment(self):
         fake_ingestion = SimpleNamespace(build_index=lambda: (_ for _ in ()).throw(AssertionError("must not build index")))
@@ -287,7 +317,7 @@ npm install.
             try:
                 os.chdir(tmpdir)
                 with patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", [pipeline_module.PROJECT_ROOT / "README.md"]):
-                    result = answer_query("What is the Advanced-RAG project?", strategy="bm25_only")
+                    result = answer_query("What is the Advanced-RAG project?", strategy="bm25_only", allow_index_build=False)
             finally:
                 os.chdir(old_cwd)
 
@@ -371,7 +401,8 @@ npm install.
     def test_chat_query_returns_contract_with_citations(self):
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=FakeRetriever())
 
-        result = pipeline.chat_query("How are Python functions defined?", strategy="bm25_only")
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("How are Python functions defined?", strategy="bm25_only")
 
         self.assertEqual(
             sorted(result.keys()),
@@ -400,7 +431,8 @@ npm install.
         ]
         pipeline = LocalRAGPipeline(nodes=nodes)
 
-        result = pipeline.chat_query("Qual é a stack do projeto?", strategy="hybrid_rerank")
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("Qual é a stack do projeto?", strategy="hybrid_rerank")
 
         self.assertEqual(result["intent"], "stack")
         for tech in ["React", "TypeScript", "Vite"]:
@@ -422,7 +454,8 @@ npm install.
         ]
         pipeline = LocalRAGPipeline(nodes=nodes)
 
-        result = pipeline.chat_query("quais sao as stacks do frontend", strategy="hybrid_rerank")
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("quais sao as stacks do frontend", strategy="hybrid_rerank")
 
         for tech in ["React", "TypeScript", "Vite", "React Router", "Axios"]:
             self.assertIn(tech, result["answer"])
@@ -440,7 +473,8 @@ npm install.
         ]
         pipeline = LocalRAGPipeline(nodes=nodes)
 
-        result = pipeline.chat_query("Me dá uma visão geral do projeto", strategy="bm25_only")
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("Me dá uma visão geral do projeto", strategy="bm25_only")
 
         self.assertEqual(result["intent"], "overview")
         self.assertIn("Free-tier RAG workspace", result["answer"])
@@ -460,7 +494,8 @@ npm install.
         ]
         pipeline = LocalRAGPipeline(nodes=nodes)
 
-        result = pipeline.chat_query("what this project is about", strategy="hybrid_rerank")
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("what this project is about", strategy="hybrid_rerank")
 
         self.assertEqual(result["intent"], "overview")
         self.assertIn("Free-tier RAG workspace", result["answer"])
@@ -468,7 +503,8 @@ npm install.
     def test_chat_query_low_evidence_refuses_to_invent(self):
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=IrrelevantRetriever())
 
-        result = pipeline.chat_query("Qual banco de dados o backend usa?", strategy="bm25_only")
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("Qual banco de dados o backend usa?", strategy="bm25_only")
 
         self.assertEqual(
             result["answer"],
@@ -496,13 +532,36 @@ npm install.
         )
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
 
-        result = pipeline.chat_query("What JSON fields exist?", strategy="bm25_only")
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("What JSON fields exist?", strategy="bm25_only")
 
         self.assertIn("JSON document summary", result["answer"])
         self.assertIn("Top-level keys", result["answer"])
         self.assertNotIn('{"name"', result["answer"])
         self.assertNotIn('"token":"abc123"', result["answer"])
         self.assertIn("JSON document summary", result["citations"][0]["snippet"])
+
+    def test_chat_provider_policy_defaults_enabled_when_provider_key_exists(self):
+        with patch.dict(
+            "os.environ",
+            {"GEMINI_API_KEY": "gemini-key"},
+            clear=True,
+        ):
+            policy = pipeline_module.ChatProviderPolicy.from_env()
+
+        self.assertTrue(policy.enabled)
+        self.assertEqual([provider.name for provider in policy.providers], ["gemini"])
+
+    def test_chat_provider_policy_allows_explicit_cloud_chat_opt_out(self):
+        with patch.dict(
+            "os.environ",
+            {"ALLOW_CLOUD_CHAT": "0", "GEMINI_API_KEY": "gemini-key"},
+            clear=True,
+        ):
+            policy = pipeline_module.ChatProviderPolicy.from_env()
+
+        self.assertFalse(policy.enabled)
+        self.assertEqual(policy.providers, ())
 
     def test_chat_provider_policy_uses_chat_env_without_ragas_gate(self):
         with patch.dict(
@@ -573,7 +632,7 @@ npm install.
     def test_chat_query_trace_reports_cloud_chat_disabled(self):
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=FakeRetriever())
 
-        with patch.dict("os.environ", {}, clear=True):
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
             result = pipeline.chat_query("How are Python functions defined?", strategy="bm25_only")
 
         self.assertIn("def keyword", result["answer"])
@@ -583,7 +642,7 @@ npm install.
     def test_chat_query_trace_reports_no_provider_configured(self):
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=FakeRetriever())
 
-        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "1"}, clear=True):
+        with patch.dict("os.environ", {}, clear=True):
             result = pipeline.chat_query("How are Python functions defined?", strategy="bm25_only")
 
         self.assertIn("def keyword", result["answer"])
@@ -741,7 +800,7 @@ npm install.
         )
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
 
-        with patch.dict("os.environ", {}, clear=True):
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
             result = pipeline.chat_query("What fine-tune recipe does this README describe?", strategy="bm25_only")
 
         self.assertEqual(result["intent"], "fine_tune")
@@ -787,7 +846,7 @@ npm install.
         )
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
 
-        with patch.dict("os.environ", {}, clear=True):
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
             result = pipeline.chat_query("qual a dataset usada no fine tunning desse model do hugging face?", strategy="bm25_only")
 
         self.assertEqual(result["intent"], "fine_tune")
@@ -828,7 +887,7 @@ npm install.
         )
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
 
-        with patch.dict("os.environ", {}, clear=True):
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
             result = pipeline.chat_query("What fine-tune recipe does this README describe?", strategy="bm25_only")
 
         self.assertEqual(result["intent"], "fine_tune")
@@ -864,7 +923,7 @@ npm install.
         )
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
 
-        with patch.dict("os.environ", {}, clear=True):
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
             result = pipeline.chat_query("What fine-tune recipe does this README describe?", strategy="bm25_only")
 
         self.assertEqual(result["intent"], "fine_tune")
@@ -910,7 +969,7 @@ npm install.
     def test_chat_query_trace_omits_raw_message_and_retrieval_query(self):
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=FakeRetriever())
 
-        with patch.dict("os.environ", {}, clear=True):
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
             result = pipeline.chat_query("What dataset was used?", strategy="bm25_only")
 
         self.assertNotIn("message", result["trace"])

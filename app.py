@@ -36,8 +36,8 @@ STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 CHAT_MESSAGES_KEY = "chat_messages"
 PREPARED_SOURCE_KEY = "prepared_source"
 MODEL_INFO = {
-    "retrieval": "local hybrid retrieval with explicit index-build opt-in",
-    "cloud_chat": "optional; requires ALLOW_CLOUD_CHAT=1 and a configured free-tier provider key",
+    "retrieval": "local hybrid retrieval with index build enabled by default; set ALLOW_INDEX_BUILD=0 to disable",
+    "cloud_chat": "generative chat enabled by default when a free-tier provider key is configured; set ALLOW_CLOUD_CHAT=0 to force extractive fallback",
     "offline_answering": "extractive fallback with visible synthesis status",
 }
 PER_QUESTION_COLUMNS = [
@@ -391,13 +391,13 @@ def _format_metric(value: float | None) -> str:
 def run_query(query: str, strategy: str) -> dict[str, Any]:
     from pipeline import answer_query
 
-    return answer_query(query, strategy=strategy, allow_index_build=False)
+    return answer_query(query, strategy=strategy, allow_index_build=True)
 
 
 def run_chat_query(message: str, history: list[dict[str, Any]], strategy: str) -> dict[str, Any]:
     from pipeline import chat_query
 
-    return chat_query(message, history=history, strategy=strategy, allow_index_build=False)
+    return chat_query(message, history=history, strategy=strategy, allow_index_build=True)
 
 
 def prepare_sources_for_app(
@@ -614,8 +614,8 @@ def _show_general_no_eval_source_error(st) -> None:
 
 def _show_allow_index_build_error(st) -> None:
     st.error(
-        "Index build requires the ALLOW_INDEX_BUILD=1 environment variable. "
-        "Set it and restart the app."
+        "Index build is disabled because ALLOW_INDEX_BUILD=0. "
+        "Unset it or set ALLOW_INDEX_BUILD=1 and restart the app."
     )
 
 
@@ -729,7 +729,7 @@ def _prepared_index_slug(st) -> str | None:
 
 
 def _allow_index_build_enabled() -> bool:
-    return os.getenv("ALLOW_INDEX_BUILD") == "1"
+    return os.getenv("ALLOW_INDEX_BUILD", "1") != "0"
 
 
 def _has_prepared_files(st) -> bool:
@@ -1089,11 +1089,8 @@ def _render_sources_tab(st) -> None:
         if st.button("Build Index"):
             if not _has_raw_source_files():
                 st.error("No source files found in data/raw/. Prepare a source first.")
-            elif os.getenv("ALLOW_INDEX_BUILD") != "1":
-                st.error(
-                    "Index build requires the ALLOW_INDEX_BUILD=1 environment variable. "
-                    "Set it and restart the app."
-                )
+            elif not _allow_index_build_enabled():
+                _show_allow_index_build_error(st)
             else:
                 progress = st.progress(0.0, "Building index...")
                 try:

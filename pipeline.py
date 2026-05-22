@@ -226,6 +226,10 @@ class SynthesisResult:
         }
 
 
+def _env_enabled_by_default(name: str) -> bool:
+    return os.getenv(name, "1") != "0"
+
+
 @dataclass(frozen=True)
 class ChatProviderPolicy:
     enabled: bool
@@ -237,7 +241,7 @@ class ChatProviderPolicy:
 
     @classmethod
     def from_env(cls) -> "ChatProviderPolicy":
-        if os.getenv("ALLOW_CLOUD_CHAT") != "1":
+        if not _env_enabled_by_default("ALLOW_CLOUD_CHAT"):
             return cls(enabled=False, providers=())
         import gemini_ragas
 
@@ -1382,10 +1386,10 @@ class LocalRAGPipeline:
             self.retriever = SimpleLocalRetriever(self.nodes, top_k=self.top_k)
             return
 
-        if os.getenv("ALLOW_INDEX_BUILD") != "1":
+        if not _env_enabled_by_default("ALLOW_INDEX_BUILD"):
             raise RuntimeError(
-                "Index build requested but ALLOW_INDEX_BUILD is not set to 1. "
-                "This prevents accidental scraping or model downloads."
+                "Index build requested but ALLOW_INDEX_BUILD=0. "
+                "Unset it or set ALLOW_INDEX_BUILD=1 to enable index building."
             )
 
         from ingestion import build_index
@@ -1513,7 +1517,7 @@ class LocalRAGPipeline:
         }
 
 
-def answer_query(query: str, strategy: str = "hybrid_rerank", allow_index_build: bool = False) -> dict[str, Any]:
+def answer_query(query: str, strategy: str = "hybrid_rerank", allow_index_build: bool = True) -> dict[str, Any]:
     return LocalRAGPipeline(allow_index_build=allow_index_build).answer_query(query, strategy=strategy)
 
 
@@ -1521,7 +1525,7 @@ def chat_query(
     message: str,
     history: Sequence[dict[str, Any]] | None = None,
     strategy: str = "hybrid_rerank",
-    allow_index_build: bool = False,
+    allow_index_build: bool = True,
 ) -> dict[str, Any]:
     return LocalRAGPipeline(allow_index_build=allow_index_build).chat_query(
         message,

@@ -39,7 +39,7 @@ flowchart TD
 Local directories or public GitHub repositories are prepared into `data/raw/`. Files are filtered by extension (`.py`, `.md`, `.ts`, `.js`, `.json`, `.yaml`, `.toml`, `.txt`, `.rst`), symlinks are rejected, and ignored directories (`node_modules`, `.git`, `__pycache__`) are skipped.
 
 ### 2. Indexing
-Source files are chunked (512 tokens, 50-token overlap) using LlamaIndex's `SentenceSplitter`, embedded locally with `BAAI/bge-small-en-v1.5` (HuggingFace), and stored in ChromaDB. This step requires `ALLOW_INDEX_BUILD=1`.
+Source files are chunked (512 tokens, 50-token overlap) using LlamaIndex's `SentenceSplitter`, embedded locally with `BAAI/bge-small-en-v1.5` (HuggingFace), and stored in ChromaDB. Index building is enabled by default; set `ALLOW_INDEX_BUILD=0` to disable it.
 
 ### 3. Retrieval
 Queries pass through intent detection (stack, overview, architecture, setup, security, evaluation) and term expansion. Four retrieval strategies are available:
@@ -121,7 +121,7 @@ Outputs:
 
 ## Manual retrieval and evaluation commands
 
-These commands are intentionally explicit. Network, model download, index build, and cloud calls require opt-in environment variables.
+These commands are intentionally explicit. Network fetches, model downloads, and cloud evaluation require opt-in environment variables; index build and cloud chat are enabled by default and can be disabled with explicit opt-out variables.
 
 ### 1. Prepare a HuggingFace source
 
@@ -135,11 +135,13 @@ PY
 ### 2. Build the local index
 
 ```bash
-ALLOW_INDEX_BUILD=1 python - <<'PY'
+python - <<'PY'
 from ingestion import build_index
 build_index()
 PY
 ```
+
+Set `ALLOW_INDEX_BUILD=0` to disable index building in app/API flows.
 
 ### 3. Ask the portfolio fine-tune question offline
 
@@ -166,10 +168,10 @@ Cloud RAGAS evaluation requires explicit gates and provider keys:
 ALLOW_CLOUD_FREE_TIER=1 USE_GEMINI_FREE_RAGAS=1 python evaluate.py
 ```
 
-Cloud chat in the Streamlit query tab requires its own gate:
+Cloud chat in the Streamlit query tab is enabled by default when a free-tier provider key is configured. To force extractive fallback:
 
 ```bash
-ALLOW_CLOUD_CHAT=1 streamlit run app.py
+ALLOW_CLOUD_CHAT=0 streamlit run app.py
 ```
 
 ## Evaluation Metrics
@@ -187,13 +189,13 @@ Offline heuristics use term-overlap scoring. RAGAS evaluation uses Gemini as the
 
 ## Design Principles
 
-**Explicit opt-in for external operations.** Every network call, model download, or cloud API request requires an environment variable. Nothing runs unexpectedly.
+**Explicit control for external operations.** Network fetches, model downloads, and cloud evaluation require opt-in environment variables. Query-time cloud chat is enabled when a free-tier provider key is configured and can be forced off with `ALLOW_CLOUD_CHAT=0`.
 
 **Offline-first with graceful degradation.** Generative → extractive fallback. Cloud RAGAS → offline heuristics. Vector index → lexical-only retrieval. The system always works.
 
 **No paid SDKs.** The codebase does not import OpenAI, Anthropic, or their LangChain wrappers. Enforced by test assertions.
 
-**Provider fallback chain.** When cloud access is enabled, requests flow through Gemini → Groq → GitHub Models, with automatic retry on 429/403/5xx and a shared call budget (default: 120 calls).
+**Provider fallback chain.** When cloud chat is enabled and provider keys are configured, requests flow through Gemini → Groq → GitHub Models, with automatic retry on 429/403/5xx and a shared call budget.
 
 ## Tech Stack
 
@@ -218,12 +220,14 @@ All configuration via environment variables. Copy `.env.example` to `.env`.
 | `GEMINI_MODEL` | Gemini model | `gemini-2.5-flash` |
 | `GROQ_API_KEY` / `GROQ_MODEL` | Groq fallback | `llama-3.3-70b-versatile` |
 | `GITHUB_MODELS_TOKEN` / `GITHUB_MODELS_MODEL` | GitHub Models fallback | — |
-| `ALLOW_INDEX_BUILD` | Permit ChromaDB index building | `0` |
+| `ALLOW_INDEX_BUILD` | Permit ChromaDB index building (`0` disables) | `1` |
 | `ALLOW_MODEL_DOWNLOADS` | Permit cross-encoder download | `0` |
 | `ALLOW_GITHUB_FETCH` | Permit GitHub repo download | `0` |
 | `ALLOW_CLOUD_FREE_TIER` | Permit cloud evaluation | `0` |
 | `USE_GEMINI_FREE_RAGAS` | Enable RAGAS with Gemini | `0` |
-| `MAX_GEMINI_CALLS` | API call budget cap | `120` |
+| `ALLOW_CLOUD_CHAT` | Permit query-time cloud chat (`0` forces extractive fallback) | `1` |
+| `MAX_CLOUD_CHAT_CALLS` | Query-time cloud chat budget cap | `1` |
+| `MAX_GEMINI_CALLS` | Evaluation API call budget cap | `120` |
 
 ## Running Tests
 

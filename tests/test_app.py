@@ -453,10 +453,10 @@ class AppHelperTests(unittest.TestCase):
         self.assertTrue(any("provider_timeout" in caption for caption in captions))
         self.assertTrue(any("groq" in caption for caption in captions))
 
-    def test_model_info_describes_cloud_chat_opt_in(self):
+    def test_model_info_describes_cloud_chat_default_on_with_opt_out(self):
         serialized = json.dumps(app.MODEL_INFO, ensure_ascii=False).lower()
 
-        self.assertIn("allow_cloud_chat", serialized)
+        self.assertIn("allow_cloud_chat=0", serialized)
         self.assertIn("extractive fallback", serialized)
         self.assertNotIn("no api call from streamlit", serialized)
 
@@ -471,14 +471,14 @@ class AppHelperTests(unittest.TestCase):
         json_payloads = [event[1] for event in fake_st.events if event[0] == "json"]
         self.assertTrue(any(payload.get("used_rerank") is False for payload in json_payloads if isinstance(payload, dict)))
 
-    def test_run_query_forces_offline_safe_pipeline_mode(self):
+    def test_run_query_allows_index_build_by_default(self):
         with patch("pipeline.answer_query", return_value={"answer": "ok"}) as query:
             result = app.run_query("question", "bm25_only")
 
         self.assertEqual(result["answer"], "ok")
-        query.assert_called_once_with("question", strategy="bm25_only", allow_index_build=False)
+        query.assert_called_once_with("question", strategy="bm25_only", allow_index_build=True)
 
-    def test_run_chat_query_forces_offline_safe_pipeline_mode(self):
+    def test_run_chat_query_allows_index_build_by_default(self):
         history = [{"role": "user", "content": "before"}]
         with patch("pipeline.chat_query", return_value={"answer": "ok"}) as query:
             result = app.run_chat_query("question", history, "bm25_only")
@@ -488,7 +488,7 @@ class AppHelperTests(unittest.TestCase):
             "question",
             history=history,
             strategy="bm25_only",
-            allow_index_build=False,
+            allow_index_build=True,
         )
 
     def test_query_tab_persists_chat_messages_in_session_state(self):
@@ -633,8 +633,8 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertIn("Manual retrieval and evaluation commands", text)
         self.assertIn("ALLOW_HF_FETCH=1", text)
-        self.assertIn("ALLOW_INDEX_BUILD=1", text)
-        self.assertIn("ALLOW_CLOUD_CHAT=1", text)
+        self.assertIn("ALLOW_INDEX_BUILD=0", text)
+        self.assertIn("ALLOW_CLOUD_CHAT=0", text)
         self.assertIn("USE_GEMINI_FREE_RAGAS=1", text)
 
     def test_is_golden_dataset_stale_returns_true_for_different_source(self):
@@ -850,17 +850,12 @@ class SourcesTabTests(unittest.TestCase):
         fake_st.session_state["prepared_files"] = prepared
         nodes = [{"text": "chunk 1"}, {"text": "chunk 2"}]
 
-        def _mock_getenv(key, default=None):
-            if key == "ALLOW_INDEX_BUILD":
-                return "1"
-            return os.environ.get(key, default)
-
         with (
             patch("app.prepare_sources_for_app", return_value=[]),
             patch("app._has_raw_source_files", return_value=True),
             patch("app._current_source_for_ui", return_value={"source_slug": "test-repo", "indexed_at": None}),
             patch("app.load_current_source", return_value={"source_slug": "test-repo"}),
-            patch("os.getenv", side_effect=_mock_getenv),
+            patch.dict("os.environ", {}, clear=True),
             patch("app.run_build_index", return_value=nodes) as run_build,
         ):
             app._render_sources_tab(fake_st)
@@ -1032,6 +1027,8 @@ class QueryTabWarningTests(unittest.TestCase):
         with (
             patch("app.prepare_sources_for_app", return_value=prepared),
             patch("app._has_raw_source_files", return_value=True),
+            patch("app.load_current_source", return_value=None),
+            patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "0"}),
         ):
             app._render_sources_tab(fake_st)
 
@@ -1045,6 +1042,7 @@ class QueryTabWarningTests(unittest.TestCase):
         with (
             patch("app.prepare_sources_for_app", return_value=[]),
             patch("app._has_raw_source_files", return_value=True),
+            patch("app.load_current_source", return_value=None),
         ):
             app._render_sources_tab(fake_st)
 
@@ -1317,7 +1315,7 @@ class QueryTabWarningTests(unittest.TestCase):
             app._render_sources_tab(fake_st)
 
         errors = [event[1] for event in fake_st.events if event[0] == "error"]
-        self.assertTrue(any("ALLOW_INDEX_BUILD=1" in e for e in errors))
+        self.assertTrue(any("ALLOW_INDEX_BUILD=0" in e for e in errors))
 
     def test_prepared_source_info_overrides_stale_current_index_message(self):
         fake_st = FakeStreamlit()
@@ -1407,6 +1405,8 @@ class QueryTabWarningTests(unittest.TestCase):
         with (
             patch("app.prepare_sources_for_app", return_value=prepared),
             patch("app._has_raw_source_files", return_value=True),
+            patch("app.load_current_source", return_value=None),
+            patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "0"}),
         ):
             app._render_sources_tab(fake_st)
             self.assertIn(app.PREPARED_SOURCE_KEY, fake_st.session_state)

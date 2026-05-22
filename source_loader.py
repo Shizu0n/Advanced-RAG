@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -77,6 +78,8 @@ IGNORED_DIR_NAMES = {
     "__pycache__",
 }
 MAX_GITHUB_ZIP_BYTES = 50 * 1024 * 1024
+CURRENT_SOURCE_PATH = Path("data/current_source.json")
+PREPARED_SOURCE_METADATA: dict[str, dict[str, str]] = {}
 
 
 def _slug(value: str) -> str:
@@ -288,6 +291,11 @@ def _huggingface_network_allowed(allow_huggingface_fetch: bool) -> bool:
     return allow_huggingface_fetch or os.getenv("ALLOW_HF_FETCH") == "1"
 
 
+def _write_prepared_source_metadata(metadata: dict[str, str | int | None]) -> None:
+    CURRENT_SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CURRENT_SOURCE_PATH.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
 def _fetch_huggingface_card(
     source: str,
     download_dir: Path,
@@ -343,6 +351,16 @@ def prepare_sources(
                 target_root.mkdir(parents=True, exist_ok=True)
                 target_file = target_root / fetched.name
                 _copy_without_conflict(fetched, target_file)
+                metadata = {
+                    "source_input": source_text,
+                    "source_type": "huggingface",
+                    "source_slug": target_root.name.lower(),
+                    "indexed_at": None,
+                    "file_count": 1,
+                    "chunk_count": 0,
+                }
+                PREPARED_SOURCE_METADATA[target_file.resolve().as_posix()] = metadata
+                _write_prepared_source_metadata(metadata)
                 prepared_files.append(target_file)
             continue
         if _is_github_url(source_text):

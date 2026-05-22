@@ -1,3 +1,4 @@
+import json
 import os
 import zipfile
 import unittest
@@ -432,7 +433,10 @@ class HuggingFaceSourceLoaderTests(unittest.TestCase):
             fake_response.raise_for_status = MagicMock()
             fake_response.content = b"# Model Card\n\nA great model.\n"
 
-            with patch.object(source_loader.requests, "get", return_value=fake_response):
+            with (
+                patch.object(source_loader.requests, "get", return_value=fake_response),
+                patch.object(source_loader, "CURRENT_SOURCE_PATH", base_dir / "current_source.json"),
+            ):
                 files = source_loader.prepare_sources(
                     ["https://huggingface.co/meta-llama/Llama-2-7b"],
                     raw_dir=raw_dir,
@@ -444,6 +448,32 @@ class HuggingFaceSourceLoaderTests(unittest.TestCase):
             self.assertEqual(relative, "meta-llama-Llama-2-7b/README.md")
             self.assertEqual(files[0].read_text(encoding="utf-8"), "# Model Card\n\nA great model.\n")
 
+    def test_prepare_sources_writes_hf_current_source_metadata(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            raw_dir = base_dir / "raw"
+            current_source_path = base_dir / "current_source.json"
+            fake_response = MagicMock()
+            fake_response.status_code = 200
+            fake_response.raise_for_status = MagicMock()
+            fake_response.content = b"# Model Card\n\nA great model.\n"
+
+            with (
+                patch.object(source_loader.requests, "get", return_value=fake_response),
+                patch.object(source_loader, "CURRENT_SOURCE_PATH", current_source_path, create=True),
+            ):
+                source_loader.prepare_sources(
+                    ["hf:Shizu0n/phi3-mini-sql-generator"],
+                    raw_dir=raw_dir,
+                    allow_huggingface_fetch=True,
+                )
+
+            data = json.loads(current_source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_type"], "huggingface")
+            self.assertEqual(data["source_input"], "hf:Shizu0n/phi3-mini-sql-generator")
+            self.assertEqual(data["source_slug"], "shizu0n-phi3-mini-sql-generator")
+            self.assertIsNone(data.get("indexed_at"))
+
     def test_prepare_sources_copies_hf_card_via_env(self):
         with TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
@@ -454,7 +484,10 @@ class HuggingFaceSourceLoaderTests(unittest.TestCase):
             fake_response.content = b"# Card\n"
 
             with patch.dict(os.environ, {"ALLOW_HF_FETCH": "1"}):
-                with patch.object(source_loader.requests, "get", return_value=fake_response):
+                with (
+                    patch.object(source_loader.requests, "get", return_value=fake_response),
+                    patch.object(source_loader, "CURRENT_SOURCE_PATH", base_dir / "current_source.json"),
+                ):
                     files = source_loader.prepare_sources(
                         ["hf:meta-llama/Llama-2-7b"],
                         raw_dir=raw_dir,
@@ -477,7 +510,10 @@ class HuggingFaceSourceLoaderTests(unittest.TestCase):
             fake_response.raise_for_status = MagicMock()
             fake_response.content = b"# HF Card\n"
 
-            with patch.object(source_loader.requests, "get", return_value=fake_response):
+            with (
+                patch.object(source_loader.requests, "get", return_value=fake_response),
+                patch.object(source_loader, "CURRENT_SOURCE_PATH", base_dir / "current_source.json"),
+            ):
                 files = source_loader.prepare_sources(
                     [local_dir, "https://huggingface.co/meta-llama/Llama-2-7b"],
                     raw_dir=raw_dir,

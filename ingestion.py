@@ -19,7 +19,7 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
-from source_loader import prepare_sources
+from source_loader import PREPARED_SOURCE_METADATA, prepare_sources
 
 
 RAW_DIR = Path("data/raw")
@@ -101,12 +101,14 @@ def write_current_source(
     file_count: int,
     chunk_count: int,
     source_input: str = "",
+    source_type: str | None = None,
+    source_slug: str | None = None,
 ) -> None:
     """Write data/current_source.json with metadata about the indexed source."""
     data = {
         "source_input": source_input,
-        "source_type": _detect_source_type(raw_dir),
-        "source_slug": _source_slug_from_raw(raw_dir),
+        "source_type": source_type or _detect_source_type(raw_dir),
+        "source_slug": source_slug or _source_slug_from_raw(raw_dir),
         "indexed_at": datetime.now(timezone.utc).isoformat(),
         "file_count": file_count,
         "chunk_count": chunk_count,
@@ -212,6 +214,18 @@ def _source_files(raw_dir: Path = RAW_DIR) -> list[Path]:
     return sorted(path for path in raw_dir.rglob("*") if _is_supported_source_file(path))
 
 
+def _current_source_raw_dir(raw_dir: Path, current_source: dict | None) -> Path | None:
+    if not current_source:
+        return None
+    source_slug = current_source.get("source_slug")
+    if not source_slug or not raw_dir.exists():
+        return None
+    for child in raw_dir.iterdir():
+        if child.is_dir() and child.name.lower() == str(source_slug).lower():
+            return child
+    return None
+
+
 def load_or_download_sources(raw_dir: Path = RAW_DIR, limit: int = PAGE_LIMIT) -> list[Path]:
     """Use local text/markdown sources when present; otherwise scrape Python docs."""
 
@@ -236,7 +250,13 @@ def build_index(
     import logging
     logger = logging.getLogger(__name__)
 
-    files = list(source_files) if source_files is not None else load_or_download_sources(raw_dir=raw_dir)
+    current_source = load_current_source()
+    current_raw_dir = _current_source_raw_dir(raw_dir, current_source)
+    files = (
+        list(source_files)
+        if source_files is not None
+        else load_or_download_sources(raw_dir=current_raw_dir or raw_dir)
+    )
     if not files:
         raise RuntimeError("No source documents found in data/raw and download produced no files.")
     logger.info("Building index from %d source files", len(files))
@@ -279,7 +299,18 @@ def build_index(
 
     logger.info("Index built: %d documents, %d chunks, %.2fs embedding", len(documents), len(nodes), embedding_time)
 
-    write_current_source(raw_dir=raw_dir, file_count=len(documents), chunk_count=len(nodes))
+    prepared_metadata = next(
+        (PREPARED_SOURCE_METADATA.get(path.resolve().as_posix()) for path in files),
+        None,
+    ) or current_source
+    write_current_source(
+        raw_dir=raw_dir,
+        file_count=len(documents),
+        chunk_count=len(nodes),
+        source_input=prepared_metadata["source_input"] if prepared_metadata else "",
+        source_type=prepared_metadata["source_type"] if prepared_metadata else None,
+        source_slug=prepared_metadata["source_slug"] if prepared_metadata else None,
+    )
 
     return index, nodes
 

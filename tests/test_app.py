@@ -499,7 +499,14 @@ class AppHelperTests(unittest.TestCase):
             "trace": {"strategy": "hybrid_rerank"},
         }
 
-        with patch("app.run_chat_query", return_value=response) as query:
+        current = {"source_slug": "test-repo", "indexed_at": "2026-05-22T00:00:00+00:00"}
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.run_chat_query", return_value=response) as query,
+        ):
+            mock_chroma.exists.return_value = True
             app._render_query_tab(fake_st)
 
         messages = fake_st.session_state[app.CHAT_MESSAGES_KEY]
@@ -512,7 +519,14 @@ class AppHelperTests(unittest.TestCase):
         existing = [{"role": "user", "content": "contexto anterior"}]
         fake_st = FakeStreamlit(prompt="continua", messages=existing)
 
-        with patch("app.run_chat_query", return_value={"answer": "ok", "citations": [], "trace": {}}) as query:
+        current = {"source_slug": "test-repo", "indexed_at": "2026-05-22T00:00:00+00:00"}
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.run_chat_query", return_value={"answer": "ok", "citations": [], "trace": {}}) as query,
+        ):
+            mock_chroma.exists.return_value = True
             app._render_query_tab(fake_st)
 
         query.assert_called_once_with("continua", history=[{"role": "user", "content": "contexto anterior"}], strategy="hybrid_rerank")

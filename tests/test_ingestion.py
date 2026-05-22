@@ -5,6 +5,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 import ingestion
+import source_loader
 
 
 class IngestionTests(unittest.TestCase):
@@ -157,6 +158,113 @@ class CurrentSourceTests(unittest.TestCase):
             self.assertEqual(data["source_type"], "local")
             self.assertGreaterEqual(data["file_count"], 1)
             self.assertGreaterEqual(data["chunk_count"], 1)
+
+    def test_build_index_records_prepared_huggingface_source_metadata(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_dir = Path(tmpdir) / "chroma_db"
+
+            with patch.object(source_loader, "_fetch_huggingface_card") as fetch_card:
+                fetch_card.return_value = Path(tmpdir) / "README.md"
+                fetch_card.return_value.write_text("# SQL generator\nThis model generates SQL queries.", encoding="utf-8")
+                files = ingestion.prepare_sources(
+                    ["hf:Shizu0n/phi3-mini-sql-generator"],
+                    raw_dir=raw_dir,
+                    allow_huggingface_fetch=True,
+                )
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb"),
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(source_files=files, raw_dir=raw_dir)
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_type"], "huggingface")
+            self.assertEqual(data["source_input"], "hf:Shizu0n/phi3-mini-sql-generator")
+            self.assertEqual(data["source_slug"], "shizu0n-phi3-mini-sql-generator")
+
+    def test_build_index_preserves_huggingface_metadata_from_previous_prepare_process(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            source_root = raw_dir / "Shizu0n-phi3-mini-sql-generator"
+            source_root.mkdir(parents=True)
+            (source_root / "README.md").write_text("# SQL generator\nThis model generates SQL queries.", encoding="utf-8")
+            source_path = Path(tmpdir) / "current_source.json"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "source_input": "hf:Shizu0n/phi3-mini-sql-generator",
+                        "source_type": "huggingface",
+                        "source_slug": "shizu0n-phi3-mini-sql-generator",
+                        "indexed_at": None,
+                        "file_count": 1,
+                        "chunk_count": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            chroma_dir = Path(tmpdir) / "chroma_db"
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb"),
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(raw_dir=raw_dir)
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_type"], "huggingface")
+            self.assertEqual(data["source_input"], "hf:Shizu0n/phi3-mini-sql-generator")
+            self.assertEqual(data["source_slug"], "shizu0n-phi3-mini-sql-generator")
+            self.assertIsNotNone(data["indexed_at"])
+            self.assertGreaterEqual(data["chunk_count"], 1)
+
+    def test_build_index_scopes_to_prepared_current_source_when_raw_has_stale_sources(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            source_root = raw_dir / "Shizu0n-phi3-mini-sql-generator"
+            source_root.mkdir(parents=True)
+            (source_root / "README.md").write_text("# SQL generator\nThis model generates SQL queries.", encoding="utf-8")
+            stale_root = raw_dir / "old-source"
+            stale_root.mkdir(parents=True)
+            (stale_root / "README.md").write_text("# Old source\nThis should not be indexed.", encoding="utf-8")
+            source_path = Path(tmpdir) / "current_source.json"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "source_input": "hf:Shizu0n/phi3-mini-sql-generator",
+                        "source_type": "huggingface",
+                        "source_slug": "shizu0n-phi3-mini-sql-generator",
+                        "indexed_at": None,
+                        "file_count": 1,
+                        "chunk_count": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            chroma_dir = Path(tmpdir) / "chroma_db"
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb"),
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(raw_dir=raw_dir)
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["file_count"], 1)
 
     def test_build_index_replaces_existing_chroma_collection(self):
         with TemporaryDirectory() as tmpdir:

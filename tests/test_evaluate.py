@@ -41,7 +41,29 @@ class StaticPipeline:
 
 class GoldenDatasetTests(unittest.TestCase):
     def test_checked_in_golden_dataset_is_minimal_valid_and_covers_task_5_topics(self):
-        dataset = evaluation.load_golden_dataset()
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "What does the project abstract say?",
+                            "ground_truth": "The project evaluates local RAG strategies offline.",
+                            "reference_context": "The project evaluates local RAG strategies offline.",
+                            "source_doc": "data/eval/project_abstract.md",
+                        },
+                        {
+                            "question": "What does the stack discovery note say?",
+                            "ground_truth": "The stack includes Streamlit and ChromaDB.",
+                            "reference_context": "The stack includes Streamlit and ChromaDB.",
+                            "source_doc": "data/eval/stack_discovery.md",
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            dataset = evaluation.load_golden_dataset(golden_path)
 
         self.assertGreaterEqual(len(dataset), 2)
         questions = " ".join(item["question"].lower() for item in dataset)

@@ -271,6 +271,100 @@ def _significant_terms(text: str) -> set[str]:
     return {term for term in _tokenize(_normalize_for_match(text)) if term not in STOPWORDS and len(term) > 1}
 
 
+CODE_REQUEST_PATTERNS = (
+    r"\bcode\b",
+    r"\bcodigo\b",
+    r"\bcódigo\b",
+    r"\bsnippet\b",
+    r"\bsnippets\b",
+    r"\bexample\b",
+    r"\bexemplo\b",
+    r"\bfunction\b",
+    r"\bfuncao\b",
+    r"\bfunção\b",
+    r"\bclass\b",
+    r"\bscript\b",
+    r"\bcommand\b",
+    r"\bcomando\b",
+    r"\bshow code\b",
+    r"\bcode example\b",
+    r"\bexample code\b",
+    r"\bpython code\b",
+    r"\bjavascript code\b",
+    r"\btypescript code\b",
+    r"\bbash code\b",
+    r"\bshell code\b",
+    r"\bsource code\b",
+    r"\bcode sample\b",
+    r"\bsample code\b",
+)
+
+
+def _query_requests_code(query: str) -> bool:
+    normalized_query = _normalize_for_match(query)
+    return any(re.search(pattern, normalized_query) for pattern in CODE_REQUEST_PATTERNS)
+
+
+_CODE_LIKE_PROSE_WORDS = {
+    "a",
+    "an",
+    "and",
+    "as",
+    "at",
+    "after",
+    "before",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "our",
+    "run",
+    "start",
+    "the",
+    "this",
+    "to",
+    "open",
+    "install",
+    "use",
+    "we",
+    "with",
+    "when",
+    "then",
+    "you",
+    "your",
+}
+
+
+def _is_code_like_sentence(sentence: str) -> bool:
+    normalized_sentence = sentence.strip()
+    if not normalized_sentence:
+        return False
+    if "```" in normalized_sentence:
+        return True
+    if re.fullmatch(r"`[^`]+`", normalized_sentence):
+        return True
+    if re.search(r"[.!?]", normalized_sentence):
+        return False
+    if re.match(r"^(?:[$#]\s*)?(?:def|class|import|from|return|const|let|var|function|if|for|while|try|except|print|console\.log|npm|pip|git|python|bash|sh|node)\b", normalized_sentence):
+        return True
+    words = [word.lower() for word in re.findall(r"[A-Za-z_][\w.-]*", normalized_sentence)]
+    prose_word_count = sum(1 for word in words if word in _CODE_LIKE_PROSE_WORDS)
+    if prose_word_count > 1:
+        return False
+    if re.fullmatch(r"(?:[$#]\s*)?[A-Za-z0-9_./-]+(?:\s+[A-Za-z0-9_./-]+){0,6}", normalized_sentence):
+        return True
+    if re.search(r"[{}();<>]=?|=>", normalized_sentence) and len(words) <= 8:
+        return True
+    return False
+
+
 def analyze_query(query: str) -> QueryAnalysis:
     normalized = _normalize_for_match(query)
     intents: list[str] = []
@@ -1233,19 +1327,31 @@ def synthesize_extractive_answer(query: str, contexts: Sequence[str], max_senten
     from synthesis import _strip_wrapping_code_fences  # noqa: PLC0415
 
     query_terms = _tokenize(query)
+    request_code = _query_requests_code(query)
     ranked: list[tuple[float, int, str]] = []
 
     for context_index, context in enumerate(contexts):
         context = _context_for_synthesis(context)
+        if not request_code:
+            context = re.sub(r"```[\s\S]*?```", " ", context)
         sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", context) if part.strip()]
         for sentence_index, sentence in enumerate(sentences or [context.strip()]):
+            if not request_code and _is_code_like_sentence(sentence):
+                continue
             terms = _tokenize(sentence)
             overlap = len(query_terms & terms)
             density = overlap / max(len(terms), 1)
             ranked.append((overlap + density, context_index * 1000 + sentence_index, sentence))
 
     if not ranked:
-        return "No relevant context was retrieved."
+        if request_code:
+            return _strip_wrapping_code_fences(contexts[0][:500]) if contexts else "No relevant context was retrieved."
+        return "No non-code evidence was retrieved for this question. Ask for code if you want code examples."
+
+    if not request_code:
+        ranked = [item for item in ranked if not _is_code_like_sentence(item[2])]
+        if not ranked:
+            return "No non-code evidence was retrieved for this question. Ask for code if you want code examples."
 
     best = sorted(ranked, key=lambda item: (-item[0], item[1]))[:max_sentences]
     answer = " ".join(sentence for _, _, sentence in sorted(best, key=lambda item: item[1]))

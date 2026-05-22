@@ -699,18 +699,23 @@ class EvalTabTests(unittest.TestCase):
     def _render_eval_tab_with_stubs(self, current_source=None, golden_path=None, results_path=None):
         """Helper to render the eval tab with controlled file paths."""
         fake_st = FakeStreamlit()
-        with (
-            patch("app.load_current_source", return_value=current_source),
-            patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
-            patch("app.last_eval_date", return_value="2025-01-15 10:00"),
-            patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
-            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
-            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
-            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
-            patch("app.build_grouped_bar_chart", return_value=None),
-            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
-        ):
-            app._render_eval_tab(fake_st)
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            if current_source and current_source.get("indexed_at"):
+                chroma_dir.mkdir()
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app.load_current_source", return_value=current_source),
+                patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
+                patch("app.last_eval_date", return_value="2025-01-15 10:00"),
+                patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+                patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            ):
+                app._render_eval_tab(fake_st)
         return fake_st
 
     def test_eval_tab_shows_warning_when_no_source_indexed(self):
@@ -730,21 +735,25 @@ class EvalTabTests(unittest.TestCase):
     def test_eval_tab_shows_warning_when_golden_dataset_is_stale(self):
         fake_st = FakeStreamlit()
         current = {"source_slug": "new-repo", "indexed_at": "2025-01-15T10:00:00+00:00"}
-        with (
-            patch("app._current_source_for_ui", return_value=current),
-            patch("app.load_current_source", return_value=current),
-            patch("app._indexed_source_for_eval", return_value=current),
-            patch("app.is_golden_dataset_stale", return_value=True),
-            patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
-            patch("app.last_eval_date", return_value="2025-01-15 10:00"),
-            patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
-            patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
-            patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
-            patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
-            patch("app.build_grouped_bar_chart", return_value=None),
-            patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
-        ):
-            app._render_eval_tab(fake_st)
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app._indexed_source_for_eval", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=True),
+                patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
+                patch("app.last_eval_date", return_value="2025-01-15 10:00"),
+                patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+                patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            ):
+                app._render_eval_tab(fake_st)
 
         warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
         self.assertTrue(any("golden dataset" in w.lower() for w in warnings))
@@ -1228,20 +1237,24 @@ class QueryTabWarningTests(unittest.TestCase):
             {"strategy": "semantic_only", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069, "summary_backend": "offline_heuristic", "evaluated_source": "raw"}
         ])
         per_question = pd.DataFrame([{"strategy": "semantic_only", "question": "q", "answer": "a", "ground_truth": "g", "source_doc": "doc", "evaluation_backend": "offline_heuristic", "summary_backend": "offline_heuristic", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069}])
-        with (
-            patch("app._current_source_for_ui", return_value=current),
-            patch("app.load_current_source", return_value=current),
-            patch("app.is_golden_dataset_stale", return_value=False),
-            patch("app.dataset_stats", return_value={"golden_questions": 3, "evaluated_rows": 12}),
-            patch("app.last_eval_date", return_value="2026-05-20 15:46"),
-            patch("app.load_eval_summary", return_value=summary),
-            patch("app.load_per_question", return_value=per_question),
-            patch("app.metric_card_values", return_value={"strategy": "semantic_only", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069}),
-            patch("app.eval_backend_counts", return_value={"summary_backends": {"offline_heuristic": 4}, "question_backends": {"offline_heuristic": 12}}),
-            patch("app.build_grouped_bar_chart", return_value=None),
-            patch("app.filter_questions_below_threshold", return_value=per_question),
-        ):
-            app._render_eval_tab(fake_st)
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=False),
+                patch("app.dataset_stats", return_value={"golden_questions": 3, "evaluated_rows": 12}),
+                patch("app.last_eval_date", return_value="2026-05-20 15:46"),
+                patch("app.load_eval_summary", return_value=summary),
+                patch("app.load_per_question", return_value=per_question),
+                patch("app.metric_card_values", return_value={"strategy": "semantic_only", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {"offline_heuristic": 4}, "question_backends": {"offline_heuristic": 12}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=per_question),
+            ):
+                app._render_eval_tab(fake_st)
 
         infos = [event[1] for event in fake_st.events if event[0] == "info"]
         self.assertTrue(any("Evaluated on: raw" in i for i in infos))
@@ -1294,16 +1307,20 @@ class QueryTabWarningTests(unittest.TestCase):
         per_question = pd.DataFrame([
             {"strategy": "semantic_only", "question": "q", "answer": "a", "ground_truth": "g", "source_doc": "doc", "evaluation_backend": "offline_heuristic", "summary_backend": "offline_heuristic", "faithfulness": 1.0, "answer_relevancy": 0.198, "context_recall": 0.295, "context_precision": 0.069}
         ])
-        with (
-            patch("app._current_source_for_ui", return_value=current),
-            patch("app.load_current_source", return_value=current),
-            patch("app.is_golden_dataset_stale", return_value=False),
-            patch("app.dataset_stats", return_value={"golden_questions": 3, "evaluated_rows": 12}),
-            patch("app.last_eval_date", return_value="2026-05-20 15:46"),
-            patch("app.load_eval_summary", return_value=summary),
-            patch("app.load_per_question", return_value=per_question),
-        ):
-            app._render_eval_tab(fake_st)
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=False),
+                patch("app.dataset_stats", return_value={"golden_questions": 3, "evaluated_rows": 12}),
+                patch("app.last_eval_date", return_value="2026-05-20 15:46"),
+                patch("app.load_eval_summary", return_value=summary),
+                patch("app.load_per_question", return_value=per_question),
+            ):
+                app._render_eval_tab(fake_st)
 
         warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
         captions = [event[1] for event in fake_st.events if event[0] == "caption"]

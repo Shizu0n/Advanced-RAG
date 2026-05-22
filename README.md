@@ -123,6 +123,14 @@ Outputs:
 
 These commands are intentionally explicit. Network fetches, model downloads, and cloud evaluation require opt-in environment variables; index build and cloud chat are enabled by default and can be disabled with explicit opt-out variables.
 
+For the reproducible Phase 6 portfolio flow, use the runner:
+
+```bash
+ALLOW_HF_FETCH=1 python scripts/demo_eval.py
+```
+
+The runner prepares `hf:Shizu0n/phi3-mini-sql-generator` when `ALLOW_HF_FETCH=1` is set, builds the local index, asks the portfolio fine-tune question in extractive/offline mode, runs offline evaluation, and runs cloud RAGAS only when `USE_GEMINI_FREE_RAGAS=1`, `ALLOW_CLOUD_FREE_TIER=1`, `GEMINI_API_KEY` is configured, and all strategy summaries report `gemini_free_tier_ragas`.
+
 ### 1. Prepare a HuggingFace source
 
 ```bash

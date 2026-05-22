@@ -204,6 +204,60 @@ npm install.
         self.assertIn("streamlit run app.py", answer)
         self.assertNotIn("```", answer)
 
+    def test_extractive_answer_suppresses_code_for_non_code_question(self):
+        answer = pipeline_module.synthesize_extractive_answer(
+            "What does the README explain about installation?",
+            [
+                "Install the package before running the app. "
+                "```python\nprint('secret demo code')\n``` "
+                "Use the dashboard after setup completes."
+            ],
+            max_sentences=3,
+        )
+
+        self.assertIn("Install the package before running the app.", answer)
+        self.assertIn("Use the dashboard after setup completes.", answer)
+        self.assertNotIn("print('secret demo code')", answer)
+        self.assertNotIn("```", answer)
+
+    def test_extractive_answer_preserves_code_for_code_question(self):
+        answer = pipeline_module.synthesize_extractive_answer(
+            "Show the Python code example for setup",
+            [
+                "Use this setup command. "
+                "```python\nprint('demo code')\n``` "
+                "The dashboard starts after setup."
+            ],
+            max_sentences=3,
+        )
+
+        self.assertIn("print('demo code')", answer)
+
+    def test_extractive_answer_preserves_inline_command_prose(self):
+        answer = pipeline_module.synthesize_extractive_answer(
+            "How do I run the app?",
+            [
+                "Run `streamlit run app.py` to start the app. The UI opens in the browser."
+            ],
+            max_sentences=2,
+        )
+
+        self.assertIn("streamlit run app.py", answer)
+        self.assertIn("The UI opens in the browser.", answer)
+
+    def test_extractive_answer_preserves_fenced_command_for_command_question(self):
+        answer = pipeline_module.synthesize_extractive_answer(
+            "What command runs the app?",
+            [
+                "Setup instructions. "
+                "```bash\nstreamlit run app.py\n``` "
+                "The app opens after the command starts."
+            ],
+            max_sentences=2,
+        )
+
+        self.assertIn("streamlit run app.py", answer)
+
     def test_answer_query_strips_wrapping_code_fences_from_offline_fallback(self):
         retriever = SimpleNamespace(
             ablation_retrieve=lambda query, strategy: (

@@ -316,8 +316,9 @@ class HuggingFaceSourceLoaderTests(unittest.TestCase):
         self.assertEqual(result, "my-org-my-model-v1.0")
 
     def test_huggingface_network_allowed_by_param(self):
-        self.assertTrue(source_loader._huggingface_network_allowed(True))
-        self.assertFalse(source_loader._huggingface_network_allowed(False))
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(source_loader._huggingface_network_allowed(True))
+            self.assertFalse(source_loader._huggingface_network_allowed(False))
 
     def test_huggingface_network_allowed_by_env(self):
         with patch.dict(os.environ, {"ALLOW_HF_FETCH": "1"}):
@@ -408,21 +409,23 @@ class HuggingFaceSourceLoaderTests(unittest.TestCase):
     def test_prepare_sources_rejects_hf_url_without_opt_in(self):
         with TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw"
-            with self.assertRaisesRegex(RuntimeError, "allow_huggingface_fetch"):
-                source_loader.prepare_sources(
-                    ["https://huggingface.co/meta-llama/Llama-2-7b"],
-                    raw_dir=raw_dir,
-                    allow_huggingface_fetch=False,
-                )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "allow_huggingface_fetch"):
+                    source_loader.prepare_sources(
+                        ["https://huggingface.co/meta-llama/Llama-2-7b"],
+                        raw_dir=raw_dir,
+                        allow_huggingface_fetch=False,
+                    )
 
     def test_prepare_sources_rejects_hf_shorthand_without_opt_in(self):
         with TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw"
-            with self.assertRaisesRegex(RuntimeError, "allow_huggingface_fetch"):
-                source_loader.prepare_sources(
-                    ["hf:meta-llama/Llama-2-7b"],
-                    raw_dir=raw_dir,
-                )
+            with patch.dict(os.environ, {}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "allow_huggingface_fetch"):
+                    source_loader.prepare_sources(
+                        ["hf:meta-llama/Llama-2-7b"],
+                        raw_dir=raw_dir,
+                    )
 
     def test_prepare_sources_copies_hf_card_to_raw_dir(self):
         with TemporaryDirectory() as tmpdir:

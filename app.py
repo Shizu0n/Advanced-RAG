@@ -35,6 +35,17 @@ METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precis
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 CHAT_MESSAGES_KEY = "chat_messages"
 PREPARED_SOURCE_KEY = "prepared_source"
+UI_GATE_OVERRIDES_KEY = "ui_gate_overrides"
+UI_TOGGLE_GATES = {
+    "ALLOW_HF_FETCH": {"label": "Allow Hugging Face fetch", "default": False},
+    "ALLOW_GITHUB_FETCH": {"label": "Allow GitHub fetch", "default": False},
+    "ALLOW_DOCS_DOWNLOAD": {"label": "Allow Python docs download", "default": False},
+    "ALLOW_INDEX_BUILD": {"label": "Allow index build", "default": True},
+    "ALLOW_MODEL_DOWNLOADS": {"label": "Allow model downloads", "default": False},
+    "ALLOW_CLOUD_CHAT": {"label": "Allow cloud chat", "default": True},
+    "USE_GEMINI_FREE_RAGAS": {"label": "Use Gemini RAGAS", "default": False},
+    "ALLOW_CLOUD_FREE_TIER": {"label": "Allow cloud free tier", "default": False},
+}
 MODEL_INFO = {
     "retrieval": "local hybrid retrieval with index build enabled by default; set ALLOW_INDEX_BUILD=0 to disable",
     "cloud_chat": "generative chat enabled by default when a free-tier provider key is configured; set ALLOW_CLOUD_CHAT=0 to force extractive fallback",
@@ -278,6 +289,37 @@ def dataset_stats(golden_path: Path = GOLDEN_DATASET_PATH, per_question_path: Pa
     return stats
 
 
+def _ui_gate_overrides(st) -> dict[str, bool]:
+    value = st.session_state.get(UI_GATE_OVERRIDES_KEY)
+    return value if isinstance(value, dict) else {}
+
+
+def _env_gate_default(name: str, default: bool) -> bool:
+    return os.getenv(name, "1" if default else "0") != "0"
+
+
+def _gate_enabled(st, name: str, default: bool) -> bool:
+    overrides = _ui_gate_overrides(st)
+    if name in overrides:
+        return bool(overrides[name])
+    return _env_gate_default(name, default)
+
+
+def _with_session_gate_env(st, names: list[str], fn):
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        for name in names:
+            default = bool(UI_TOGGLE_GATES[name]["default"])
+            os.environ[name] = "1" if _gate_enabled(st, name, default=default) else "0"
+        return fn()
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 CURRENT_SOURCE_PATH = PROJECT_ROOT / "data" / "current_source.json"
 
 
@@ -397,7 +439,7 @@ def run_query(query: str, strategy: str) -> dict[str, Any]:
 def run_chat_query(message: str, history: list[dict[str, Any]], strategy: str) -> dict[str, Any]:
     from pipeline import chat_query
 
-    return chat_query(message, history=history, strategy=strategy, allow_index_build=True)
+    return chat_query(message, history=history, strategy=strategy, allow_index_build=False)
 
 
 def prepare_sources_for_app(
@@ -728,8 +770,8 @@ def _prepared_index_slug(st) -> str | None:
     return source.get("source_slug") if source else None
 
 
-def _allow_index_build_enabled() -> bool:
-    return os.getenv("ALLOW_INDEX_BUILD", "1") != "0"
+def _allow_index_build_enabled(st) -> bool:
+    return _gate_enabled(st, "ALLOW_INDEX_BUILD", default=True)
 
 
 def _has_prepared_files(st) -> bool:
@@ -1002,10 +1044,27 @@ def _render_source_badge(st, badge_state: str, current_source: dict[str, Any] | 
         st.sidebar.error("No source prepared")
 
 
+def _render_gate_toggles(st) -> None:
+    st.sidebar.header("Session gates")
+    overrides = dict(_ui_gate_overrides(st))
+    for name, config in UI_TOGGLE_GATES.items():
+        default_value = _env_gate_default(name, config["default"])
+        value = st.sidebar.checkbox(
+            config["label"],
+            value=bool(overrides.get(name, default_value)),
+            help=f"Default from .env: {'on' if default_value else 'off'}. Override applies only to this Streamlit session.",
+        )
+        overrides[name] = value
+    st.session_state[UI_GATE_OVERRIDES_KEY] = overrides
+
+
 def _render_sidebar(st) -> None:
     current_source = _source_ui_state(st)
-    badge_state = get_source_badge_state()
+    badge_state = "green" if _source_is_indexed(current_source) else get_source_badge_state()
+    if current_source is not None and not _source_is_indexed(current_source):
+        badge_state = "yellow"
     _render_source_badge(st, badge_state, current_source)
+    _render_gate_toggles(st)
 
     stats = dataset_stats()
     st.sidebar.header("Run metadata")
@@ -1041,9 +1100,8 @@ def _render_sources_tab(st) -> None:
     else:
         source_text = st.text_input("HuggingFace URL", placeholder="hf:owner/model or https://huggingface.co/owner/model")
 
-    allow_network = False
-    if source_type in ("GitHub repo", "HuggingFace model/dataset"):
-        allow_network = st.checkbox(f"Allow {source_type.split()[0].lower()} fetch")
+    allow_hf_fetch = _gate_enabled(st, "ALLOW_HF_FETCH", default=False)
+    allow_github_fetch = _gate_enabled(st, "ALLOW_GITHUB_FETCH", default=False)
 
     # Prepare sources
     if st.button("Prepare sources"):
@@ -1054,10 +1112,10 @@ def _render_sources_tab(st) -> None:
             try:
                 if source_type == "HuggingFace model/dataset":
                     prepared = prepare_sources_for_app(
-                        sources, allow_github_fetch=False, allow_huggingface_fetch=allow_network,
+                        sources, allow_github_fetch=False, allow_huggingface_fetch=allow_hf_fetch,
                     )
                 elif source_type == "GitHub repo":
-                    prepared = prepare_sources_for_app(sources, allow_github_fetch=allow_network)
+                    prepared = prepare_sources_for_app(sources, allow_github_fetch=allow_github_fetch)
                 else:
                     prepared = prepare_sources_for_app(sources, allow_github_fetch=False, allow_huggingface_fetch=False)
             except Exception as exc:
@@ -1089,7 +1147,7 @@ def _render_sources_tab(st) -> None:
         if st.button("Build Index"):
             if not _has_raw_source_files():
                 st.error("No source files found in data/raw/. Prepare a source first.")
-            elif not _allow_index_build_enabled():
+            elif not _allow_index_build_enabled(st):
                 _show_allow_index_build_error(st)
             else:
                 progress = st.progress(0.0, "Building index...")
@@ -1195,7 +1253,7 @@ def _render_query_tab(st) -> None:
     _render_chat_message(st, user_message)
 
     try:
-        result = run_chat_query(prompt.strip(), history=history, strategy=strategy)
+        result = _with_session_gate_env(st, ["ALLOW_CLOUD_CHAT"], lambda: run_chat_query(prompt.strip(), history=history, strategy=strategy))
     except Exception as exc:
         st.error(str(exc))
         return
@@ -1238,7 +1296,7 @@ def _render_eval_tab(st) -> None:
         else:
             with st.spinner("Running evaluation... This may take a minute."):
                 try:
-                    run_evaluation_inline()
+                    _with_session_gate_env(st, ["USE_GEMINI_FREE_RAGAS", "ALLOW_CLOUD_FREE_TIER"], run_evaluation_inline)
                     _show_eval_success(st)
                     st.rerun()
                 except Exception as exc:

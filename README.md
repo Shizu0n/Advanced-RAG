@@ -1,27 +1,37 @@
 # Advanced-RAG
 
-Retrieval-Augmented Generation system that indexes local codebases and documentation, retrieves context through hybrid search (BM25 + vector embeddings + Reciprocal Rank Fusion), and synthesizes answers using either local extractive methods or free-tier LLM providers. Operates fully offline by default — no paid API keys required.
+Advanced-RAG is a Retrieval-Augmented Generation workspace for local and public technical sources. It prepares source material, builds a local retrieval index, answers questions with hybrid retrieval, and evaluates retrieval quality with offline heuristics or optional RAGAS-backed cloud evaluation.
 
-## Motivation
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white) ![Streamlit](https://img.shields.io/badge/Streamlit-1.39-FF4B4B?logo=streamlit&logoColor=white) ![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.11-4A67FF?logo=llama&logoColor=white) ![ChromaDB](https://img.shields.io/badge/ChromaDB-0.5-7B61FF) ![BM25](https://img.shields.io/badge/rank--bm25-BM25-555555) ![Sentence%20Transformers](https://img.shields.io/badge/Sentence%20Transformers-bge--small--en--v1.5-0A7EA4) ![RAGAS](https://img.shields.io/badge/RAGAS-0.2.5-0F766E)
 
-Most RAG implementations depend on paid APIs (OpenAI, Anthropic) for embeddings, retrieval, and synthesis. This creates a barrier for experimentation and raises concerns about sending proprietary code to third-party services. Advanced-RAG solves this by:
+Core stack: Python 3.11, Streamlit, LlamaIndex, ChromaDB, rank-bm25, sentence-transformers, and RAGAS.
 
-- Running entirely on local infrastructure with open-source models
-- Providing a multi-provider fallback chain (Gemini, Groq, GitHub Models) when cloud access is desired
-- Evaluating retrieval quality with both offline heuristics and real RAGAS metrics
-- Making every external operation explicitly opt-in through environment variables
+The project is offline-first by default. External fetches, model downloads, and cloud-dependent paths are gated explicitly.
 
-## Architecture
+## Supported Sources
+
+The product currently supports three source types:
+
+- **Local paths** — local directories or supported files from the device filesystem
+- **GitHub repositories** — public repository URLs from `github.com`
+- **Hugging Face model or dataset cards** — `hf:owner/model` shorthand or `https://huggingface.co/...` URLs
+
+Notes:
+
+- Local and GitHub sources ingest supported repository files into `data/raw/`
+- Hugging Face sources ingest the source card `README.md` for the selected model or dataset
+
+## System Architecture
 
 ```mermaid
 flowchart TD
-    APP["app.py (Streamlit)<br/>Sources | Query Interface | Eval Dashboard"]
+    APP["app.py (Streamlit)<br/>Sources | Query Interface | Evaluation Dashboard"]
     PIPE["pipeline.py (Orchestrator)<br/>Intent detection → Query rewriting → Strategy selection<br/>→ Confidence scoring → Answer synthesis"]
     RET["retrieval.py<br/>BM25 + Vector + RRF + Reranker<br/>4 strategies: semantic, bm25, hybrid, hybrid+rerank"]
-    SYN["synthesis.py<br/>Generative (Gemini) + Extractive fallback"]
-    GEM["gemini_ragas.py<br/>Multi-provider client with budget enforcement & caching<br/>Gemini → Groq → GitHub Models"]
+    SYN["synthesis.py<br/>Generative + Extractive fallback"]
+    GEM["gemini_ragas.py<br/>Cloud provider client, fallback chain, budgets, caching"]
     ING["ingestion.py<br/>Chunking → Embedding → ChromaDB"]
-    SRC["source_loader.py<br/>Local files + GitHub repos<br/>Filtered, symlink-safe"]
+    SRC["source_loader.py<br/>Local files + GitHub repos + Hugging Face cards"]
     EVA["evaluate.py<br/>Golden dataset + Offline heuristics + RAGAS integration"]
 
     APP --> PIPE
@@ -33,105 +43,169 @@ flowchart TD
     RET --> EVA
 ```
 
-## How It Works
+Core modules:
 
-### 1. Source Ingestion
-Local directories or public GitHub repositories are prepared into `data/raw/`. Files are filtered by extension (`.py`, `.md`, `.ts`, `.js`, `.json`, `.yaml`, `.toml`, `.txt`, `.rst`), symlinks are rejected, and ignored directories (`node_modules`, `.git`, `__pycache__`) are skipped.
+- `source_loader.py` — prepares local, GitHub, and Hugging Face sources into `data/raw/`
+- `ingestion.py` — chunks source files, computes embeddings, and persists the vector index
+- `retrieval.py` — implements lexical, semantic, hybrid, and reranked retrieval strategies
+- `pipeline.py` — coordinates query analysis, retrieval, synthesis, and fallback behavior
+- `synthesis.py` — handles generative and extractive answer synthesis
+- `evaluate.py` — generates golden datasets and runs evaluation
+- `gemini_ragas.py` — integrates optional free-tier cloud providers for synthesis and RAGAS evaluation
+- `app.py` — Streamlit interface for source preparation, querying, and evaluation
 
-### 2. Indexing
-Source files are chunked (512 tokens, 50-token overlap) using LlamaIndex's `SentenceSplitter`, embedded locally with `BAAI/bge-small-en-v1.5` (HuggingFace), and stored in ChromaDB. Index building is enabled by default; set `ALLOW_INDEX_BUILD=0` to disable it.
+## Runtime Behavior
 
-### 3. Retrieval
-Queries pass through intent detection (stack, overview, architecture, setup, security, evaluation) and term expansion. Four retrieval strategies are available:
+### Source Preparation
+
+Prepared sources are stored under `data/raw/`.
+
+- Local and GitHub sources are filtered by supported extensions such as `.py`, `.md`, `.ts`, `.js`, `.json`, `.yaml`, `.toml`, `.txt`, and `.rst`
+- Symlinks are rejected
+- Ignored directories such as `node_modules`, `.git`, and `__pycache__` are skipped
+- Hugging Face sources fetch the card `README.md` through the raw `/resolve/main/README.md` endpoint
+
+### Indexing
+
+Source files are chunked with LlamaIndex `SentenceSplitter` using a 512-token chunk size and 50-token overlap. Embeddings are generated locally with `BAAI/bge-small-en-v1.5` and stored in ChromaDB.
+
+If no vector index exists, the product falls back to lexical-only retrieval.
+
+### Querying
+
+The query flow supports four retrieval strategies:
 
 | Strategy | Description |
-|----------|-------------|
-| `semantic_only` | Vector similarity search |
-| `bm25_only` | BM25Okapi lexical matching |
+|---|---|
+| `semantic_only` | Vector similarity retrieval |
+| `bm25_only` | BM25 lexical retrieval |
 | `hybrid_no_rerank` | Vector + BM25 with Reciprocal Rank Fusion |
-| `hybrid_rerank` | Hybrid + cross-encoder reranking (`ms-marco-MiniLM-L-6-v2`) |
+| `hybrid_rerank` | Hybrid retrieval with cross-encoder reranking |
 
-When no vector index exists, the system falls back to a lexical-only retriever — zero setup required.
+Answer synthesis has two modes:
 
-### 4. Answer Synthesis
-- **Extractive** (default): Selects sentences with strongest lexical overlap to the query. Always available, no API calls.
-- **Generative**: Sends retrieved contexts to a free-tier LLM with a structured prompt. Falls back to extractive on failure.
+- **Generative** — uses a configured free-tier provider when query-time cloud chat is allowed
+- **Extractive fallback** — uses retrieved context directly when cloud chat is disabled, unavailable, or fails
 
-### 5. Evaluation
-Generates a golden dataset from indexed content, evaluates all 4 strategies using offline heuristic metrics (faithfulness, answer relevancy, context recall, context precision), and optionally runs real RAGAS evaluation with a cloud provider.
+### Evaluation
 
-## Usage Flow
+Evaluation generates a golden dataset from the indexed source and scores all retrieval strategies across:
 
-```mermaid
-flowchart LR
-    A["1. Prepare Sources<br/>Copy local files or fetch GitHub repos"] --> B["2. Index (optional)<br/>Build ChromaDB vector index with local embeddings"]
-    B --> C["3. Query<br/>Ask questions via Streamlit or Python API"]
-    C --> D["4. Evaluate<br/>Run offline metrics or RAGAS eval"]
-```
+- Faithfulness
+- Answer relevancy
+- Context recall
+- Context precision
+
+Two evaluation modes exist:
+
+- **Offline heuristic evaluation** — local only
+- **RAGAS-backed evaluation** — optional cloud-backed evaluation when explicitly enabled
+
+## Configuration
+
+Runtime defaults come from `.env`. The Streamlit UI can override selected operational gates for the current session only.
+
+### Provider Configuration
+
+| Variable | What it does |
+|---|---|
+| `GEMINI_API_KEY` | Enables Gemini as a provider for supported cloud flows |
+| `GEMINI_MODEL` | Selects the Gemini model used by this project |
+| `GROQ_API_KEY` | Enables Groq as a fallback provider |
+| `GROQ_MODEL` | Selects the Groq model used by this project |
+| `GITHUB_MODELS_TOKEN` | Enables GitHub Models as a fallback provider |
+| `GITHUB_MODELS_MODEL` | Selects the GitHub Models model identifier |
+
+### Source Preparation Gates
+
+| Variable | Default | What it does |
+|---|---:|---|
+| `ALLOW_HF_FETCH` | `0` | Allows fetching Hugging Face model or dataset card `README.md` files |
+| `ALLOW_GITHUB_FETCH` | `0` | Allows downloading public GitHub repositories for preparation |
+| `ALLOW_DOCS_DOWNLOAD` | `0` | Allows the Python-docs bootstrap fallback when `data/raw/` is empty |
+
+### Local Indexing and Model Gates
+
+| Variable | Default | What it does |
+|---|---:|---|
+| `ALLOW_INDEX_BUILD` | `1` | Allows the application to build a local ChromaDB index |
+| `ALLOW_MODEL_DOWNLOADS` | `0` | Allows downloading optional local models such as the reranker |
+
+### Query-Time Cloud Chat
+
+| Variable | Default | What it does |
+|---|---:|---|
+| `ALLOW_CLOUD_CHAT` | `1` | Allows query-time generative synthesis; set `ALLOW_CLOUD_CHAT=0` to force extractive fallback |
+| `MAX_CLOUD_CHAT_CALLS` | `1` | Limits how many cloud chat calls the query path may make |
+| `CLOUD_CHAT_PROVIDER_TIMEOUT_SECONDS` | `10` | Per-provider timeout for a single cloud chat attempt |
+| `CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS` | `30` | Total timeout budget across the cloud chat flow |
+
+### Evaluation and RAGAS Gates
+
+These variables affect evaluation only. They do not enable query-time cloud chat by themselves.
+
+| Variable | Default | What it does |
+|---|---:|---|
+| `USE_GEMINI_FREE_RAGAS` | `0` | Enables Gemini-backed RAGAS evaluation paths |
+| `ALLOW_CLOUD_FREE_TIER` | `0` | Allows cloud-backed free-tier evaluation flows |
+| `MAX_GEMINI_CALLS` | `120` | Sets the maximum evaluation API call budget |
+| `GEMINI_RAGAS_STRICT` | `0` | When `1`, evaluation fails hard instead of falling back to offline heuristics |
+
+### Session Overrides in the UI
+
+The Streamlit UI exposes session-scoped toggles for:
+
+- `ALLOW_HF_FETCH`
+- `ALLOW_GITHUB_FETCH`
+- `ALLOW_DOCS_DOWNLOAD`
+- `ALLOW_INDEX_BUILD`
+- `ALLOW_MODEL_DOWNLOADS`
+- `ALLOW_CLOUD_CHAT`
+- `USE_GEMINI_FREE_RAGAS`
+- `ALLOW_CLOUD_FREE_TIER`
+
+These toggles use `.env` as the default source of truth, apply only to the current Streamlit session, and do not rewrite `.env`.
+
+Advanced limits such as `MAX_GEMINI_CALLS`, `CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS`, and `GEMINI_RAGAS_STRICT` remain environment-only.
+
+## Usage
 
 ### Quick Start
 
 ```bash
-# Clone and install
 git clone https://github.com/Shizu0n/Advanced-RAG && cd Advanced-RAG
 pip install -r requirements.txt
-
-# Configure (optional — works offline without any keys)
 cp .env.example .env
-
-# Run the Streamlit UI
 streamlit run app.py
 ```
 
 The app opens at `http://localhost:8501` with three tabs:
-- **Sources**: Prepare local directories or GitHub repos for indexing
-- **Query**: Chat interface with strategy selector and retrieval trace debug
-- **Evaluation**: Metrics dashboard with per-question scores and strategy comparison
+
+- **Sources** — prepare local paths, GitHub repositories, or Hugging Face cards
+- **Query** — run questions against the indexed source with trace visibility
+- **Evaluation** — compare retrieval strategies and inspect results
 
 ### Python API
 
 ```python
 from pipeline import answer_query, chat_query
 
-# Single question
 result = answer_query("What authentication method does this project use?")
 print(result["answer"])
 
-# Conversational (with history)
-result = chat_query("Explain the referral system", history=[
-    {"role": "user", "content": "What tech stack is used?"},
-    {"role": "assistant", "content": "NestJS backend, React frontend..."}
-])
+result = chat_query(
+    "Explain the referral system",
+    history=[
+        {"role": "user", "content": "What tech stack is used?"},
+        {"role": "assistant", "content": "NestJS backend, React frontend..."},
+    ],
+)
+print(result["answer"])
 ```
 
-### Running Evaluations
+### Manual Source Preparation and Query Flow
 
-```bash
-# Offline evaluation (no API keys needed)
-python evaluate.py
-
-# With Gemini RAGAS evaluation
-USE_GEMINI_FREE_RAGAS=1 ALLOW_CLOUD_FREE_TIER=1 python evaluate.py
-```
-
-Outputs:
-- `data/eval/ragas_results.csv` — per-strategy summary metrics
-- `data/eval/ragas_per_question.csv` — per-question breakdown
-- `data/eval/golden_dataset.json` — generated evaluation dataset
-
-## Manual retrieval and evaluation commands
-
-These commands are intentionally explicit. Network fetches, model downloads, and cloud evaluation require opt-in environment variables; index build and cloud chat are enabled by default and can be disabled with explicit opt-out variables.
-
-For the reproducible Phase 6 portfolio flow, use the runner:
-
-```bash
-ALLOW_HF_FETCH=1 python scripts/demo_eval.py
-```
-
-The runner prepares `hf:Shizu0n/phi3-mini-sql-generator` when `ALLOW_HF_FETCH=1` is set, builds the local index, asks the portfolio fine-tune question in extractive/offline mode, runs offline evaluation, and runs cloud RAGAS only when `USE_GEMINI_FREE_RAGAS=1`, `ALLOW_CLOUD_FREE_TIER=1`, `GEMINI_API_KEY` is configured, and all strategy summaries report `gemini_free_tier_ragas`.
-
-### 1. Prepare a HuggingFace source
+#### 1. Prepare a Hugging Face source
 
 ```bash
 ALLOW_HF_FETCH=1 python - <<'PY'
@@ -140,7 +214,7 @@ prepare_sources(["hf:Shizu0n/phi3-mini-sql-generator"], allow_huggingface_fetch=
 PY
 ```
 
-### 2. Build the local index
+#### 2. Build the local index
 
 ```bash
 python - <<'PY'
@@ -151,103 +225,66 @@ PY
 
 Set `ALLOW_INDEX_BUILD=0` to disable index building in app/API flows.
 
-### 3. Ask the portfolio fine-tune question offline
+#### 3. Ask a question offline
 
 ```bash
 python - <<'PY'
 from pipeline import chat_query
-result = chat_query("qual a dataset usada no fine tunning desse model do hugging face?", strategy="hybrid_rerank")
+result = chat_query(
+    "qual a dataset usada no fine tunning desse model do hugging face?",
+    strategy="hybrid_rerank",
+)
 print(result["answer"])
 print(result["trace"].get("synthesis", {}))
 PY
 ```
 
-### 4. Run source-scoped evaluation
-
-Offline heuristic evaluation:
-
-```bash
-python evaluate.py
-```
-
-Cloud RAGAS evaluation requires explicit gates and provider keys:
-
-```bash
-ALLOW_CLOUD_FREE_TIER=1 USE_GEMINI_FREE_RAGAS=1 python evaluate.py
-```
-
-Cloud chat in the Streamlit query tab is enabled by default when a free-tier provider key is configured. To force extractive fallback:
+#### 4. Force extractive fallback in the UI
 
 ```bash
 ALLOW_CLOUD_CHAT=0 streamlit run app.py
 ```
 
-## Evaluation Metrics
+## Evaluation
 
-The system evaluates 4 retrieval strategies across 4 dimensions:
-
-| Metric | What It Measures |
-|--------|-----------------|
-| **Faithfulness** | Does the answer stay grounded in retrieved context? |
-| **Answer Relevancy** | Does the answer address the actual question? |
-| **Context Recall** | Does the retrieval capture the relevant information? |
-| **Context Precision** | Is the retrieved context focused and not noisy? |
-
-Offline heuristics use term-overlap scoring. RAGAS evaluation uses Gemini as the judge model with locally computed embeddings — no OpenAI dependency.
-
-## Design Principles
-
-**Explicit control for external operations.** Network fetches, model downloads, and cloud evaluation require opt-in environment variables. Query-time cloud chat is enabled when a free-tier provider key is configured and can be forced off with `ALLOW_CLOUD_CHAT=0`.
-
-**Offline-first with graceful degradation.** Generative → extractive fallback. Cloud RAGAS → offline heuristics. Vector index → lexical-only retrieval. The system always works.
-
-**No paid SDKs.** The codebase does not import OpenAI, Anthropic, or their LangChain wrappers. Enforced by test assertions.
-
-**Provider fallback chain.** When cloud chat is enabled and provider keys are configured, requests flow through Gemini → Groq → GitHub Models, with automatic retry on 429/403/5xx and a shared call budget.
-
-## Tech Stack
-
-| Component | Technology |
-|-----------|-----------|
-| RAG Framework | LlamaIndex 0.11.23 |
-| Vector Store | ChromaDB 0.5.15 |
-| Local Embeddings | BAAI/bge-small-en-v1.5 (sentence-transformers) |
-| Lexical Retrieval | rank-bm25 (BM25Okapi) |
-| Reranking | cross-encoder/ms-marco-MiniLM-L-6-v2 |
-| Evaluation | RAGAS 0.2.5 + custom offline heuristics |
-| UI | Streamlit 1.39.0 |
-| Language | Python 3.11 |
-
-## Configuration
-
-All configuration via environment variables. Copy `.env.example` to `.env`.
-
-| Variable | Purpose | Default |
-|----------|---------|---------|
-| `GEMINI_API_KEY` | Gemini API key (primary provider) | — |
-| `GEMINI_MODEL` | Gemini model | `gemini-2.5-flash` |
-| `GROQ_API_KEY` / `GROQ_MODEL` | Groq fallback | `llama-3.3-70b-versatile` |
-| `GITHUB_MODELS_TOKEN` / `GITHUB_MODELS_MODEL` | GitHub Models fallback | — |
-| `ALLOW_INDEX_BUILD` | Permit ChromaDB index building (`0` disables) | `1` |
-| `ALLOW_MODEL_DOWNLOADS` | Permit cross-encoder download | `0` |
-| `ALLOW_GITHUB_FETCH` | Permit GitHub repo download | `0` |
-| `ALLOW_CLOUD_FREE_TIER` | Permit cloud evaluation | `0` |
-| `USE_GEMINI_FREE_RAGAS` | Enable RAGAS with Gemini | `0` |
-| `ALLOW_CLOUD_CHAT` | Permit query-time cloud chat (`0` forces extractive fallback) | `1` |
-| `MAX_CLOUD_CHAT_CALLS` | Query-time cloud chat budget cap | `1` |
-| `MAX_GEMINI_CALLS` | Evaluation API call budget cap | `120` |
-
-## Running Tests
+### Running Evaluations
 
 ```bash
-# All tests
+python evaluate.py
+USE_GEMINI_FREE_RAGAS=1 ALLOW_CLOUD_FREE_TIER=1 python evaluate.py
+```
+
+Outputs:
+
+- `data/eval/ragas_results.csv` — per-strategy summary metrics
+- `data/eval/ragas_per_question.csv` — per-question breakdown
+- `data/eval/golden_dataset.json` — generated evaluation dataset
+
+### Evaluation Metrics
+
+| Metric | What it measures |
+|---|---|
+| Faithfulness | Whether the answer stays grounded in retrieved context |
+| Answer relevancy | Whether the answer addresses the question directly |
+| Context recall | Whether retrieval captured the needed information |
+| Context precision | Whether retrieved context is focused rather than noisy |
+
+Offline heuristics use local overlap-based scoring. RAGAS evaluation uses Gemini as the judge model with local embeddings and no paid-provider dependency.
+
+## Testing
+
+```bash
 python -m unittest discover -s tests -v
-
-# Single file
 python -m unittest tests.test_pipeline -v
-
-# Single method
 python -m unittest tests.test_pipeline.PipelineTests.test_chat_query_stack_aggregates_technologies_with_evidence -v
 ```
 
-Tests use `unittest` with extensive mocking. Validates that paid SDKs are never imported, network calls are blocked by default, and all fallback paths work correctly.
+The project uses `unittest` with extensive mocking. Tests cover provider gating, source preparation, retrieval strategies, synthesis fallback behavior, and evaluation contracts.
+
+## Technical Principles
+
+- **Offline-first operation** — the system remains usable without cloud providers
+- **Explicit external operations** — network fetches, cloud evaluation, and model downloads remain gated
+- **No paid-provider SDKs** — the codebase avoids OpenAI and Anthropic dependencies
+- **Visible fallback behavior** — the query path exposes synthesis mode and trace metadata
+- **Source-scoped evaluation** — evaluation is tied to the currently indexed source

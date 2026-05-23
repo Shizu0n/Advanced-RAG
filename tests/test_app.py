@@ -71,6 +71,10 @@ class FakeSidebar:
     def json(self, value):
         self._parent.events.append(("sidebar_json", value))
 
+    def checkbox(self, label, value=False, help=None):
+        self._parent.events.append(("sidebar_checkbox", label, value, help))
+        return self._parent._checkbox_value if self._parent._checkbox_value is not None else value
+
     def download_button(self, label, **kwargs):
         self._parent.events.append(("sidebar_download_button", label))
 
@@ -180,6 +184,31 @@ class FakeStreamlit:
 
 
 class AppHelperTests(unittest.TestCase):
+    def test_session_gate_override_takes_precedence_over_env_default(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {"ALLOW_CLOUD_CHAT": False}
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "1"}, clear=True):
+            self.assertFalse(app._gate_enabled(fake_st, "ALLOW_CLOUD_CHAT", default=True))
+
+    def test_session_gate_uses_env_default_when_no_override_exists(self):
+        fake_st = FakeStreamlit()
+        with patch.dict("os.environ", {"ALLOW_HF_FETCH": "1"}, clear=True):
+            self.assertTrue(app._gate_enabled(fake_st, "ALLOW_HF_FETCH", default=False))
+
+    def test_with_session_gates_applies_cloud_chat_override(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {"ALLOW_CLOUD_CHAT": False}
+
+        observed = {}
+
+        def capture():
+            observed["value"] = os.getenv("ALLOW_CLOUD_CHAT")
+            return "ok"
+
+        result = app._with_session_gate_env(fake_st, ["ALLOW_CLOUD_CHAT"], capture)
+        self.assertEqual(result, "ok")
+        self.assertEqual(observed["value"], "0")
+
     def test_load_eval_summary_reads_expected_metric_columns(self):
         with TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "ragas_results.csv"
@@ -478,7 +507,7 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(result["answer"], "ok")
         query.assert_called_once_with("question", strategy="bm25_only", allow_index_build=True)
 
-    def test_run_chat_query_allows_index_build_by_default(self):
+    def test_run_chat_query_uses_existing_index_without_rebuilding(self):
         history = [{"role": "user", "content": "before"}]
         with patch("pipeline.chat_query", return_value={"answer": "ok"}) as query:
             result = app.run_chat_query("question", history, "bm25_only")
@@ -488,7 +517,7 @@ class AppHelperTests(unittest.TestCase):
             "question",
             history=history,
             strategy="bm25_only",
-            allow_index_build=True,
+            allow_index_build=False,
         )
 
     def test_query_tab_persists_chat_messages_in_session_state(self):
@@ -906,6 +935,11 @@ class SourcesTabTests(unittest.TestCase):
         errors = [event[1] for event in fake_st.events if event[0] == "error"]
         self.assertTrue(any("ALLOW_INDEX_BUILD" in e for e in errors))
 
+    def test_build_index_uses_sidebar_index_gate_override(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {"ALLOW_INDEX_BUILD": False}
+        self.assertFalse(app._allow_index_build_enabled(fake_st))
+
     def test_prepare_sources_passes_huggingface_flag(self):
         fake_st = FakeStreamlit()
         fake_st._button_return = True
@@ -919,8 +953,29 @@ class SourcesTabTests(unittest.TestCase):
             app._render_sources_tab(fake_st)
 
         mock_prepare.assert_called_once_with(
-            ["hf:owner/model"], allow_github_fetch=False, allow_huggingface_fetch=False,
+            ["hf:owner/model"], allow_github_fetch=False, allow_huggingface_fetch=True,
         )
+
+    def test_sidebar_renders_operational_gate_toggles_only(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+        ):
+            app._render_sidebar(fake_st)
+
+        labels = [event[1] for event in fake_st.events if event[0] == "sidebar_checkbox"]
+        self.assertIn("Allow Hugging Face fetch", labels)
+        self.assertIn("Allow GitHub fetch", labels)
+        self.assertIn("Allow Python docs download", labels)
+        self.assertIn("Allow index build", labels)
+        self.assertIn("Allow model downloads", labels)
+        self.assertIn("Allow cloud chat", labels)
+        self.assertIn("Use Gemini RAGAS", labels)
+        self.assertIn("Allow cloud free tier", labels)
+        self.assertNotIn("MAX_GEMINI_CALLS", labels)
+        self.assertNotIn("CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS", labels)
+        self.assertNotIn("GEMINI_RAGAS_STRICT", labels)
 
     def test_sidebar_shows_green_badge_when_indexed(self):
         fake_st = FakeStreamlit()
@@ -947,6 +1002,22 @@ class SourcesTabTests(unittest.TestCase):
 
         sidebar_warnings = [event[1] for event in fake_st.events if event[0] == "sidebar_warning"]
         self.assertTrue(any("prepared" in w.lower() for w in sidebar_warnings))
+
+    def test_sidebar_does_not_mark_different_prepared_source_as_indexed(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "new-source", "indexed_at": None}
+        with (
+            patch("app.load_current_source", return_value={"source_slug": "old-source", "indexed_at": "2026-05-20"}),
+            patch("app.get_source_badge_state", return_value="green"),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+        ):
+            app._render_sidebar(fake_st)
+
+        sidebar_warnings = [event[1] for event in fake_st.events if event[0] == "sidebar_warning"]
+        sidebar_successes = [event[1] for event in fake_st.events if event[0] == "sidebar_success"]
+        self.assertTrue(any("new-source" in warning for warning in sidebar_warnings))
+        self.assertFalse(any("new-source" in success for success in sidebar_successes))
 
     def test_sidebar_shows_grey_badge_when_no_source(self):
         fake_st = FakeStreamlit()

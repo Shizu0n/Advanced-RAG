@@ -57,7 +57,7 @@ class CloudProvider:
 def providers_from_env() -> list[CloudProvider]:
     providers: list[CloudProvider] = []
     if os.getenv("GEMINI_API_KEY"):
-        providers.append(CloudProvider("gemini", GEMINI_MODEL, os.environ["GEMINI_API_KEY"]))
+        providers.append(CloudProvider("gemini", os.getenv("GEMINI_MODEL", GEMINI_MODEL), os.environ["GEMINI_API_KEY"]))
     if os.getenv("GROQ_API_KEY"):
         model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         if _is_allowed_fallback_model(model):

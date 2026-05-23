@@ -146,7 +146,7 @@ class GeminiRagasTests(unittest.TestCase):
             providers = gemini_ragas.providers_from_env()
 
         self.assertEqual([provider.name for provider in providers], ["gemini", "groq", "github"])
-        self.assertEqual([provider.model for provider in providers].count("gemini-2.5-flash"), 1)
+        self.assertEqual(providers[0].model, "gemini-2.5-pro")
         self.assertTrue(all(gemini_ragas._is_allowed_fallback_model(provider.model) for provider in providers[1:]))
 
     def test_provider_chain_skips_google_family_fallback_models(self):

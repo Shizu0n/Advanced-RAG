@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import os
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,11 +20,13 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.vector_stores.chroma import ChromaVectorStore
 
-from source_loader import PREPARED_SOURCE_METADATA, prepare_sources
+from source_loader import PREPARED_SOURCE_METADATA, clear_prepared_source, prepare_sources
+import source_loader
 
 
-RAW_DIR = Path("data/raw")
-CHROMA_DIR = Path("chroma_db")
+PROJECT_ROOT = Path(__file__).resolve().parent
+RAW_DIR = PROJECT_ROOT / "data" / "raw"
+CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 CHROMA_COLLECTION_NAME = "advanced_rag"
 PYTHON_TUTORIAL_URL = "https://docs.python.org/3/tutorial/"
 PAGE_LIMIT = 50
@@ -78,7 +81,7 @@ IGNORED_DIR_NAMES = {
     "__pycache__",
 }
 
-CURRENT_SOURCE_PATH = Path("data/current_source.json")
+CURRENT_SOURCE_PATH = PROJECT_ROOT / "data" / "current_source.json"
 
 
 def _detect_source_type(raw_dir: Path) -> str:
@@ -241,6 +244,63 @@ def load_or_download_sources(raw_dir: Path = RAW_DIR, limit: int = PAGE_LIMIT) -
     return download_python_tutorial_pages(raw_dir=raw_dir, limit=limit)
 
 
+def _metadata_for_files(
+    files: list[Path],
+    current_source: dict | None,
+    source_files_were_explicit: bool,
+    raw_dir: Path,
+) -> dict | None:
+    for path in files:
+        metadata = PREPARED_SOURCE_METADATA.get(path.resolve().as_posix())
+        if metadata:
+            return metadata
+    prepared_source = source_loader.load_prepared_source(source_loader.prepared_source_path_for_raw_dir(raw_dir))
+    if prepared_source:
+        prepared_root = raw_dir / str(prepared_source.get("source_slug", ""))
+        resolved_root = prepared_root.resolve(strict=False)
+        if any(_path_is_relative_to(path.resolve(strict=False), resolved_root) for path in files):
+            return prepared_source
+    return None if source_files_were_explicit else current_source
+
+
+def _path_is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _explicit_source_root(files: list[Path], raw_dir: Path) -> Path:
+    resolved_raw_dir = raw_dir.resolve(strict=False)
+    for path in files:
+        resolved_path = path.resolve(strict=False)
+        try:
+            relative = resolved_path.relative_to(resolved_raw_dir)
+        except ValueError:
+            return path.parent
+        if relative.parts:
+            return raw_dir / relative.parts[0]
+    return raw_dir
+
+
+def _raw_dir_for_metadata(raw_dir: Path, metadata: dict | None, files: list[Path], source_files_were_explicit: bool) -> Path:
+    if metadata and metadata.get("source_slug"):
+        candidate = raw_dir / str(metadata["source_slug"])
+        if candidate.exists():
+            return candidate
+    if source_files_were_explicit:
+        return _explicit_source_root(files, raw_dir)
+    return raw_dir
+
+
+def clear_indexed_source_artifacts() -> None:
+    if CHROMA_DIR.exists():
+        shutil.rmtree(CHROMA_DIR)
+    if CURRENT_SOURCE_PATH.exists():
+        CURRENT_SOURCE_PATH.unlink()
+
+
 def build_index(
     source_files: Iterable[Path] | None = None,
     raw_dir: Path = RAW_DIR,
@@ -250,11 +310,12 @@ def build_index(
     import logging
     logger = logging.getLogger(__name__)
 
+    source_files_were_explicit = source_files is not None
     current_source = load_current_source()
     current_raw_dir = _current_source_raw_dir(raw_dir, current_source)
     files = (
         list(source_files)
-        if source_files is not None
+        if source_files_were_explicit
         else load_or_download_sources(raw_dir=current_raw_dir or raw_dir)
     )
     if not files:
@@ -282,35 +343,37 @@ def build_index(
     splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
     nodes = splitter.get_nodes_from_documents(documents)
 
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     try:
-        chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
-    except chromadb.errors.NotFoundError:
-        pass
-    chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
-    vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-    storage_context = StorageContext.from_defaults(vector_store=vector_store)
-    embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
+        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+        chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        try:
+            chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
+        except chromadb.errors.NotFoundError:
+            pass
+        chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
+        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+        storage_context = StorageContext.from_defaults(vector_store=vector_store)
+        embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
 
-    start = time.perf_counter()
-    index = VectorStoreIndex(nodes, storage_context=storage_context, embed_model=embed_model)
-    embedding_time = time.perf_counter() - start
+        start = time.perf_counter()
+        index = VectorStoreIndex(nodes, storage_context=storage_context, embed_model=embed_model)
+        embedding_time = time.perf_counter() - start
 
-    logger.info("Index built: %d documents, %d chunks, %.2fs embedding", len(documents), len(nodes), embedding_time)
+        logger.info("Index built: %d documents, %d chunks, %.2fs embedding", len(documents), len(nodes), embedding_time)
 
-    prepared_metadata = next(
-        (PREPARED_SOURCE_METADATA.get(path.resolve().as_posix()) for path in files),
-        None,
-    ) or current_source
-    write_current_source(
-        raw_dir=raw_dir,
-        file_count=len(documents),
-        chunk_count=len(nodes),
-        source_input=prepared_metadata["source_input"] if prepared_metadata else "",
-        source_type=prepared_metadata["source_type"] if prepared_metadata else None,
-        source_slug=prepared_metadata["source_slug"] if prepared_metadata else None,
-    )
+        prepared_metadata = _metadata_for_files(files, current_source, source_files_were_explicit, raw_dir)
+        active_raw_dir = _raw_dir_for_metadata(raw_dir, prepared_metadata, files, source_files_were_explicit)
+        write_current_source(
+            raw_dir=active_raw_dir,
+            file_count=len(documents),
+            chunk_count=len(nodes),
+            source_input=str(prepared_metadata.get("source_input", "")) if prepared_metadata else "",
+            source_type=str(prepared_metadata.get("source_type")) if prepared_metadata and prepared_metadata.get("source_type") else None,
+            source_slug=str(prepared_metadata.get("source_slug")) if prepared_metadata and prepared_metadata.get("source_slug") else None,
+        )
+    except Exception:
+        clear_indexed_source_artifacts()
+        raise
 
     return index, nodes
 

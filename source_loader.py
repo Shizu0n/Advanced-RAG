@@ -78,8 +78,10 @@ IGNORED_DIR_NAMES = {
     "__pycache__",
 }
 MAX_GITHUB_ZIP_BYTES = 50 * 1024 * 1024
-CURRENT_SOURCE_PATH = Path("data/current_source.json")
-PREPARED_SOURCE_METADATA: dict[str, dict[str, str]] = {}
+PROJECT_ROOT = Path(__file__).resolve().parent
+CURRENT_SOURCE_PATH = PROJECT_ROOT / "data" / "current_source.json"
+PREPARED_SOURCE_PATH = PROJECT_ROOT / "data" / "prepared_source.json"
+PREPARED_SOURCE_METADATA: dict[str, dict[str, str | int | None]] = {}
 
 
 def _slug(value: str) -> str:
@@ -291,9 +293,73 @@ def _huggingface_network_allowed(allow_huggingface_fetch: bool) -> bool:
     return allow_huggingface_fetch or os.getenv("ALLOW_HF_FETCH") == "1"
 
 
-def _write_prepared_source_metadata(metadata: dict[str, str | int | None]) -> None:
-    CURRENT_SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CURRENT_SOURCE_PATH.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+def _prepared_metadata(
+    *,
+    source_input: str,
+    source_type: str,
+    source_slug: str,
+    file_count: int,
+) -> dict[str, str | int | None]:
+    return {
+        "source_input": source_input,
+        "source_type": source_type,
+        "source_slug": source_slug.lower(),
+        "indexed_at": None,
+        "file_count": file_count,
+        "chunk_count": 0,
+    }
+
+
+def prepared_source_path_for_raw_dir(raw_dir: Path) -> Path:
+    return raw_dir.parent / "prepared_source.json"
+
+
+def _persist_prepared_source(metadata: dict[str, str | int | None], path: Path | None = None) -> None:
+    target = path or PREPARED_SOURCE_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_prepared_source(path: Path | None = None) -> dict | None:
+    target = path or PREPARED_SOURCE_PATH
+    if not target.exists():
+        return None
+    try:
+        return json.loads(target.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def clear_prepared_source(path: Path | None = None) -> None:
+    target = path or PREPARED_SOURCE_PATH
+    if target.exists():
+        target.unlink()
+
+
+def _register_prepared_files(
+    files: list[Path],
+    *,
+    source_input: str,
+    source_type: str,
+    source_slug: str,
+    prepared_source_path: Path | None = None,
+) -> dict[str, str | int | None]:
+    metadata = _prepared_metadata(
+        source_input=source_input,
+        source_type=source_type,
+        source_slug=source_slug,
+        file_count=len(files),
+    )
+    for file_path in files:
+        PREPARED_SOURCE_METADATA[file_path.resolve().as_posix()] = metadata
+    _persist_prepared_source(metadata, prepared_source_path)
+    return metadata
+
+
+def _reset_raw_dir(raw_dir: Path) -> None:
+    if raw_dir.exists():
+        shutil.rmtree(raw_dir)
+    raw_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _fetch_huggingface_card(
@@ -325,15 +391,22 @@ def _fetch_huggingface_card(
 
 def prepare_sources(
     sources: list[str | Path] | tuple[str | Path, ...],
-    raw_dir: Path | str = Path("data/raw"),
+    raw_dir: Path | str = PROJECT_ROOT / "data" / "raw",
     allow_github_fetch: bool = False,
     allow_huggingface_fetch: bool = False,
+    clear_existing: bool = False,
 ) -> list[Path]:
     """Copy supported local/GitHub/HuggingFace source files into raw_dir and return copied paths."""
 
     logger.info("prepare_sources: %d sources, raw_dir=%s", len(sources), raw_dir)
     raw_dir = Path(raw_dir)
-    raw_dir.mkdir(parents=True, exist_ok=True)
+    prepared_source_path = prepared_source_path_for_raw_dir(raw_dir)
+    if clear_existing:
+        _reset_raw_dir(raw_dir)
+        PREPARED_SOURCE_METADATA.clear()
+        clear_prepared_source(prepared_source_path)
+    else:
+        raw_dir.mkdir(parents=True, exist_ok=True)
     prepared_files: list[Path] = []
 
     for source in sources:
@@ -351,17 +424,15 @@ def prepare_sources(
                 target_root.mkdir(parents=True, exist_ok=True)
                 target_file = target_root / fetched.name
                 _copy_without_conflict(fetched, target_file)
-                metadata = {
-                    "source_input": source_text,
-                    "source_type": "huggingface",
-                    "source_slug": target_root.name.lower(),
-                    "indexed_at": None,
-                    "file_count": 1,
-                    "chunk_count": 0,
-                }
-                PREPARED_SOURCE_METADATA[target_file.resolve().as_posix()] = metadata
-                _write_prepared_source_metadata(metadata)
-                prepared_files.append(target_file)
+                source_files = [target_file]
+                _register_prepared_files(
+                    source_files,
+                    source_input=source_text,
+                    source_type="huggingface",
+                    source_slug=target_root.name,
+                    prepared_source_path=prepared_source_path,
+                )
+                prepared_files.extend(source_files)
             continue
         if _is_github_url(source_text):
             owner, repo = _github_owner_repo(source_text)
@@ -373,21 +444,43 @@ def prepare_sources(
 
             with tempfile.TemporaryDirectory() as tmpdir:
                 fetched_dir = _fetch_github_repository(source_text, Path(tmpdir))
-                prepared_files.extend(
-                    _copy_source_tree(fetched_dir, raw_dir, _github_target_name(owner, repo))
+                source_files = _copy_source_tree(fetched_dir, raw_dir, _github_target_name(owner, repo))
+                _register_prepared_files(
+                    source_files,
+                    source_input=source_text,
+                    source_type="github",
+                    source_slug=_github_target_name(owner, repo),
+                    prepared_source_path=prepared_source_path,
                 )
+                prepared_files.extend(source_files)
             continue
 
         source_path = Path(source).expanduser()
         if source_path.is_dir():
-            prepared_files.extend(_copy_source_tree(source_path, raw_dir, _local_target_name(source_path)))
+            source_files = _copy_source_tree(source_path, raw_dir, _local_target_name(source_path))
+            _register_prepared_files(
+                source_files,
+                source_input=source_text,
+                source_type="local",
+                source_slug=_local_target_name(source_path),
+                prepared_source_path=prepared_source_path,
+            )
+            prepared_files.extend(source_files)
             continue
         if source_path.is_file() and _is_supported_file(source_path):
             target_root = raw_dir / _local_target_name(source_path)
             target_file = target_root / source_path.name
             target_file.parent.mkdir(parents=True, exist_ok=True)
             _copy_without_conflict(source_path, target_file)
-            prepared_files.append(target_file)
+            source_files = [target_file]
+            _register_prepared_files(
+                source_files,
+                source_input=source_text,
+                source_type="local",
+                source_slug=_local_target_name(source_path),
+                prepared_source_path=prepared_source_path,
+            )
+            prepared_files.extend(source_files)
             continue
 
         raise FileNotFoundError(f"Unsupported or missing source: {source}")

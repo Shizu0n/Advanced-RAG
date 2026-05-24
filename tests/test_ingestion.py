@@ -1,4 +1,5 @@
 import json
+import os
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -134,6 +135,39 @@ class CurrentSourceTests(unittest.TestCase):
 
             self.assertIsNone(result)
 
+    def test_default_paths_are_project_local_when_cwd_changes(self):
+        old_cwd = os.getcwd()
+        with TemporaryDirectory() as tmpdir:
+            try:
+                os.chdir(tmpdir)
+                self.assertEqual(ingestion.RAW_DIR, ingestion.PROJECT_ROOT / "data" / "raw")
+                self.assertEqual(ingestion.CHROMA_DIR, ingestion.PROJECT_ROOT / "chroma_db")
+                self.assertEqual(ingestion.CURRENT_SOURCE_PATH, ingestion.PROJECT_ROOT / "data" / "current_source.json")
+            finally:
+                os.chdir(old_cwd)
+
+    def test_build_index_failure_clears_stale_indexed_source_artifacts(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "new-source"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "README.md").write_text("# New source\n", encoding="utf-8")
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            source_path.write_text('{"source_slug":"old-source"}', encoding="utf-8")
+            chroma_dir.mkdir()
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding", side_effect=RuntimeError("embedding failed")),
+                patch.object(ingestion, "chromadb"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "embedding failed"):
+                    ingestion.build_index(raw_dir=raw_dir)
+
+            self.assertFalse(source_path.exists())
+            self.assertFalse(chroma_dir.exists())
+
     def test_build_index_writes_current_source_json(self):
         with TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw" / "test-repo"
@@ -189,14 +223,145 @@ class CurrentSourceTests(unittest.TestCase):
             self.assertEqual(data["source_input"], "hf:Shizu0n/phi3-mini-sql-generator")
             self.assertEqual(data["source_slug"], "shizu0n-phi3-mini-sql-generator")
 
-    def test_build_index_preserves_huggingface_metadata_from_previous_prepare_process(self):
+    def test_build_index_records_prepared_github_source_metadata_after_stale_hf_source(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            raw_dir = base_dir / "raw"
+            source_path = base_dir / "current_source.json"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "source_input": "hf:Shizu0n/phi3-mini-sql-generator",
+                        "source_type": "huggingface",
+                        "source_slug": "shizu0n-phi3-mini-sql-generator",
+                        "indexed_at": "2026-05-20T00:00:00+00:00",
+                        "file_count": 1,
+                        "chunk_count": 10,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            chroma_dir = base_dir / "chroma_db"
+            fetched_dir = base_dir / "downloaded"
+            fetched_dir.mkdir()
+            (fetched_dir / "README.md").write_text("# Repo\nGitHub fixture content.", encoding="utf-8")
+
+            with patch.object(source_loader, "_fetch_github_repository", return_value=fetched_dir):
+                files = ingestion.prepare_sources(
+                    ["https://github.com/acme/repo"],
+                    raw_dir=raw_dir,
+                    allow_github_fetch=True,
+                    clear_existing=True,
+                )
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb"),
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(source_files=files, raw_dir=raw_dir)
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_type"], "github")
+            self.assertEqual(data["source_input"], "https://github.com/acme/repo")
+            self.assertEqual(data["source_slug"], "acme-repo")
+            self.assertEqual(data["file_count"], 1)
+            self.assertIsNotNone(data["indexed_at"])
+
+    def test_build_index_records_prepared_local_source_metadata_after_stale_hf_source(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            project_dir = base_dir / "project"
+            raw_dir = base_dir / "raw"
+            source_path = base_dir / "current_source.json"
+            chroma_dir = base_dir / "chroma_db"
+            project_dir.mkdir()
+            (project_dir / "README.md").write_text("# Local\nLocal fixture content.", encoding="utf-8")
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "source_input": "hf:Shizu0n/phi3-mini-sql-generator",
+                        "source_type": "huggingface",
+                        "source_slug": "shizu0n-phi3-mini-sql-generator",
+                        "indexed_at": "2026-05-20T00:00:00+00:00",
+                        "file_count": 1,
+                        "chunk_count": 10,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            files = ingestion.prepare_sources([project_dir], raw_dir=raw_dir, clear_existing=True)
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb"),
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(source_files=files, raw_dir=raw_dir)
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_type"], "local")
+            self.assertEqual(data["source_input"], str(project_dir))
+            self.assertTrue(data["source_slug"].startswith("project-"))
+            self.assertEqual(data["file_count"], 1)
+            self.assertIsNotNone(data["indexed_at"])
+
+    def test_build_index_with_explicit_files_without_prepared_metadata_does_not_reuse_stale_current_source(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            raw_dir = base_dir / "raw"
+            source_root = raw_dir / "new-source"
+            source_root.mkdir(parents=True)
+            source_file = source_root / "README.md"
+            source_file.write_text("# New Source\nFresh explicit source content.", encoding="utf-8")
+            source_path = base_dir / "current_source.json"
+            chroma_dir = base_dir / "chroma_db"
+            source_path.write_text(
+                json.dumps(
+                    {
+                        "source_input": "hf:Shizu0n/phi3-mini-sql-generator",
+                        "source_type": "huggingface",
+                        "source_slug": "shizu0n-phi3-mini-sql-generator",
+                        "indexed_at": "2026-05-20T00:00:00+00:00",
+                        "file_count": 1,
+                        "chunk_count": 10,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            source_loader.PREPARED_SOURCE_METADATA.clear()
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb"),
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(source_files=[source_file], raw_dir=raw_dir)
+
+            data = json.loads(source_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["source_type"], "local")
+            self.assertEqual(data["source_input"], "")
+            self.assertEqual(data["source_slug"], "new-source")
+
+    def test_build_index_preserves_huggingface_metadata_from_durable_prepared_source_after_restart(self):
         with TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw"
             source_root = raw_dir / "Shizu0n-phi3-mini-sql-generator"
             source_root.mkdir(parents=True)
             (source_root / "README.md").write_text("# SQL generator\nThis model generates SQL queries.", encoding="utf-8")
             source_path = Path(tmpdir) / "current_source.json"
-            source_path.write_text(
+            prepared_path = Path(tmpdir) / "prepared_source.json"
+            prepared_path.write_text(
                 json.dumps(
                     {
                         "source_input": "hf:Shizu0n/phi3-mini-sql-generator",
@@ -210,10 +375,12 @@ class CurrentSourceTests(unittest.TestCase):
                 encoding="utf-8",
             )
             chroma_dir = Path(tmpdir) / "chroma_db"
+            source_loader.PREPARED_SOURCE_METADATA.clear()
 
             with (
                 patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
                 patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(source_loader, "PREPARED_SOURCE_PATH", prepared_path),
                 patch.object(ingestion, "HuggingFaceEmbedding"),
                 patch.object(ingestion, "chromadb"),
                 patch.object(ingestion, "VectorStoreIndex") as mock_index,

@@ -10,6 +10,9 @@ import source_loader
 
 
 class SourceLoaderTests(unittest.TestCase):
+    def setUp(self):
+        source_loader.PREPARED_SOURCE_METADATA.clear()
+
     def test_prepare_sources_copies_supported_files_from_local_directory(self):
         with TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
@@ -112,6 +115,129 @@ class SourceLoaderTests(unittest.TestCase):
             files = source_loader.prepare_sources([repo_dir], raw_dir=raw_dir)
 
             self.assertEqual(files, [])
+
+    def test_prepare_sources_clear_existing_removes_stale_raw_subtree_before_local_copy(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            repo_dir = base_dir / "repo"
+            raw_dir = base_dir / "raw"
+            (repo_dir / "src").mkdir(parents=True)
+            (repo_dir / "src" / "main.py").write_text("print('fresh')\n", encoding="utf-8")
+            stale_dir = raw_dir / "stale-source"
+            stale_dir.mkdir(parents=True)
+            (stale_dir / "old.md").write_text("# stale\n", encoding="utf-8")
+            source_loader.PREPARED_SOURCE_METADATA[(stale_dir / "old.md").resolve().as_posix()] = {
+                "source_input": "stale",
+                "source_type": "local",
+                "source_slug": "stale-source",
+                "indexed_at": None,
+                "file_count": 1,
+                "chunk_count": 0,
+            }
+
+            files = source_loader.prepare_sources([repo_dir], raw_dir=raw_dir, clear_existing=True)
+
+            self.assertEqual(len(files), 1)
+            self.assertFalse(stale_dir.exists())
+            self.assertEqual(len(source_loader.PREPARED_SOURCE_METADATA), 1)
+            only_path = next(iter(source_loader.PREPARED_SOURCE_METADATA))
+            self.assertTrue(only_path.endswith("/src/main.py"))
+
+    def test_prepare_sources_persists_pending_metadata_separately_from_current_source(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            repo_dir = base_dir / "repo"
+            raw_dir = base_dir / "raw"
+            prepared_path = base_dir / "prepared_source.json"
+            current_path = base_dir / "current_source.json"
+            repo_dir.mkdir()
+            (repo_dir / "README.md").write_text("# Fresh repo\n", encoding="utf-8")
+
+            with (
+                patch.object(source_loader, "PREPARED_SOURCE_PATH", prepared_path),
+                patch.object(source_loader, "CURRENT_SOURCE_PATH", current_path),
+            ):
+                source_loader.prepare_sources([repo_dir], raw_dir=raw_dir)
+
+            self.assertTrue(prepared_path.exists())
+            self.assertFalse(current_path.exists())
+            metadata = json.loads(prepared_path.read_text(encoding="utf-8"))
+            self.assertEqual(metadata["source_type"], "local")
+            self.assertEqual(metadata["source_input"], str(repo_dir))
+            self.assertTrue(metadata["source_slug"].startswith("repo-"))
+            self.assertIsNone(metadata["indexed_at"])
+
+    def test_prepare_sources_default_raw_dir_is_project_local(self):
+        self.assertEqual(source_loader.prepare_sources.__defaults__[0], source_loader.PROJECT_ROOT / "data" / "raw")
+
+    def test_prepare_sources_registers_metadata_for_local_directory_files(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            project_dir = base_dir / "My Project"
+            raw_dir = base_dir / "raw"
+            (project_dir / "src").mkdir(parents=True)
+            (project_dir / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            (project_dir / "README.md").write_text("# Test\n", encoding="utf-8")
+
+            files = source_loader.prepare_sources([project_dir], raw_dir=raw_dir)
+
+            metadata_by_path = source_loader.PREPARED_SOURCE_METADATA
+            self.assertEqual(set(metadata_by_path), {path.resolve().as_posix() for path in files})
+            slug = source_loader._local_target_name(project_dir).lower()
+            for path in files:
+                metadata = metadata_by_path[path.resolve().as_posix()]
+                self.assertEqual(metadata["source_input"], str(project_dir))
+                self.assertEqual(metadata["source_type"], "local")
+                self.assertEqual(metadata["source_slug"], slug)
+                self.assertIsNone(metadata["indexed_at"])
+                self.assertEqual(metadata["file_count"], 2)
+                self.assertEqual(metadata["chunk_count"], 0)
+
+    def test_prepare_sources_registers_metadata_for_nested_local_file_path(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            source_file = base_dir / "nested space" / "pkg" / "module.py"
+            raw_dir = base_dir / "raw"
+            source_file.parent.mkdir(parents=True)
+            source_file.write_text("print('nested')\n", encoding="utf-8")
+
+            files = source_loader.prepare_sources([source_file], raw_dir=raw_dir)
+
+            self.assertEqual(len(files), 1)
+            metadata = source_loader.PREPARED_SOURCE_METADATA[files[0].resolve().as_posix()]
+            self.assertEqual(metadata["source_input"], str(source_file))
+            self.assertEqual(metadata["source_type"], "local")
+            self.assertEqual(metadata["source_slug"], source_loader._local_target_name(source_file).lower())
+            self.assertIsNone(metadata["indexed_at"])
+            self.assertEqual(metadata["file_count"], 1)
+            self.assertEqual(metadata["chunk_count"], 0)
+
+    def test_prepare_sources_registers_metadata_for_github_files(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            fetched_dir = base_dir / "downloaded" / "project-main"
+            raw_dir = base_dir / "raw"
+            (fetched_dir / "src").mkdir(parents=True)
+            (fetched_dir / "README.md").write_text("# fetched\n", encoding="utf-8")
+            (fetched_dir / "src" / "app.py").write_text("print('fetched')\n", encoding="utf-8")
+
+            with patch.object(source_loader, "_fetch_github_repository", return_value=fetched_dir):
+                files = source_loader.prepare_sources(
+                    ["https://github.com/Example/Project"],
+                    raw_dir=raw_dir,
+                    allow_github_fetch=True,
+                )
+
+            metadata_by_path = source_loader.PREPARED_SOURCE_METADATA
+            self.assertEqual(set(metadata_by_path), {path.resolve().as_posix() for path in files})
+            for path in files:
+                metadata = metadata_by_path[path.resolve().as_posix()]
+                self.assertEqual(metadata["source_input"], "https://github.com/Example/Project")
+                self.assertEqual(metadata["source_type"], "github")
+                self.assertEqual(metadata["source_slug"], source_loader._github_target_name("Example", "Project").lower())
+                self.assertIsNone(metadata["indexed_at"])
+                self.assertEqual(metadata["file_count"], 2)
+                self.assertEqual(metadata["chunk_count"], 0)
 
     def test_supported_file_rejects_symlinks(self):
         with TemporaryDirectory() as tmpdir:
@@ -451,7 +577,7 @@ class HuggingFaceSourceLoaderTests(unittest.TestCase):
             self.assertEqual(relative, "meta-llama-Llama-2-7b/README.md")
             self.assertEqual(files[0].read_text(encoding="utf-8"), "# Model Card\n\nA great model.\n")
 
-    def test_prepare_sources_writes_hf_current_source_metadata(self):
+    def test_prepare_sources_registers_hf_metadata_without_writing_current_source(self):
         with TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
             raw_dir = base_dir / "raw"
@@ -465,17 +591,18 @@ class HuggingFaceSourceLoaderTests(unittest.TestCase):
                 patch.object(source_loader.requests, "get", return_value=fake_response),
                 patch.object(source_loader, "CURRENT_SOURCE_PATH", current_source_path, create=True),
             ):
-                source_loader.prepare_sources(
+                files = source_loader.prepare_sources(
                     ["hf:Shizu0n/phi3-mini-sql-generator"],
                     raw_dir=raw_dir,
                     allow_huggingface_fetch=True,
                 )
 
-            data = json.loads(current_source_path.read_text(encoding="utf-8"))
-            self.assertEqual(data["source_type"], "huggingface")
-            self.assertEqual(data["source_input"], "hf:Shizu0n/phi3-mini-sql-generator")
-            self.assertEqual(data["source_slug"], "shizu0n-phi3-mini-sql-generator")
-            self.assertIsNone(data.get("indexed_at"))
+            self.assertFalse(current_source_path.exists())
+            metadata = source_loader.PREPARED_SOURCE_METADATA[files[0].resolve().as_posix()]
+            self.assertEqual(metadata["source_type"], "huggingface")
+            self.assertEqual(metadata["source_input"], "hf:Shizu0n/phi3-mini-sql-generator")
+            self.assertEqual(metadata["source_slug"], "shizu0n-phi3-mini-sql-generator")
+            self.assertIsNone(metadata.get("indexed_at"))
 
     def test_prepare_sources_copies_hf_card_via_env(self):
         with TemporaryDirectory() as tmpdir:

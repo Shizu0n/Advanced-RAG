@@ -1286,8 +1286,40 @@ def _is_supported_local_context_file(path: Path) -> bool:
     ) and not any(part in LOCAL_CONTEXT_IGNORED_DIR_NAMES for part in path.parts)
 
 
+def _current_source_raw_path(raw_path: Path) -> tuple[bool, Path | None]:
+    current_source_path = PROJECT_ROOT / "data" / "current_source.json"
+    try:
+        current_source = json.loads(current_source_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return False, None
+    source_slug = current_source.get("source_slug") if isinstance(current_source, dict) else None
+    if not source_slug:
+        return False, None
+    if not raw_path.exists():
+        return True, None
+    for child in raw_path.iterdir():
+        if child.is_dir() and child.name.lower() == str(source_slug).lower():
+            return True, child
+    return True, None
+
+
+def _scoped_local_context_paths(paths: Sequence[Path]) -> list[Path]:
+    scoped: list[Path] = []
+    default_raw_path = PROJECT_ROOT / "data" / "raw"
+    for path in paths:
+        if path == default_raw_path:
+            has_current_source, source_path = _current_source_raw_path(path)
+            if source_path is not None:
+                scoped.append(source_path)
+            elif not has_current_source:
+                scoped.append(path)
+        else:
+            scoped.append(path)
+    return scoped
+
+
 def load_local_context_nodes(paths: Sequence[Path] | None = None) -> list[LocalTextNode]:
-    paths = paths if paths is not None else LOCAL_CONTEXT_PATHS
+    paths = list(paths) if paths is not None else _scoped_local_context_paths(LOCAL_CONTEXT_PATHS)
     nodes: list[LocalTextNode] = []
     files: list[Path] = []
 
@@ -1433,7 +1465,7 @@ class LocalRAGPipeline:
         Returns (VectorStoreIndex, nodes) if chroma_db exists and has documents,
         otherwise (None, None). Only uses local embedding model — no network calls.
         """
-        chroma_dir = Path("chroma_db")
+        chroma_dir = PROJECT_ROOT / "chroma_db"
         if not chroma_dir.exists():
             return None, None
 

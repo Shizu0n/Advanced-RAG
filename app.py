@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Any, Iterable, cast
 
@@ -35,6 +36,7 @@ METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precis
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 CHAT_MESSAGES_KEY = "chat_messages"
 PREPARED_SOURCE_KEY = "prepared_source"
+ACTIVE_CHAT_SOURCE_KEY = "active_chat_source_slug"
 UI_GATE_OVERRIDES_KEY = "ui_gate_overrides"
 UI_TOGGLE_GATES = {
     "ALLOW_HF_FETCH": {"label": "Allow Hugging Face fetch", "default": False},
@@ -321,6 +323,37 @@ def _with_session_gate_env(st, names: list[str], fn):
 
 
 CURRENT_SOURCE_PATH = PROJECT_ROOT / "data" / "current_source.json"
+PREPARED_SOURCE_PATH = PROJECT_ROOT / "data" / "prepared_source.json"
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir():
+        shutil.rmtree(path)
+    elif path.exists():
+        path.unlink()
+
+
+def clear_eval_artifacts() -> None:
+    for path in [GOLDEN_DATASET_PATH, RAGAS_RESULTS_PATH, RAGAS_PER_QUESTION_PATH]:
+        _remove_path(path)
+
+
+def clear_source_cache(clear_raw: bool = True) -> None:
+    _remove_path(CHROMA_DIR)
+    for path in [CURRENT_SOURCE_PATH, PREPARED_SOURCE_PATH, QUERY_LOG_PATH]:
+        _remove_path(path)
+    clear_eval_artifacts()
+    if clear_raw:
+        if RAW_DIR.exists():
+            shutil.rmtree(RAW_DIR)
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def reset_session_source_state(st) -> None:
+    st.session_state.pop(PREPARED_SOURCE_KEY, None)
+    st.session_state.pop("prepared_files", None)
+    st.session_state.pop(CHAT_MESSAGES_KEY, None)
+    st.session_state.pop(ACTIVE_CHAT_SOURCE_KEY, None)
 
 
 def load_current_source(path: Path = CURRENT_SOURCE_PATH) -> dict[str, Any] | None:
@@ -331,6 +364,17 @@ def load_current_source(path: Path = CURRENT_SOURCE_PATH) -> dict[str, Any] | No
         return json.loads(path.read_text(encoding="utf-8"))
     except (json.JSONDecodeError, OSError):
         return None
+
+
+def load_prepared_source(path: Path | None = None) -> dict[str, Any] | None:
+    target = path or PREPARED_SOURCE_PATH
+    if not target.exists():
+        return None
+    try:
+        prepared = json.loads(target.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return prepared if isinstance(prepared, dict) else None
 
 
 def is_golden_dataset_stale(current_source: dict | None, golden_path: Path = GOLDEN_DATASET_PATH) -> bool:
@@ -368,6 +412,13 @@ def _has_raw_source_files(raw_dir: Path = RAW_DIR) -> bool:
     return any(raw_dir.rglob("*"))
 
 
+def _has_chroma_index(chroma_dir: Path | None = None) -> bool:
+    target = chroma_dir or CHROMA_DIR
+    if not isinstance(target, Path):
+        return bool(target.exists())
+    return target.exists() and any(target.rglob("*"))
+
+
 def get_source_badge_state(
     current_source_path: Path = CURRENT_SOURCE_PATH,
     chroma_dir: Path = CHROMA_DIR,
@@ -375,7 +426,7 @@ def get_source_badge_state(
 ) -> str:
     """Return 'green' if indexed, 'yellow' if prepared, 'grey' otherwise."""
     has_source = current_source_path.exists()
-    has_chroma = chroma_dir.exists()
+    has_chroma = _has_chroma_index(chroma_dir)
     has_raw = _has_raw_source_files(raw_dir)
 
     if has_source and has_chroma:
@@ -390,8 +441,7 @@ def run_build_index(source_files: Iterable[Path] | None = None) -> list:
     from ingestion import build_index
 
     files = list(source_files) if source_files is not None else None
-    raw_dir = files[0].parent if files else RAW_DIR
-    _index, nodes = build_index(source_files=files, raw_dir=raw_dir)
+    _index, nodes = build_index(source_files=files, raw_dir=RAW_DIR)
     return nodes
 
 
@@ -439,13 +489,14 @@ def run_query(query: str, strategy: str) -> dict[str, Any]:
 def run_chat_query(message: str, history: list[dict[str, Any]], strategy: str) -> dict[str, Any]:
     from pipeline import chat_query
 
-    return chat_query(message, history=history, strategy=strategy, allow_index_build=False)
+    return chat_query(message, history=history, strategy=strategy, allow_index_build=True)
 
 
 def prepare_sources_for_app(
     sources: list[str],
     allow_github_fetch: bool = False,
     allow_huggingface_fetch: bool = False,
+    clear_existing: bool = False,
 ) -> list[Path]:
     from source_loader import prepare_sources
 
@@ -454,8 +505,10 @@ def prepare_sources_for_app(
         return []
     return prepare_sources(
         cast(list[str | Path], cleaned),
+        raw_dir=RAW_DIR,
         allow_github_fetch=allow_github_fetch,
         allow_huggingface_fetch=allow_huggingface_fetch,
+        clear_existing=clear_existing,
     )
 
 
@@ -465,7 +518,7 @@ def _prepared_source_state(st) -> dict[str, Any] | None:
 
 
 def _current_source_for_ui(st) -> dict[str, Any] | None:
-    prepared = _prepared_source_state(st)
+    prepared = _prepared_source_state(st) or load_prepared_source()
     indexed = load_current_source()
     if prepared and prepared.get("source_slug") != (indexed or {}).get("source_slug"):
         return prepared
@@ -473,7 +526,7 @@ def _current_source_for_ui(st) -> dict[str, Any] | None:
 
 
 def _source_is_indexed(current_source: dict[str, Any] | None) -> bool:
-    if current_source is None or not CHROMA_DIR.exists():
+    if current_source is None or not _has_chroma_index():
         return False
     if current_source.get("indexed_at"):
         indexed = load_current_source()
@@ -544,7 +597,7 @@ def _can_evaluate(current_source: dict | None) -> bool:
 
 def _has_any_indexed_source() -> bool:
     indexed = load_current_source()
-    return indexed is not None and CHROMA_DIR.exists()
+    return indexed is not None and _has_chroma_index()
 
 
 def _source_for_eval_staleness(st) -> dict | None:
@@ -714,7 +767,7 @@ def _show_prepare_success(st, prepared: list[Path]) -> None:
 def _store_prepared_source(st, prepared: list[Path], source_input: str, source_type: str) -> None:
     st.session_state["prepared_files"] = prepared
     st.session_state[PREPARED_SOURCE_KEY] = {
-        "source_slug": prepared[0].parent.name,
+        "source_slug": _prepared_source_slug(prepared),
         "source_input": source_input,
         "source_type": source_type,
         "indexed_at": None,
@@ -723,6 +776,8 @@ def _store_prepared_source(st, prepared: list[Path], source_input: str, source_t
 
 def _clear_prepared_source(st) -> None:
     st.session_state.pop(PREPARED_SOURCE_KEY, None)
+    st.session_state.pop("prepared_files", None)
+    _remove_path(PREPARED_SOURCE_PATH)
 
 
 def _prepared_source_type(source_type: str) -> str:
@@ -737,6 +792,14 @@ def _render_prepared_files(st, prepared: list[Path]) -> None:
 
 
 def _prepared_source_slug(prepared: list[Path]) -> str:
+    if not prepared:
+        return "unknown"
+    try:
+        relative = prepared[0].resolve(strict=False).relative_to(RAW_DIR.resolve(strict=False))
+        if relative.parts:
+            return relative.parts[0]
+    except ValueError:
+        pass
     return prepared[0].parent.name
 
 
@@ -1060,9 +1123,7 @@ def _render_gate_toggles(st) -> None:
 
 def _render_sidebar(st) -> None:
     current_source = _source_ui_state(st)
-    badge_state = "green" if _source_is_indexed(current_source) else get_source_badge_state()
-    if current_source is not None and not _source_is_indexed(current_source):
-        badge_state = "yellow"
+    badge_state = get_source_badge_state()
     _render_source_badge(st, badge_state, current_source)
     _render_gate_toggles(st)
 
@@ -1086,6 +1147,12 @@ def _render_sidebar(st) -> None:
 
 def _render_sources_tab(st) -> None:
     st.subheader("Source preparation")
+
+    if st.button("Clear active source cache"):
+        clear_source_cache()
+        reset_session_source_state(st)
+        st.success("Active source cache cleared.")
+        st.rerun()
 
     source_type = st.radio(
         "Source type",
@@ -1112,29 +1179,37 @@ def _render_sources_tab(st) -> None:
             try:
                 if source_type == "HuggingFace model/dataset":
                     prepared = prepare_sources_for_app(
-                        sources, allow_github_fetch=False, allow_huggingface_fetch=allow_hf_fetch,
+                        sources,
+                        allow_github_fetch=False,
+                        allow_huggingface_fetch=allow_hf_fetch,
+                        clear_existing=True,
                     )
                 elif source_type == "GitHub repo":
-                    prepared = prepare_sources_for_app(sources, allow_github_fetch=allow_github_fetch)
+                    prepared = prepare_sources_for_app(
+                        sources,
+                        allow_github_fetch=allow_github_fetch,
+                        clear_existing=True,
+                    )
                 else:
-                    prepared = prepare_sources_for_app(sources, allow_github_fetch=False, allow_huggingface_fetch=False)
+                    prepared = prepare_sources_for_app(
+                        sources,
+                        allow_github_fetch=False,
+                        allow_huggingface_fetch=False,
+                        clear_existing=True,
+                    )
             except Exception as exc:
                 st.error(str(exc))
                 return
             if prepared:
+                clear_source_cache(clear_raw=False)
+                reset_session_source_state(st)
                 st.success(f"Prepared {len(prepared)} files under data/raw.")
-                st.session_state["prepared_files"] = prepared
-                st.session_state[PREPARED_SOURCE_KEY] = {
-                    "source_slug": prepared[0].parent.name,
-                    "source_input": sources[0],
-                    "source_type": "huggingface" if source_type == "HuggingFace model/dataset" else "github" if source_type == "GitHub repo" else "local",
-                    "indexed_at": None,
-                }
+                _store_prepared_source(st, prepared, sources[0], _prepared_source_type(source_type))
                 st.dataframe(
                     pd.DataFrame({"file": [path.as_posix() for path in prepared]}),
                     use_container_width=True,
                 )
-                st.info(f"Prepared source: {prepared[0].parent.name}")
+                st.info(f"Prepared source: {_prepared_source_slug(prepared)}")
             else:
                 st.warning("No sources were provided.")
 
@@ -1156,10 +1231,25 @@ def _render_sources_tab(st) -> None:
                     progress.progress(1.0)
                     current = load_current_source()
                     slug = current.get("source_slug", "unknown") if current else "unknown"
-                    st.session_state.pop(PREPARED_SOURCE_KEY, None)
+                    _clear_prepared_source(st)
+                    st.session_state.pop(CHAT_MESSAGES_KEY, None)
+                    st.session_state.pop(ACTIVE_CHAT_SOURCE_KEY, None)
+                    clear_eval_artifacts()
                     st.success(f"Index built successfully. {len(nodes)} chunks for source '{slug}'.")
                 except Exception as exc:
                     st.error(f"Index build failed: {exc}")
+
+
+def _sync_chat_history_to_source(st, current_source: dict[str, Any] | None) -> None:
+    source_slug = current_source.get("source_slug") if current_source else None
+    if not source_slug:
+        st.session_state.pop(ACTIVE_CHAT_SOURCE_KEY, None)
+        st.session_state.pop(CHAT_MESSAGES_KEY, None)
+        return
+    previous_slug = st.session_state.get(ACTIVE_CHAT_SOURCE_KEY)
+    st.session_state[ACTIVE_CHAT_SOURCE_KEY] = source_slug
+    if previous_slug is not None and previous_slug != source_slug:
+        st.session_state[CHAT_MESSAGES_KEY] = []
 
 
 def _chat_history(st) -> list[dict[str, Any]]:
@@ -1235,7 +1325,7 @@ def _render_query_tab(st) -> None:
         return
 
     _render_query_ready(st)
-
+    _sync_chat_history_to_source(st, current_source)
 
     strategy = st.selectbox("Strategy", STRATEGIES, index=STRATEGIES.index("hybrid_rerank"))
 
@@ -1253,7 +1343,7 @@ def _render_query_tab(st) -> None:
     _render_chat_message(st, user_message)
 
     try:
-        result = _with_session_gate_env(st, ["ALLOW_CLOUD_CHAT"], lambda: run_chat_query(prompt.strip(), history=history, strategy=strategy))
+        result = run_chat_query(prompt.strip(), history=history, strategy=strategy)
     except Exception as exc:
         st.error(str(exc))
         return
@@ -1296,7 +1386,11 @@ def _render_eval_tab(st) -> None:
         else:
             with st.spinner("Running evaluation... This may take a minute."):
                 try:
-                    _with_session_gate_env(st, ["USE_GEMINI_FREE_RAGAS", "ALLOW_CLOUD_FREE_TIER"], run_evaluation_inline)
+                    _with_session_gate_env(
+                        st,
+                        ["USE_GEMINI_FREE_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
+                        run_evaluation_inline,
+                    )
                     _show_eval_success(st)
                     st.rerun()
                 except Exception as exc:

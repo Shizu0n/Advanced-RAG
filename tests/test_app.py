@@ -1,5 +1,6 @@
 import hashlib
 import json
+import shutil
 import unittest
 import os
 from pathlib import Path
@@ -507,7 +508,7 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(result["answer"], "ok")
         query.assert_called_once_with("question", strategy="bm25_only", allow_index_build=True)
 
-    def test_run_chat_query_uses_existing_index_without_rebuilding(self):
+    def test_run_chat_query_allows_index_build_by_default(self):
         history = [{"role": "user", "content": "before"}]
         with patch("pipeline.chat_query", return_value={"answer": "ok"}) as query:
             result = app.run_chat_query("question", history, "bm25_only")
@@ -517,7 +518,7 @@ class AppHelperTests(unittest.TestCase):
             "question",
             history=history,
             strategy="bm25_only",
-            allow_index_build=False,
+            allow_index_build=True,
         )
 
     def test_query_tab_persists_chat_messages_in_session_state(self):
@@ -586,7 +587,13 @@ class AppHelperTests(unittest.TestCase):
             files = app.prepare_sources_for_app(["https://github.com/user/repo"], allow_github_fetch=True)
 
         self.assertEqual(files, [Path("data/raw/repo/a.py")])
-        prepare.assert_called_once_with(["https://github.com/user/repo"], allow_github_fetch=True, allow_huggingface_fetch=False)
+        prepare.assert_called_once_with(
+            ["https://github.com/user/repo"],
+            raw_dir=app.RAW_DIR,
+            allow_github_fetch=True,
+            allow_huggingface_fetch=False,
+            clear_existing=False,
+        )
 
     def test_eval_backend_counts_summarize_summary_and_question_backends(self):
         summary = pd.DataFrame(
@@ -671,6 +678,60 @@ class AppHelperTests(unittest.TestCase):
             path = Path(tmpdir) / "nonexistent.json"
             self.assertIsNone(app.load_current_source(path))
 
+    def test_clear_source_cache_removes_app_owned_source_artifacts(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "data" / "raw"
+            chroma_dir = root / "chroma_db"
+            current_source = root / "data" / "current_source.json"
+            query_log = root / "data" / "query_log.jsonl"
+            golden_path = root / "data" / "eval" / "golden_dataset.json"
+            summary_path = root / "data" / "eval" / "ragas_results.csv"
+            detail_path = root / "data" / "eval" / "ragas_per_question.csv"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "old" / "README.md").parent.mkdir()
+            (raw_dir / "old" / "README.md").write_text("# old", encoding="utf-8")
+            chroma_dir.mkdir()
+            current_source.parent.mkdir(parents=True, exist_ok=True)
+            current_source.write_text('{"source_slug":"old"}', encoding="utf-8")
+            query_log.write_text("{}\n", encoding="utf-8")
+            for path in [golden_path, summary_path, detail_path]:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("stale", encoding="utf-8")
+
+            with (
+                patch.object(app, "RAW_DIR", raw_dir),
+                patch.object(app, "CHROMA_DIR", chroma_dir),
+                patch.object(app, "CURRENT_SOURCE_PATH", current_source),
+                patch.object(app, "QUERY_LOG_PATH", query_log),
+                patch.object(app, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(app, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(app, "RAGAS_PER_QUESTION_PATH", detail_path),
+            ):
+                app.clear_source_cache()
+
+            self.assertTrue(raw_dir.exists())
+            self.assertEqual(list(raw_dir.iterdir()), [])
+            self.assertFalse(chroma_dir.exists())
+            self.assertFalse(current_source.exists())
+            self.assertFalse(query_log.exists())
+            self.assertFalse(golden_path.exists())
+            self.assertFalse(summary_path.exists())
+            self.assertFalse(detail_path.exists())
+
+    def test_reset_session_source_state_removes_prepared_files_and_chat(self):
+        fake_st = FakeStreamlit(messages=[{"role": "user", "content": "old"}])
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "old", "indexed_at": None}
+        fake_st.session_state["prepared_files"] = [Path("data/raw/old/README.md")]
+        fake_st.session_state[app.ACTIVE_CHAT_SOURCE_KEY] = "old"
+
+        app.reset_session_source_state(fake_st)
+
+        self.assertNotIn(app.PREPARED_SOURCE_KEY, fake_st.session_state)
+        self.assertNotIn("prepared_files", fake_st.session_state)
+        self.assertNotIn(app.CHAT_MESSAGES_KEY, fake_st.session_state)
+        self.assertNotIn(app.ACTIVE_CHAT_SOURCE_KEY, fake_st.session_state)
+
     def test_readme_documents_manual_retrieval_and_evaluation_commands(self):
         text = Path("README.md").read_text(encoding="utf-8")
 
@@ -725,6 +786,45 @@ class AppHelperTests(unittest.TestCase):
 
 
 class EvalTabTests(unittest.TestCase):
+    def test_eval_tab_runs_evaluation_with_session_gate_overrides(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return = True
+        fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {
+            "USE_GEMINI_FREE_RAGAS": True,
+            "ALLOW_CLOUD_FREE_TIER": True,
+        }
+        current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
+        observed = {}
+
+        def capture_eval():
+            observed["USE_GEMINI_FREE_RAGAS"] = os.getenv("USE_GEMINI_FREE_RAGAS")
+            observed["ALLOW_CLOUD_FREE_TIER"] = os.getenv("ALLOW_CLOUD_FREE_TIER")
+
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=False),
+                patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+                patch("app.last_eval_date", return_value="Not available"),
+                patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+                patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.run_evaluation_inline", side_effect=capture_eval),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                app._render_eval_tab(fake_st)
+
+        self.assertEqual(observed["USE_GEMINI_FREE_RAGAS"], "1")
+        self.assertEqual(observed["ALLOW_CLOUD_FREE_TIER"], "1")
+
     def _render_eval_tab_with_stubs(self, current_source=None, golden_path=None, results_path=None):
         """Helper to render the eval tab with controlled file paths."""
         fake_st = FakeStreamlit()
@@ -732,6 +832,7 @@ class EvalTabTests(unittest.TestCase):
             chroma_dir = Path(tmpdir) / "chroma_db"
             if current_source and current_source.get("indexed_at"):
                 chroma_dir.mkdir()
+                (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
             with (
                 patch("app.CHROMA_DIR", chroma_dir),
                 patch("app.load_current_source", return_value=current_source),
@@ -767,6 +868,7 @@ class EvalTabTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             chroma_dir = Path(tmpdir) / "chroma_db"
             chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
             with (
                 patch("app.CHROMA_DIR", chroma_dir),
                 patch("app._current_source_for_ui", return_value=current),
@@ -802,12 +904,48 @@ class SourceBadgeTests(unittest.TestCase):
             raw_path = Path(tmpdir) / "data" / "raw"
             source_path.write_text("{}", encoding="utf-8")
             chroma_path.mkdir()
+            (chroma_path / "chroma.sqlite3").write_text("index", encoding="utf-8")
             raw_path.mkdir(parents=True)
             (raw_path / "file.py").write_text("content", encoding="utf-8")
 
             result = app.get_source_badge_state(source_path, chroma_path, raw_path)
 
         self.assertEqual(result, "green")
+
+    def test_get_source_badge_state_yellow_when_current_source_exists_but_chroma_empty(self):
+        with TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_path = Path(tmpdir) / "chroma_db"
+            raw_path = Path(tmpdir) / "data" / "raw"
+            source_path.write_text("{}", encoding="utf-8")
+            chroma_path.mkdir()
+            raw_path.mkdir(parents=True)
+            (raw_path / "file.py").write_text("content", encoding="utf-8")
+
+            result = app.get_source_badge_state(source_path, chroma_path, raw_path)
+
+        self.assertEqual(result, "yellow")
+
+    def test_source_is_not_indexed_when_chroma_dir_is_empty(self):
+        with TemporaryDirectory() as tmpdir:
+            chroma_path = Path(tmpdir) / "chroma_db"
+            chroma_path.mkdir()
+            current = {"source_slug": "repo", "indexed_at": "2026-05-24T00:00:00+00:00"}
+
+            with patch.object(app, "CHROMA_DIR", chroma_path):
+                self.assertFalse(app._source_is_indexed(current))
+
+    def test_current_source_for_ui_uses_durable_prepared_source_after_session_restart(self):
+        prepared = {"source_slug": "github-repo", "source_type": "github", "source_input": "https://github.com/user/repo", "indexed_at": None}
+        fake_st = FakeStreamlit()
+
+        with (
+            patch("app.load_prepared_source", return_value=prepared),
+            patch("app.load_current_source", return_value=None),
+        ):
+            current = app._current_source_for_ui(fake_st)
+
+        self.assertEqual(current, prepared)
 
     def test_get_source_badge_state_yellow_when_prepared_only(self):
         with TemporaryDirectory() as tmpdir:
@@ -897,7 +1035,8 @@ class SourcesTabTests(unittest.TestCase):
 
     def test_build_index_button_builds_index_on_click(self):
         fake_st = FakeStreamlit()
-        fake_st._button_return = True
+        fake_st._button_return_by_label = {"Clear active source cache": False, "Prepare sources": False, "Build Index": True}
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         prepared = [Path("data/raw/test-repo/README.md")]
         fake_st.session_state["prepared_files"] = prepared
         nodes = [{"text": "chunk 1"}, {"text": "chunk 2"}]
@@ -920,6 +1059,11 @@ class SourcesTabTests(unittest.TestCase):
         self.assertTrue(any("2 chunks" in s for s in success_events))
         self.assertTrue(any("test-repo" in s for s in success_events))
 
+    def test_build_index_uses_sidebar_index_gate_override(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {"ALLOW_INDEX_BUILD": False}
+        self.assertFalse(app._allow_index_build_enabled(fake_st))
+
     def test_build_index_requires_allow_index_build_env(self):
         fake_st = FakeStreamlit()
         fake_st._button_return = True
@@ -935,26 +1079,92 @@ class SourcesTabTests(unittest.TestCase):
         errors = [event[1] for event in fake_st.events if event[0] == "error"]
         self.assertTrue(any("ALLOW_INDEX_BUILD" in e for e in errors))
 
-    def test_build_index_uses_sidebar_index_gate_override(self):
-        fake_st = FakeStreamlit()
-        fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {"ALLOW_INDEX_BUILD": False}
-        self.assertFalse(app._allow_index_build_enabled(fake_st))
-
     def test_prepare_sources_passes_huggingface_flag(self):
         fake_st = FakeStreamlit()
-        fake_st._button_return = True
+        fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         fake_st._radio_value = "HuggingFace model/dataset"
         fake_st._text_input_value = "hf:owner/model"
 
         with (
+            patch("app.clear_source_cache"),
+            patch("app.reset_session_source_state"),
             patch("app.prepare_sources_for_app", return_value=[]) as mock_prepare,
             patch("app._has_raw_source_files", return_value=False),
         ):
             app._render_sources_tab(fake_st)
 
         mock_prepare.assert_called_once_with(
-            ["hf:owner/model"], allow_github_fetch=False, allow_huggingface_fetch=True,
+            ["hf:owner/model"], allow_github_fetch=False, allow_huggingface_fetch=True, clear_existing=True,
         )
+
+    def test_prepare_sources_clears_existing_cache_before_copying_new_source(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
+        fake_st._radio_value = "Local directory"
+        fake_st._text_input_value = "/tmp/new-project"
+        prepared = [Path("data/raw/new-project/README.md")]
+
+        with (
+            patch("app.clear_source_cache") as clear_cache,
+            patch("app.reset_session_source_state") as reset_state,
+            patch("app.prepare_sources_for_app", return_value=prepared) as prepare,
+            patch("app._has_raw_source_files", return_value=True),
+            patch("app.load_current_source", return_value=None),
+        ):
+            app._render_sources_tab(fake_st)
+
+        prepare.assert_called_once_with(
+            ["/tmp/new-project"],
+            allow_github_fetch=False,
+            allow_huggingface_fetch=False,
+            clear_existing=True,
+        )
+        clear_cache.assert_called_once_with(clear_raw=False)
+        reset_state.assert_called_once_with(fake_st)
+        self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_slug"], "new-project")
+
+    def test_prepare_sources_failure_preserves_active_source_cache(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
+        fake_st._radio_value = "Local directory"
+        fake_st._text_input_value = "/tmp/missing-project"
+
+        with (
+            patch("app.clear_source_cache") as clear_cache,
+            patch("app.reset_session_source_state") as reset_state,
+            patch("app.prepare_sources_for_app", side_effect=FileNotFoundError("missing")),
+            patch("app._has_raw_source_files", return_value=True),
+            patch("app.load_current_source", return_value={"source_slug": "old-source", "indexed_at": "2026-05-23"}),
+        ):
+            app._render_sources_tab(fake_st)
+
+        clear_cache.assert_not_called()
+        reset_state.assert_not_called()
+        errors = [event[1] for event in fake_st.events if event[0] == "error"]
+        self.assertTrue(any("missing" in error for error in errors))
+
+    def test_sources_tab_clear_active_source_button_clears_cache_and_reruns(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return_by_label = {"Clear active source cache": True, "Prepare sources": False, "Build Index": False}
+
+        def button_by_label(label):
+            fake_st.events.append(("button", label))
+            return fake_st._button_return_by_label.get(label, False)
+
+        fake_st.button = button_by_label
+        with (
+            patch("app.clear_source_cache") as clear_cache,
+            patch("app.reset_session_source_state") as reset_state,
+            patch("app._has_raw_source_files", return_value=False),
+        ):
+            app._render_sources_tab(fake_st)
+
+        clear_cache.assert_called_once()
+        reset_state.assert_called_once_with(fake_st)
+        self.assertIn(("rerun",), fake_st.events)
 
     def test_sidebar_renders_operational_gate_toggles_only(self):
         fake_st = FakeStreamlit()
@@ -1002,22 +1212,6 @@ class SourcesTabTests(unittest.TestCase):
 
         sidebar_warnings = [event[1] for event in fake_st.events if event[0] == "sidebar_warning"]
         self.assertTrue(any("prepared" in w.lower() for w in sidebar_warnings))
-
-    def test_sidebar_does_not_mark_different_prepared_source_as_indexed(self):
-        fake_st = FakeStreamlit()
-        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "new-source", "indexed_at": None}
-        with (
-            patch("app.load_current_source", return_value={"source_slug": "old-source", "indexed_at": "2026-05-20"}),
-            patch("app.get_source_badge_state", return_value="green"),
-            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
-            patch("app.last_eval_date", return_value="Not available"),
-        ):
-            app._render_sidebar(fake_st)
-
-        sidebar_warnings = [event[1] for event in fake_st.events if event[0] == "sidebar_warning"]
-        sidebar_successes = [event[1] for event in fake_st.events if event[0] == "sidebar_success"]
-        self.assertTrue(any("new-source" in warning for warning in sidebar_warnings))
-        self.assertFalse(any("new-source" in success for success in sidebar_successes))
 
     def test_sidebar_shows_grey_badge_when_no_source(self):
         fake_st = FakeStreamlit()
@@ -1242,6 +1436,23 @@ class QueryTabWarningTests(unittest.TestCase):
         self.assertTrue(any("prepared but not indexed" in w for w in warnings))
         self.assertNotIn("Run Evaluation", [event[1] for event in fake_st.events if event[0] == "button"])
 
+    def test_query_tab_resets_chat_history_when_indexed_source_changes(self):
+        fake_st = FakeStreamlit(messages=[{"role": "user", "content": "old source question"}])
+        fake_st.session_state[app.ACTIVE_CHAT_SOURCE_KEY] = "old-source"
+        current = {"source_slug": "new-source", "indexed_at": "2026-05-23T00:00:00+00:00"}
+
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.CHROMA_DIR") as mock_chroma,
+        ):
+            mock_chroma.exists.return_value = True
+            app._render_query_tab(fake_st)
+
+        self.assertEqual(fake_st.session_state[app.ACTIVE_CHAT_SOURCE_KEY], "new-source")
+        self.assertEqual(fake_st.session_state[app.CHAT_MESSAGES_KEY], [])
+        self.assertEqual([event for event in fake_st.events if event[0] == "chat_message"], [])
+
     def test_query_tab_no_warning_when_source_is_indexed(self):
         fake_st = FakeStreamlit()
         with (
@@ -1311,6 +1522,7 @@ class QueryTabWarningTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             chroma_dir = Path(tmpdir) / "chroma_db"
             chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
             with (
                 patch("app.CHROMA_DIR", chroma_dir),
                 patch("app._current_source_for_ui", return_value=current),
@@ -1381,6 +1593,7 @@ class QueryTabWarningTests(unittest.TestCase):
         with TemporaryDirectory() as tmpdir:
             chroma_dir = Path(tmpdir) / "chroma_db"
             chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
             with (
                 patch("app.CHROMA_DIR", chroma_dir),
                 patch("app._current_source_for_ui", return_value=current),

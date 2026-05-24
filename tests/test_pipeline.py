@@ -49,6 +49,75 @@ class IrrelevantRetriever:
 
 
 class PipelineTests(unittest.TestCase):
+    def test_default_local_context_nodes_scope_data_raw_to_current_source(self):
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            readme = project_root / "README.md"
+            raw_dir = project_root / "data" / "raw"
+            current = project_root / "data" / "current_source.json"
+            active = raw_dir / "active-source"
+            stale = raw_dir / "stale-source"
+            active.mkdir(parents=True)
+            stale.mkdir(parents=True)
+            readme.write_text("# Project README\n", encoding="utf-8")
+            current.parent.mkdir(parents=True, exist_ok=True)
+            current.write_text('{"source_slug":"active-source"}', encoding="utf-8")
+            (active / "README.md").write_text("ACTIVE_UNIQUE_TOKEN", encoding="utf-8")
+            (stale / "README.md").write_text("STALE_UNIQUE_TOKEN", encoding="utf-8")
+
+            with (
+                patch.object(pipeline_module, "PROJECT_ROOT", project_root),
+                patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", [readme, raw_dir]),
+            ):
+                nodes = pipeline_module.load_local_context_nodes()
+
+        combined = "\n".join(node.text for node in nodes)
+        self.assertIn("ACTIVE_UNIQUE_TOKEN", combined)
+        self.assertNotIn("STALE_UNIQUE_TOKEN", combined)
+
+    def test_default_local_context_nodes_resolve_current_source_case_insensitively(self):
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            raw_dir = project_root / "data" / "raw"
+            current = project_root / "data" / "current_source.json"
+            active = raw_dir / "Shizu0n-phi3-mini-sql-generator"
+            stale = raw_dir / "stale-source"
+            active.mkdir(parents=True)
+            stale.mkdir(parents=True)
+            current.parent.mkdir(parents=True, exist_ok=True)
+            current.write_text('{"source_slug":"shizu0n-phi3-mini-sql-generator"}', encoding="utf-8")
+            (active / "README.md").write_text("MIXED_CASE_ACTIVE_TOKEN", encoding="utf-8")
+            (stale / "README.md").write_text("STALE_UNIQUE_TOKEN", encoding="utf-8")
+
+            with (
+                patch.object(pipeline_module, "PROJECT_ROOT", project_root),
+                patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", [raw_dir]),
+            ):
+                nodes = pipeline_module.load_local_context_nodes()
+
+        combined = "\n".join(node.text for node in nodes)
+        self.assertIn("MIXED_CASE_ACTIVE_TOKEN", combined)
+        self.assertNotIn("STALE_UNIQUE_TOKEN", combined)
+
+    def test_default_local_context_nodes_do_not_scan_raw_when_current_source_directory_is_missing(self):
+        with TemporaryDirectory() as tmpdir:
+            project_root = Path(tmpdir)
+            raw_dir = project_root / "data" / "raw"
+            current = project_root / "data" / "current_source.json"
+            stale = raw_dir / "stale-source"
+            stale.mkdir(parents=True)
+            current.parent.mkdir(parents=True, exist_ok=True)
+            current.write_text('{"source_slug":"missing-source"}', encoding="utf-8")
+            (stale / "README.md").write_text("STALE_UNIQUE_TOKEN", encoding="utf-8")
+
+            with (
+                patch.object(pipeline_module, "PROJECT_ROOT", project_root),
+                patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", [raw_dir]),
+            ):
+                nodes = pipeline_module.load_local_context_nodes()
+
+        self.assertEqual(nodes, [])
+
     def test_local_context_nodes_include_nested_repo_files(self):
         with TemporaryDirectory() as tmpdir:
             repo = Path(tmpdir) / "my-repo"

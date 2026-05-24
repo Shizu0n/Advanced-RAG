@@ -203,7 +203,7 @@ result = chat_query(
 print(result["answer"])
 ```
 
-### Manual Source Preparation and Query Flow
+### Manual retrieval and evaluation commands
 
 #### 1. Prepare a Hugging Face source
 

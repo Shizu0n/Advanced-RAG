@@ -109,6 +109,47 @@ class GoldenDatasetTests(unittest.TestCase):
             self.assertEqual(detail.loc[0, "summary_backend"], "offline_heuristic")
             self.assertEqual(summary.loc[0, "summary_backend"], "offline_heuristic")
 
+    def test_run_evaluation_can_skip_real_ragas_even_when_env_enabled(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            summary_path = Path(tmpdir) / "summary.csv"
+            detail_path = Path(tmpdir) / "detail.csv"
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "What is Python?",
+                            "ground_truth": "Python is a language.",
+                            "reference_context": "Python is a language.",
+                            "source_doc": "doc.md",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "STRATEGIES", ["semantic_only"]),
+                patch.object(evaluation, "EVAL_DIR", Path(tmpdir)),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.dict(
+                    "os.environ",
+                    {
+                        "USE_GEMINI_FREE_RAGAS": "1",
+                        "ALLOW_CLOUD_FREE_TIER": "1",
+                        "GEMINI_API_KEY": "key",
+                    },
+                    clear=True,
+                ),
+                patch.object(evaluation.gemini_ragas, "run_ragas") as run_ragas,
+            ):
+                evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline(), use_real_ragas=False)
+
+            run_ragas.assert_not_called()
+            summary = pd.read_csv(summary_path)
+            self.assertEqual(summary.loc[0, "summary_backend"], "offline_heuristic")
+
     def test_provider_fallback_uses_next_provider(self):
         node = TextNode(id_="n1", text="Python functions are defined with def and return values.")
 
@@ -183,7 +224,7 @@ class GoldenDatasetTests(unittest.TestCase):
 
             build.assert_not_called()
             generate.assert_called_once_with([node], output_path=golden_path)
-            run.assert_called_once_with(pipeline="pipeline")
+            run.assert_called_once_with(pipeline="pipeline", use_real_ragas=False)
 
     def test_main_can_build_index_only_with_explicit_opt_in(self):
         with TemporaryDirectory() as tmpdir:
@@ -203,7 +244,7 @@ class GoldenDatasetTests(unittest.TestCase):
 
             build.assert_called_once()
             generate.assert_called_once_with(["node"], output_path=golden_path)
-            run.assert_called_once_with(pipeline="pipeline")
+            run.assert_called_once_with(pipeline="pipeline", use_real_ragas=False)
 
     def test_main_reuses_existing_indexed_pipeline_when_golden_dataset_is_stale(self):
         with TemporaryDirectory() as tmpdir:
@@ -230,7 +271,35 @@ class GoldenDatasetTests(unittest.TestCase):
 
             build.assert_not_called()
             generate.assert_called_once_with([node], output_path=golden_path)
-            run.assert_called_once_with(pipeline=indexed_pipeline)
+            run.assert_called_once_with(pipeline=indexed_pipeline, use_real_ragas=False)
+
+    def test_main_passes_explicit_ragas_mode_to_run_evaluation(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "Q?",
+                            "ground_truth": "A",
+                            "reference_context": "ctx",
+                            "source_doc": "doc.md",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=None),
+                patch.object(evaluation, "LocalRAGPipeline", return_value="pipeline"),
+                patch.object(evaluation, "run_evaluation") as run,
+            ):
+                evaluation.main(use_real_ragas=False)
+
+            run.assert_called_once_with(pipeline="pipeline", use_real_ragas=False)
 
     def test_gemini_ragas_opt_in_requires_cloud_free_tier_and_key(self):
         rows = [
@@ -435,6 +504,30 @@ class GoldenDatasetTests(unittest.TestCase):
 
 
 class SourceScopedEvalTests(unittest.TestCase):
+    def test_generate_pre_questions_uses_indexed_pipeline_nodes_and_source_slug(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+            node = TextNode(id_="indexed", text="Indexed source context explains the current repository architecture.")
+            indexed_pipeline = StaticPipeline(nodes=[node])
+            current_source_path.write_text(json.dumps({"source_slug": "current-repo"}), encoding="utf-8")
+
+            with (
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=indexed_pipeline),
+            ):
+                dataset = evaluation.generate_pre_questions(
+                    output_path=golden_path,
+                    providers=[StaticProvider()],
+                    chunk_limit=1,
+                    final_limit=1,
+                )
+
+            self.assertEqual(len(dataset), 1)
+            self.assertEqual(dataset[0]["source_slug"], "current-repo")
+            self.assertTrue(golden_path.exists())
+
     def test_run_evaluation_writes_evaluated_source_column_to_csv(self):
         with TemporaryDirectory() as tmpdir:
             golden_path = Path(tmpdir) / "golden_dataset.json"

@@ -291,6 +291,21 @@ def dataset_stats(golden_path: Path = GOLDEN_DATASET_PATH, per_question_path: Pa
     return stats
 
 
+def load_golden_questions(path: Path = GOLDEN_DATASET_PATH) -> pd.DataFrame:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return _empty_frame(["question", "source_doc", "source_slug"])
+    if not isinstance(data, list):
+        return _empty_frame(["question", "source_doc", "source_slug"])
+    rows = [item for item in data if isinstance(item, dict)]
+    frame = pd.DataFrame(rows)
+    for column in ["question", "source_doc", "source_slug"]:
+        if column not in frame.columns:
+            frame[column] = pd.NA
+    return frame[["question", "source_doc", "source_slug"]]
+
+
 def _ui_gate_overrides(st) -> dict[str, bool]:
     value = st.session_state.get(UI_GATE_OVERRIDES_KEY)
     return value if isinstance(value, dict) else {}
@@ -338,15 +353,31 @@ def clear_eval_artifacts() -> None:
         _remove_path(path)
 
 
+def _clear_chroma_artifacts() -> None:
+    try:
+        _remove_path(CHROMA_DIR)
+        return
+    except PermissionError:
+        pass
+
+    import chromadb
+
+    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    try:
+        client.delete_collection("advanced_rag")
+    except chromadb.errors.NotFoundError:
+        pass
+
+
 def clear_source_cache(clear_raw: bool = True) -> None:
-    _remove_path(CHROMA_DIR)
+    _clear_chroma_artifacts()
     for path in [CURRENT_SOURCE_PATH, PREPARED_SOURCE_PATH, QUERY_LOG_PATH]:
         _remove_path(path)
     clear_eval_artifacts()
     if clear_raw:
-        if RAW_DIR.exists():
-            shutil.rmtree(RAW_DIR)
         RAW_DIR.mkdir(parents=True, exist_ok=True)
+        for path in RAW_DIR.iterdir():
+            _remove_path(path)
 
 
 def reset_session_source_state(st) -> None:
@@ -445,11 +476,17 @@ def run_build_index(source_files: Iterable[Path] | None = None) -> list:
     return nodes
 
 
-def run_evaluation_inline() -> None:
+def generate_pre_questions_inline() -> list[dict[str, str]]:
+    from evaluate import generate_pre_questions
+
+    return generate_pre_questions()
+
+
+def run_evaluation_inline(use_real_ragas: bool = True) -> None:
     """Run full evaluation pipeline inline (blocking). Calls evaluate.main()."""
     from evaluate import main as eval_main
 
-    eval_main()
+    eval_main(use_real_ragas=use_real_ragas)
 
 
 def last_eval_date(path: Path = RAGAS_RESULTS_PATH) -> str:
@@ -517,10 +554,14 @@ def _prepared_source_state(st) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _source_slug_matches(left: Any, right: Any) -> bool:
+    return str(left or "").lower() == str(right or "").lower()
+
+
 def _current_source_for_ui(st) -> dict[str, Any] | None:
     prepared = _prepared_source_state(st) or load_prepared_source()
     indexed = load_current_source()
-    if prepared and prepared.get("source_slug") != (indexed or {}).get("source_slug"):
+    if prepared and not _source_slug_matches(prepared.get("source_slug"), (indexed or {}).get("source_slug")):
         return prepared
     return indexed
 
@@ -1380,21 +1421,56 @@ def _render_eval_tab(st) -> None:
         _show_stale_eval_results_warning(st, indexed_source)
     _render_eval_ready(st, summary)
 
-    if st.button("Run Evaluation"):
+    if st.button("Generate pre-questions"):
         if not _eval_should_allow_run(st):
             _render_eval_run_blocked(st)
         else:
-            with st.spinner("Running evaluation... This may take a minute."):
+            with st.spinner("Generating source-specific pre-questions..."):
+                try:
+                    questions = _with_session_gate_env(
+                        st,
+                        ["USE_GEMINI_FREE_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
+                        generate_pre_questions_inline,
+                    )
+                    st.success(f"Generated {len(questions)} source-specific pre-questions.")
+                    st.rerun()
+                except Exception as exc:
+                    _show_eval_failure(st, exc)
+
+    if st.button("Run fast evaluation"):
+        if not _eval_should_allow_run(st):
+            _render_eval_run_blocked(st)
+        else:
+            with st.spinner("Running fast offline evaluation..."):
                 try:
                     _with_session_gate_env(
                         st,
-                        ["USE_GEMINI_FREE_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
-                        run_evaluation_inline,
+                        ["ALLOW_INDEX_BUILD"],
+                        lambda: run_evaluation_inline(use_real_ragas=False),
                     )
                     _show_eval_success(st)
                     st.rerun()
                 except Exception as exc:
                     _show_eval_failure(st, exc)
+
+    if st.button("Run Gemini RAGAS"):
+        if not _eval_should_allow_run(st):
+            _render_eval_run_blocked(st)
+        else:
+            with st.spinner("Running Gemini RAGAS evaluation..."):
+                try:
+                    _with_session_gate_env(
+                        st,
+                        ["USE_GEMINI_FREE_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
+                        lambda: run_evaluation_inline(use_real_ragas=True),
+                    )
+                    _show_eval_success(st)
+                    st.rerun()
+                except Exception as exc:
+                    _show_eval_failure(st, exc)
+
+    st.subheader("Generated pre-questions")
+    st.dataframe(load_golden_questions(), use_container_width=True)
 
     st.subheader("Evaluation summary")
     card_columns = st.columns(4)

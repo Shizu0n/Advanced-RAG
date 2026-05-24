@@ -143,6 +143,30 @@ class SourceLoaderTests(unittest.TestCase):
             only_path = next(iter(source_loader.PREPARED_SOURCE_METADATA))
             self.assertTrue(only_path.endswith("/src/main.py"))
 
+    def test_prepare_sources_clear_existing_preserves_raw_dir_when_root_cannot_be_removed(self):
+        with TemporaryDirectory() as tmpdir:
+            base_dir = Path(tmpdir)
+            repo_dir = base_dir / "repo"
+            raw_dir = base_dir / "raw"
+            (repo_dir / "src").mkdir(parents=True)
+            (repo_dir / "src" / "main.py").write_text("print('fresh')\n", encoding="utf-8")
+            stale_dir = raw_dir / "stale-source"
+            stale_dir.mkdir(parents=True)
+            (stale_dir / "old.md").write_text("# stale\n", encoding="utf-8")
+            original_rmtree = source_loader.shutil.rmtree
+
+            def rmtree_unless_raw_root(path):
+                if Path(path) == raw_dir:
+                    raise PermissionError("raw root is locked")
+                original_rmtree(path)
+
+            with patch.object(source_loader.shutil, "rmtree", side_effect=rmtree_unless_raw_root):
+                files = source_loader.prepare_sources([repo_dir], raw_dir=raw_dir, clear_existing=True)
+
+            self.assertTrue(raw_dir.exists())
+            self.assertEqual(len(files), 1)
+            self.assertFalse(stale_dir.exists())
+
     def test_prepare_sources_persists_pending_metadata_separately_from_current_source(self):
         with TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)

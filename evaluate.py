@@ -349,8 +349,9 @@ def _strict_gemini_ragas_enabled() -> bool:
 def maybe_run_real_ragas(
     rows: Sequence[dict[str, Any]],
     gemini_client: gemini_ragas.GeminiFreeTierClient | None = None,
+    enabled: bool | None = None,
 ) -> dict[str, float] | None:
-    if not _real_ragas_enabled():
+    if enabled is False or not _real_ragas_enabled():
         return None
 
     config = gemini_ragas.config_from_env() if gemini_client is None else None
@@ -384,12 +385,15 @@ def run_evaluation(
     golden_path: Path = GOLDEN_DATASET_PATH,
     pipeline: LocalRAGPipeline | None = None,
     gemini_client: gemini_ragas.GeminiFreeTierClient | None = None,
+    use_real_ragas: bool | None = None,
 ) -> dict[str, dict[str, float]]:
     logger.info("run_evaluation: loading golden dataset from %s", golden_path)
     dataset = load_golden_dataset(golden_path)
     logger.info("run_evaluation: %d golden items, %d strategies", len(dataset), len(STRATEGIES))
     pipeline = pipeline or LocalRAGPipeline()
-    if _real_ragas_enabled() and gemini_client is None:
+    if use_real_ragas is None:
+        use_real_ragas = _real_ragas_enabled()
+    if use_real_ragas and gemini_client is None:
         gemini_client = gemini_ragas.client_from_config(gemini_ragas.config_from_env())
     summaries: dict[str, dict[str, float]] = {}
     summary_backends: dict[str, str] = {}
@@ -398,7 +402,7 @@ def run_evaluation(
     for strategy in STRATEGIES:
         logger.info("Evaluating strategy: %s", strategy)
         summary, rows = evaluate_strategy(dataset, strategy, pipeline)
-        real_scores = maybe_run_real_ragas(rows, gemini_client=gemini_client)
+        real_scores = maybe_run_real_ragas(rows, gemini_client=gemini_client, enabled=use_real_ragas)
         summary_backend = "gemini_free_tier_ragas" if real_scores else "offline_heuristic"
         for row in rows:
             row["summary_backend"] = summary_backend
@@ -458,11 +462,35 @@ def _load_indexed_pipeline() -> LocalRAGPipeline | None:
     return pipeline if pipeline.index is not None and pipeline.nodes else None
 
 
-def main() -> None:
+def generate_pre_questions(
+    output_path: Path = GOLDEN_DATASET_PATH,
+    providers: Sequence[QuestionProvider] | None = None,
+    chunk_limit: int = 12,
+    final_limit: int = 8,
+) -> list[dict[str, str]]:
+    pipeline = _load_indexed_pipeline()
+    nodes: Sequence[Any] | None = pipeline.nodes if pipeline is not None else None
+    if nodes is None:
+        nodes = load_local_context_nodes()
+    if not nodes:
+        raise RuntimeError("No indexed or local source context was found for question generation.")
+    invalidate_golden_dataset_if_stale()
+    return generate_golden_dataset(
+        nodes,
+        output_path=output_path,
+        providers=providers,
+        chunk_limit=chunk_limit,
+        final_limit=final_limit,
+    )
+
+
+def main(use_real_ragas: bool | None = None) -> None:
     pipeline = _load_indexed_pipeline()
     nodes: Sequence[Any] | None = None
+    if use_real_ragas is None:
+        use_real_ragas = _real_ragas_enabled()
     gemini_client = (
-        gemini_ragas.client_from_config(gemini_ragas.config_from_env()) if _real_ragas_enabled() else None
+        gemini_ragas.client_from_config(gemini_ragas.config_from_env()) if use_real_ragas else None
     )
     invalidate_golden_dataset_if_stale()
     try:
@@ -492,9 +520,9 @@ def main() -> None:
 
     pipeline = pipeline or LocalRAGPipeline(nodes=nodes, allow_index_build=False)
     if gemini_client:
-        run_evaluation(pipeline=pipeline, gemini_client=gemini_client)
+        run_evaluation(pipeline=pipeline, gemini_client=gemini_client, use_real_ragas=use_real_ragas)
     else:
-        run_evaluation(pipeline=pipeline)
+        run_evaluation(pipeline=pipeline, use_real_ragas=use_real_ragas)
 
 
 if __name__ == "__main__":

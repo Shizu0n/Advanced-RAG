@@ -357,9 +357,12 @@ def _register_prepared_files(
 
 
 def _reset_raw_dir(raw_dir: Path) -> None:
-    if raw_dir.exists():
-        shutil.rmtree(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
+    for path in raw_dir.iterdir():
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
 
 
 def _fetch_huggingface_card(

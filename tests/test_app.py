@@ -5,7 +5,7 @@ import unittest
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
@@ -719,6 +719,86 @@ class AppHelperTests(unittest.TestCase):
             self.assertFalse(summary_path.exists())
             self.assertFalse(detail_path.exists())
 
+    def test_clear_source_cache_preserves_raw_dir_when_root_cannot_be_removed(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "data" / "raw"
+            chroma_dir = root / "chroma_db"
+            current_source = root / "data" / "current_source.json"
+            prepared_source = root / "data" / "prepared_source.json"
+            query_log = root / "data" / "query_log.jsonl"
+            golden_path = root / "data" / "eval" / "golden_dataset.json"
+            summary_path = root / "data" / "eval" / "ragas_results.csv"
+            detail_path = root / "data" / "eval" / "ragas_per_question.csv"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "old" / "README.md").parent.mkdir()
+            (raw_dir / "old" / "README.md").write_text("# old", encoding="utf-8")
+            original_rmtree = shutil.rmtree
+
+            def rmtree_unless_raw_root(path):
+                if Path(path) == raw_dir:
+                    raise PermissionError("raw root is locked")
+                original_rmtree(path)
+
+            with (
+                patch.object(app, "RAW_DIR", raw_dir),
+                patch.object(app, "CHROMA_DIR", chroma_dir),
+                patch.object(app, "CURRENT_SOURCE_PATH", current_source),
+                patch.object(app, "PREPARED_SOURCE_PATH", prepared_source),
+                patch.object(app, "QUERY_LOG_PATH", query_log),
+                patch.object(app, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(app, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(app, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.object(app.shutil, "rmtree", side_effect=rmtree_unless_raw_root),
+            ):
+                app.clear_source_cache()
+
+            self.assertTrue(raw_dir.exists())
+            self.assertEqual(list(raw_dir.iterdir()), [])
+
+    def test_clear_source_cache_clears_chroma_collection_when_index_files_are_locked(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "data" / "raw"
+            chroma_dir = root / "chroma_db"
+            current_source = root / "data" / "current_source.json"
+            prepared_source = root / "data" / "prepared_source.json"
+            query_log = root / "data" / "query_log.jsonl"
+            golden_path = root / "data" / "eval" / "golden_dataset.json"
+            summary_path = root / "data" / "eval" / "ragas_results.csv"
+            detail_path = root / "data" / "eval" / "ragas_per_question.csv"
+            raw_dir.mkdir(parents=True)
+            chroma_dir.mkdir()
+            current_source.parent.mkdir(parents=True, exist_ok=True)
+            current_source.write_text('{"source_slug":"old"}', encoding="utf-8")
+            mock_client = MagicMock()
+            mock_chromadb = MagicMock()
+            mock_chromadb.PersistentClient.return_value = mock_client
+            mock_chromadb.errors.NotFoundError = RuntimeError
+
+            def rmtree_unless_chroma(path):
+                if Path(path) == chroma_dir:
+                    raise PermissionError("chroma file is locked")
+                shutil.rmtree(path)
+
+            with (
+                patch.object(app, "RAW_DIR", raw_dir),
+                patch.object(app, "CHROMA_DIR", chroma_dir),
+                patch.object(app, "CURRENT_SOURCE_PATH", current_source),
+                patch.object(app, "PREPARED_SOURCE_PATH", prepared_source),
+                patch.object(app, "QUERY_LOG_PATH", query_log),
+                patch.object(app, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(app, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(app, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.object(app.shutil, "rmtree", side_effect=rmtree_unless_chroma),
+                patch.dict("sys.modules", {"chromadb": mock_chromadb}),
+            ):
+                app.clear_source_cache()
+
+            mock_chromadb.PersistentClient.assert_called_once_with(path=str(chroma_dir))
+            mock_client.delete_collection.assert_called_once_with("advanced_rag")
+            self.assertFalse(current_source.exists())
+
     def test_reset_session_source_state_removes_prepared_files_and_chat(self):
         fake_st = FakeStreamlit(messages=[{"role": "user", "content": "old"}])
         fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "old", "indexed_at": None}
@@ -786,9 +866,14 @@ class AppHelperTests(unittest.TestCase):
 
 
 class EvalTabTests(unittest.TestCase):
-    def test_eval_tab_runs_evaluation_with_session_gate_overrides(self):
+    def test_eval_tab_runs_gemini_ragas_with_session_gate_overrides(self):
         fake_st = FakeStreamlit()
-        fake_st._button_return = True
+        fake_st._button_return_by_label = {
+            "Generate pre-questions": False,
+            "Run fast evaluation": False,
+            "Run Gemini RAGAS": True,
+        }
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {
             "USE_GEMINI_FREE_RAGAS": True,
             "ALLOW_CLOUD_FREE_TIER": True,
@@ -796,7 +881,8 @@ class EvalTabTests(unittest.TestCase):
         current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
         observed = {}
 
-        def capture_eval():
+        def capture_eval(use_real_ragas=True):
+            observed["use_real_ragas"] = use_real_ragas
             observed["USE_GEMINI_FREE_RAGAS"] = os.getenv("USE_GEMINI_FREE_RAGAS")
             observed["ALLOW_CLOUD_FREE_TIER"] = os.getenv("ALLOW_CLOUD_FREE_TIER")
 
@@ -822,8 +908,119 @@ class EvalTabTests(unittest.TestCase):
             ):
                 app._render_eval_tab(fake_st)
 
+        self.assertTrue(observed["use_real_ragas"])
         self.assertEqual(observed["USE_GEMINI_FREE_RAGAS"], "1")
         self.assertEqual(observed["ALLOW_CLOUD_FREE_TIER"], "1")
+
+    def test_eval_tab_generates_pre_questions_without_running_full_evaluation(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return_by_label = {
+            "Generate pre-questions": True,
+            "Run fast evaluation": False,
+            "Run Gemini RAGAS": False,
+        }
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
+        current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
+
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=False),
+                patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+                patch("app.last_eval_date", return_value="Not available"),
+                patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+                patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.generate_pre_questions_inline", return_value=[{"question": "Q?", "source_doc": "doc.md"}]) as generate,
+                patch("app.run_evaluation_inline") as run_eval,
+            ):
+                app._render_eval_tab(fake_st)
+
+        generate.assert_called_once()
+        run_eval.assert_not_called()
+        self.assertTrue(any(event[0] == "success" and "Generated 1" in event[1] for event in fake_st.events))
+
+    def test_eval_tab_fast_evaluation_skips_real_ragas(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return_by_label = {
+            "Generate pre-questions": False,
+            "Run fast evaluation": True,
+            "Run Gemini RAGAS": False,
+        }
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
+        current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
+
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=False),
+                patch("app.dataset_stats", return_value={"golden_questions": 1, "evaluated_rows": 0}),
+                patch("app.last_eval_date", return_value="Not available"),
+                patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+                patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.run_evaluation_inline") as run_eval,
+            ):
+                app._render_eval_tab(fake_st)
+
+        run_eval.assert_called_once_with(use_real_ragas=False)
+
+    def test_eval_tab_displays_existing_pre_questions(self):
+        fake_st = FakeStreamlit()
+        current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
+        questions = [
+            {
+                "question": "What does this repo do?",
+                "ground_truth": "It evaluates RAG.",
+                "reference_context": "It evaluates RAG.",
+                "source_doc": "README.md",
+                "source_slug": "repo",
+            }
+        ]
+
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(json.dumps(questions), encoding="utf-8")
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app.GOLDEN_DATASET_PATH", golden_path),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=False),
+                patch("app.dataset_stats", return_value={"golden_questions": 1, "evaluated_rows": 0}),
+                patch("app.last_eval_date", return_value="Not available"),
+                patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+                patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+            ):
+                app._render_eval_tab(fake_st)
+
+        subheaders = [event[1] for event in fake_st.events if event[0] == "subheader"]
+        self.assertIn("Generated pre-questions", subheaders)
+        dataframes = [event for event in fake_st.events if event[0] == "dataframe"]
+        self.assertTrue(any("question" in event[1] and "source_doc" in event[1] for event in dataframes))
 
     def _render_eval_tab_with_stubs(self, current_source=None, golden_path=None, results_path=None):
         """Helper to render the eval tab with controlled file paths."""
@@ -893,7 +1090,9 @@ class EvalTabTests(unittest.TestCase):
         fake_st = self._render_eval_tab_with_stubs(current_source={"source_slug": "repo", "indexed_at": "2026-05-20T00:00:00+00:00"})
 
         buttons = [event[1] for event in fake_st.events if event[0] == "button"]
-        self.assertIn("Run Evaluation", buttons)
+        self.assertIn("Generate pre-questions", buttons)
+        self.assertIn("Run fast evaluation", buttons)
+        self.assertIn("Run Gemini RAGAS", buttons)
 
 
 class SourceBadgeTests(unittest.TestCase):
@@ -1434,7 +1633,21 @@ class QueryTabWarningTests(unittest.TestCase):
         run_eval.assert_not_called()
         warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
         self.assertTrue(any("prepared but not indexed" in w for w in warnings))
-        self.assertNotIn("Run Evaluation", [event[1] for event in fake_st.events if event[0] == "button"])
+        button_labels = [event[1] for event in fake_st.events if event[0] == "button"]
+        self.assertNotIn("Generate pre-questions", button_labels)
+        self.assertNotIn("Run fast evaluation", button_labels)
+        self.assertNotIn("Run Gemini RAGAS", button_labels)
+
+    def test_current_source_for_ui_treats_slug_case_difference_as_same_source(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "Shizu0n-ReferralSystem", "indexed_at": None}
+        indexed = {"source_slug": "shizu0n-referralsystem", "indexed_at": "2026-05-24T00:00:00+00:00"}
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = prepared
+
+        with patch("app.load_current_source", return_value=indexed):
+            result = app._current_source_for_ui(fake_st)
+
+        self.assertEqual(result, indexed)
 
     def test_query_tab_resets_chat_history_when_indexed_source_changes(self):
         fake_st = FakeStreamlit(messages=[{"role": "user", "content": "old source question"}])
@@ -1615,7 +1828,10 @@ class QueryTabWarningTests(unittest.TestCase):
         self.assertFalse(any("Last eval: raw" in c for c in captions))
         self.assertTrue(all(value == "n/a" for _, _, value in metrics))
         self.assertEqual(dataframes[-1][1], app.PER_QUESTION_COLUMNS)
-        self.assertIn("Run Evaluation", [event[1] for event in fake_st.events if event[0] == "button"])
+        button_labels = [event[1] for event in fake_st.events if event[0] == "button"]
+        self.assertIn("Generate pre-questions", button_labels)
+        self.assertIn("Run fast evaluation", button_labels)
+        self.assertIn("Run Gemini RAGAS", button_labels)
 
     def test_build_index_without_allow_index_build_surfaces_actionable_error(self):
         fake_st = FakeStreamlit()
@@ -1673,7 +1889,10 @@ class QueryTabWarningTests(unittest.TestCase):
         self.assertTrue(any("prepared but not indexed" in w for w in warnings))
         infos = [event[1] for event in fake_st.events if event[0] == "info"]
         self.assertTrue(any("Prepared source pending index" in i for i in infos))
-        self.assertNotIn("Run Evaluation", [event[1] for event in fake_st.events if event[0] == "button"])
+        button_labels = [event[1] for event in fake_st.events if event[0] == "button"]
+        self.assertNotIn("Generate pre-questions", button_labels)
+        self.assertNotIn("Run fast evaluation", button_labels)
+        self.assertNotIn("Run Gemini RAGAS", button_labels)
         self.assertFalse(any(event[0] == "metric" for event in fake_st.events))
         self.assertFalse(any(event[0] == "subheader" and event[1] == "Evaluation summary" for event in fake_st.events))
 

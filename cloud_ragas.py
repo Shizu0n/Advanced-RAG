@@ -18,31 +18,33 @@ import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_CACHE_DIR = PROJECT_ROOT / "data" / "eval" / "cache"
-GEMINI_MODEL = "gemini-2.5-flash"
-EMBEDDING_MODEL = "gemini-embedding-001"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_EMBEDDING_MODEL = "gemini-embedding-001"
 QUOTA_STATUS_CODES = {403, 429, 500, 502, 503, 504}
 METRIC_NAMES = ("faithfulness", "answer_relevancy", "context_recall", "context_precision")
+SUPPORTED_CLOUD_PROVIDERS = ("gemini", "github", "groq")
+DEFAULT_PROVIDER_ORDER = ("gemini", "github", "groq")
 
 
-class GeminiCloudUnavailable(RuntimeError):
+class CloudProviderUnavailable(RuntimeError):
     pass
 
 
 @dataclass(frozen=True)
-class GeminiRagasConfig:
-    api_key: str
+class CloudRagasConfig:
+    providers: tuple["CloudProvider", ...]
     cache_dir: Path = DEFAULT_CACHE_DIR
     max_calls: int = 120
 
 
 @dataclass
-class GeminiCallBudget:
+class CloudCallBudget:
     max_calls: int = 120
     calls_made: int = 0
 
     def consume(self) -> None:
         if self.calls_made >= self.max_calls:
-            raise RuntimeError(f"MAX_GEMINI_CALLS exceeded ({self.max_calls}); cached calls still work.")
+            raise RuntimeError(f"MAX_CLOUD_CALLS exceeded ({self.max_calls}); cached calls still work.")
         self.calls_made += 1
 
 
@@ -54,19 +56,32 @@ class CloudProvider:
     account_id: str | None = None
 
 
+def _provider_order_from_env() -> tuple[str, ...]:
+    raw_order = os.getenv("CLOUD_PROVIDER_ORDER")
+    if not raw_order:
+        return DEFAULT_PROVIDER_ORDER
+    order = tuple(name.strip().lower() for name in raw_order.split(",") if name.strip())
+    unsupported = [name for name in order if name not in SUPPORTED_CLOUD_PROVIDERS]
+    if unsupported:
+        raise RuntimeError(f"Unsupported CLOUD_PROVIDER_ORDER provider: {unsupported[0]}")
+    return order or DEFAULT_PROVIDER_ORDER
+
+
 def providers_from_env() -> list[CloudProvider]:
-    providers: list[CloudProvider] = []
+    configured: dict[str, CloudProvider] = {}
     if os.getenv("GEMINI_API_KEY"):
-        providers.append(CloudProvider("gemini", os.getenv("GEMINI_MODEL", GEMINI_MODEL), os.environ["GEMINI_API_KEY"]))
-    if os.getenv("GROQ_API_KEY"):
-        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-        if _is_allowed_fallback_model(model):
-            providers.append(CloudProvider("groq", model, os.environ["GROQ_API_KEY"]))
+        configured["gemini"] = CloudProvider("gemini", os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL), os.environ["GEMINI_API_KEY"])
     if os.getenv("GITHUB_MODELS_TOKEN") and os.getenv("GITHUB_MODELS_MODEL"):
         model = os.environ["GITHUB_MODELS_MODEL"]
         if _is_allowed_fallback_model(model):
-            providers.append(CloudProvider("github", model, os.environ["GITHUB_MODELS_TOKEN"]))
-    return providers
+            configured["github"] = CloudProvider("github", model, os.environ["GITHUB_MODELS_TOKEN"])
+    if os.getenv("GROQ_API_KEY"):
+        model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+        if _is_allowed_fallback_model(model):
+            configured["groq"] = CloudProvider("groq", model, os.environ["GROQ_API_KEY"])
+    return [configured[name] for name in _provider_order_from_env() if name in configured]
+
+
 
 
 def _is_allowed_fallback_model(model: str) -> bool:
@@ -75,44 +90,39 @@ def _is_allowed_fallback_model(model: str) -> bool:
     return not any(marker in normalized for marker in blocked_markers)
 
 
-def config_from_env() -> GeminiRagasConfig:
+def config_from_env() -> CloudRagasConfig:
     if os.getenv("ALLOW_CLOUD_FREE_TIER") != "1":
-        raise RuntimeError("Set ALLOW_CLOUD_FREE_TIER=1 to permit Gemini free-tier cloud evaluation.")
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError("Set GEMINI_API_KEY for Gemini free-tier RAGAS evaluation.")
-    max_calls = int(os.getenv("MAX_GEMINI_CALLS", "120"))
-    return GeminiRagasConfig(api_key=api_key, max_calls=max_calls)
+        raise RuntimeError("Set ALLOW_CLOUD_FREE_TIER=1 to permit free-tier cloud evaluation.")
+    providers = tuple(providers_from_env())
+    if not providers:
+        raise RuntimeError("Set at least one supported free-tier cloud provider key before cloud RAGAS evaluation.")
+    max_calls = int(os.getenv("MAX_CLOUD_CALLS", "120"))
+    return CloudRagasConfig(providers=providers, max_calls=max_calls)
 
 
-def gemini_ragas_enabled() -> bool:
-    return os.getenv("USE_GEMINI_FREE_RAGAS") == "1"
+def cloud_ragas_enabled() -> bool:
+    return os.getenv("USE_CLOUD_FREE_TIER_RAGAS") == "1"
 
 
-def client_from_config(config: GeminiRagasConfig) -> "GeminiFreeTierClient":
-    return GeminiFreeTierClient(
-        api_key=config.api_key,
-        cache_dir=config.cache_dir,
-        budget=GeminiCallBudget(max_calls=config.max_calls),
-        providers=providers_from_env(),
-    )
+def client_from_config(config: CloudRagasConfig) -> "FreeTierCloudClient":
+    return FreeTierCloudClient(cache_dir=config.cache_dir, budget=CloudCallBudget(max_calls=config.max_calls), providers=config.providers)
 
 
-class GeminiFreeTierClient:
+class FreeTierCloudClient:
     def __init__(
         self,
-        api_key: str,
         cache_dir: Path = DEFAULT_CACHE_DIR,
         post: Callable[..., Any] = requests.post,
         max_calls: int = 120,
-        budget: GeminiCallBudget | None = None,
+        budget: CloudCallBudget | None = None,
         providers: Sequence[CloudProvider] | None = None,
     ) -> None:
-        self.api_key = api_key
         self.cache_dir = Path(cache_dir)
         self.post = post
-        self.budget = budget or GeminiCallBudget(max_calls=max_calls)
-        self.providers = tuple(providers or [CloudProvider("gemini", GEMINI_MODEL, api_key)])
+        self.budget = budget or CloudCallBudget(max_calls=max_calls)
+        self.providers = tuple(providers or providers_from_env())
+        if not self.providers:
+            raise RuntimeError("Set at least one supported free-tier cloud provider key.")
 
     @property
     def calls_made(self) -> int:
@@ -143,10 +153,10 @@ class GeminiFreeTierClient:
 
     def embed_text(self, text: str) -> list[float]:
         payload = {
-            "model": f"models/{EMBEDDING_MODEL}",
+            "model": f"models/{GEMINI_EMBEDDING_MODEL}",
             "content": {"parts": [{"text": text}]},
         }
-        data = self._request_with_model_fallback("embedContent", payload, (EMBEDDING_MODEL,))
+        data = self._request_with_model_fallback("embedContent", payload, (GEMINI_EMBEDDING_MODEL,))
         values = data.get("embedding", {}).get("values", [])
         return [float(value) for value in values]
 
@@ -185,13 +195,13 @@ class GeminiFreeTierClient:
             self._write_cache(cache_key, data)
             logger.info("Provider %s succeeded", provider.name)
             return data
-        raise GeminiCloudUnavailable("; ".join(errors) or "cloud providers unavailable")
+        raise CloudProviderUnavailable("; ".join(errors) or "cloud providers unavailable")
 
     def _provider_request(self, provider: CloudProvider, payload: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, str]]:
         prompt = payload["contents"][0]["parts"][0]["text"]
         temperature = payload.get("generationConfig", {}).get("temperature", 0.0)
         if provider.name == "gemini":
-            return self._url(provider.model, "generateContent"), payload, self._gemini_headers()
+            return self._url(provider.model, "generateContent"), payload, self._gemini_headers(provider.api_key)
 
         messages = [{"role": "user", "content": prompt}]
         if provider.name == "groq":
@@ -222,6 +232,12 @@ class GeminiFreeTierClient:
             return data["result"].get("response") or data["result"].get("text") or ""
         raise ValueError("Cloud provider response did not contain generated text.")
 
+    def _gemini_provider(self) -> CloudProvider:
+        for provider in self.providers:
+            if provider.name == "gemini":
+                return provider
+        raise CloudProviderUnavailable("Gemini embeddings require GEMINI_API_KEY.")
+
     def _request_with_model_fallback(
         self,
         method: str,
@@ -229,6 +245,7 @@ class GeminiFreeTierClient:
         models: Sequence[str],
     ) -> dict[str, Any]:
         errors: list[str] = []
+        provider = self._gemini_provider()
         for model in models:
             cache_key = self._cache_key(method, model, payload)
             cached = self._read_cache(cache_key)
@@ -237,7 +254,7 @@ class GeminiFreeTierClient:
 
             url = self._url(model, method)
             self.budget.consume()
-            response = self.post(url, json=payload, headers=self._gemini_headers(), timeout=30)
+            response = self.post(url, json=payload, headers=self._gemini_headers(provider.api_key), timeout=30)
             if getattr(response, "status_code", 200) in QUOTA_STATUS_CODES:
                 errors.append(f"{model}: HTTP {response.status_code}")
                 continue
@@ -245,13 +262,13 @@ class GeminiFreeTierClient:
             data = response.json()
             self._write_cache(cache_key, data)
             return data
-        raise GeminiCloudUnavailable("; ".join(errors) or "Gemini models unavailable")
+        raise CloudProviderUnavailable("; ".join(errors) or "Gemini embedding models unavailable")
 
     def _url(self, model: str, method: str) -> str:
         return f"https://generativelanguage.googleapis.com/v1beta/models/{model}:{method}"
 
-    def _gemini_headers(self) -> dict[str, str]:
-        return {"x-goog-api-key": self.api_key, "Content-Type": "application/json"}
+    def _gemini_headers(self, api_key: str) -> dict[str, str]:
+        return {"x-goog-api-key": api_key, "Content-Type": "application/json"}
 
     def _cache_key(self, method: str, model: str, payload: dict[str, Any]) -> str:
         raw = json.dumps({"method": method, "model": model, "payload": payload}, sort_keys=True)
@@ -271,22 +288,21 @@ class GeminiFreeTierClient:
         self._cache_path(cache_key).write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
 
 
-def build_gemini_backends(
-    api_key: str,
+def build_cloud_backends(
     cache_dir: Path = DEFAULT_CACHE_DIR,
     max_calls: int = 120,
-    gemini_client: GeminiFreeTierClient | None = None,
+    cloud_client: FreeTierCloudClient | None = None,
 ) -> tuple[Any, Any]:
-    client = gemini_client or GeminiFreeTierClient(api_key=api_key, cache_dir=cache_dir, max_calls=max_calls)
+    client = cloud_client or FreeTierCloudClient(cache_dir=cache_dir, max_calls=max_calls)
 
     try:
         from ragas.embeddings import BaseRagasEmbeddings
         from ragas.llms import BaseRagasLLM
         from langchain_core.outputs import Generation, LLMResult
     except ImportError:
-        return GeminiPlainLLM(client), GeminiPlainEmbeddings(client)
+        return PlainCloudLLM(client), PlainLocalEmbeddings(client)
 
-    class GeminiRagasLLM(BaseRagasLLM):
+    class CloudRagasLLM(BaseRagasLLM):
         def generate_text(
             self,
             prompt: Any,
@@ -309,7 +325,7 @@ def build_gemini_backends(
             text = await client.agenerate_text(prompt, n=n, temperature=temperature)
             return LLMResult(generations=[[Generation(text=text)]])
 
-    class GeminiRagasEmbeddings(BaseRagasEmbeddings):
+    class LocalRagasEmbeddings(BaseRagasEmbeddings):
         def embed_query(self, text: str) -> list[float]:
             return _local_embedding(text)
 
@@ -322,16 +338,16 @@ def build_gemini_backends(
         async def aembed_documents(self, texts: list[str]) -> list[list[float]]:
             return [_local_embedding(text) for text in texts]
 
-    return GeminiRagasLLM(), GeminiRagasEmbeddings()
+    return CloudRagasLLM(), LocalRagasEmbeddings()
 
 
-class GeminiPlainLLM:
-    def __init__(self, client: GeminiFreeTierClient) -> None:
+class PlainCloudLLM:
+    def __init__(self, client: FreeTierCloudClient) -> None:
         self.client = client
 
 
-class GeminiPlainEmbeddings:
-    def __init__(self, client: GeminiFreeTierClient) -> None:
+class PlainLocalEmbeddings:
+    def __init__(self, client: FreeTierCloudClient) -> None:
         self.client = client
 
 
@@ -360,17 +376,15 @@ def _import_ragas_parts() -> dict[str, Any]:
 
 def run_ragas(
     rows: Sequence[dict[str, Any]],
-    api_key: str,
     cache_dir: Path = DEFAULT_CACHE_DIR,
     max_calls: int = 120,
-    gemini_client: GeminiFreeTierClient | None = None,
+    cloud_client: FreeTierCloudClient | None = None,
 ) -> dict[str, float]:
     parts = _import_ragas_parts()
-    llm, embeddings = build_gemini_backends(
-        api_key=api_key,
+    llm, embeddings = build_cloud_backends(
         cache_dir=cache_dir,
         max_calls=max_calls,
-        gemini_client=gemini_client,
+        cloud_client=cloud_client,
     )
     records = [_ragas_record(row) for row in rows]
     dataset = parts["Dataset"].from_list(records)

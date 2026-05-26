@@ -45,7 +45,7 @@ UI_TOGGLE_GATES = {
     "ALLOW_INDEX_BUILD": {"label": "Allow index build", "default": True},
     "ALLOW_MODEL_DOWNLOADS": {"label": "Allow model downloads", "default": False},
     "ALLOW_CLOUD_CHAT": {"label": "Allow cloud chat", "default": True},
-    "USE_GEMINI_FREE_RAGAS": {"label": "Use Gemini RAGAS", "default": False},
+    "USE_CLOUD_FREE_TIER_RAGAS": {"label": "Use Cloud RAGAS", "default": False},
     "ALLOW_CLOUD_FREE_TIER": {"label": "Allow cloud free tier", "default": False},
 }
 MODEL_INFO = {
@@ -520,13 +520,13 @@ def _format_metric(value: float | None) -> str:
 def run_query(query: str, strategy: str) -> dict[str, Any]:
     from pipeline import answer_query
 
-    return answer_query(query, strategy=strategy, allow_index_build=True)
+    return answer_query(query, strategy=strategy, allow_index_build=False)
 
 
 def run_chat_query(message: str, history: list[dict[str, Any]], strategy: str) -> dict[str, Any]:
     from pipeline import chat_query
 
-    return chat_query(message, history=history, strategy=strategy, allow_index_build=True)
+    return chat_query(message, history=history, strategy=strategy, allow_index_build=False)
 
 
 def prepare_sources_for_app(
@@ -1117,7 +1117,7 @@ def _pending_source_slug_from_session(st) -> str | None:
 def _pending_source_matches_index(st) -> bool:
     prepared = _prepared_source_state(st)
     indexed = load_current_source()
-    return bool(prepared and indexed and prepared.get("source_slug") == indexed.get("source_slug"))
+    return bool(prepared and indexed and _source_slug_matches(prepared.get("source_slug"), indexed.get("source_slug")))
 
 
 def _cleanup_pending_source_if_index_matches(st) -> None:
@@ -1162,9 +1162,15 @@ def _render_gate_toggles(st) -> None:
     st.session_state[UI_GATE_OVERRIDES_KEY] = overrides
 
 
+def _sidebar_badge_state_for_source(current_source: dict[str, Any] | None) -> str:
+    if current_source is None:
+        return "grey"
+    return "green" if _source_is_indexed(current_source) else "yellow"
+
+
 def _render_sidebar(st) -> None:
     current_source = _source_ui_state(st)
-    badge_state = get_source_badge_state()
+    badge_state = _sidebar_badge_state_for_source(current_source) if current_source is not None else get_source_badge_state()
     _render_source_badge(st, badge_state, current_source)
     _render_gate_toggles(st)
 
@@ -1277,6 +1283,7 @@ def _render_sources_tab(st) -> None:
                     st.session_state.pop(ACTIVE_CHAT_SOURCE_KEY, None)
                     clear_eval_artifacts()
                     st.success(f"Index built successfully. {len(nodes)} chunks for source '{slug}'.")
+                    st.rerun()
                 except Exception as exc:
                     st.error(f"Index build failed: {exc}")
 
@@ -1429,7 +1436,7 @@ def _render_eval_tab(st) -> None:
                 try:
                     questions = _with_session_gate_env(
                         st,
-                        ["USE_GEMINI_FREE_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
+                        ["USE_CLOUD_FREE_TIER_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
                         generate_pre_questions_inline,
                     )
                     st.success(f"Generated {len(questions)} source-specific pre-questions.")
@@ -1453,15 +1460,15 @@ def _render_eval_tab(st) -> None:
                 except Exception as exc:
                     _show_eval_failure(st, exc)
 
-    if st.button("Run Gemini RAGAS"):
+    if st.button("Run Cloud RAGAS"):
         if not _eval_should_allow_run(st):
             _render_eval_run_blocked(st)
         else:
-            with st.spinner("Running Gemini RAGAS evaluation..."):
+            with st.spinner("Running Cloud RAGAS evaluation..."):
                 try:
                     _with_session_gate_env(
                         st,
-                        ["USE_GEMINI_FREE_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
+                        ["USE_CLOUD_FREE_TIER_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
                         lambda: run_evaluation_inline(use_real_ragas=True),
                     )
                     _show_eval_success(st)

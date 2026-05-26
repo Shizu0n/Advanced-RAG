@@ -701,7 +701,22 @@ npm install.
             policy = pipeline_module.ChatProviderPolicy.from_env()
 
         self.assertTrue(policy.enabled)
-        self.assertEqual([provider.name for provider in policy.providers], ["gemini", "groq", "github"])
+        self.assertEqual([provider.name for provider in policy.providers], ["gemini", "github", "groq"])
+
+    def test_cloud_chat_policy_accepts_groq_without_gemini_key(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "ALLOW_CLOUD_CHAT": "1",
+                "GROQ_API_KEY": "groq-key",
+                "GROQ_MODEL": "llama-3.3-70b-versatile",
+            },
+            clear=True,
+        ):
+            policy = pipeline_module.ChatProviderPolicy.from_env()
+
+        self.assertTrue(policy.enabled)
+        self.assertEqual(policy.provider_chain(), ["groq"])
 
     def test_chat_provider_policy_reads_budget_timeouts_and_disables_cache_by_default(self):
         with patch.dict(

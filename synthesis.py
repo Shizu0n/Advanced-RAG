@@ -17,9 +17,9 @@ from pipeline import (
 )
 
 try:
-    import gemini_ragas
+    import cloud_ragas
 except ImportError:
-    gemini_ragas = None  # type: ignore
+    cloud_ragas = None  # type: ignore
 
 
 def _build_prompt(
@@ -98,14 +98,16 @@ def _build_prompt(
 
 
 def _llm_available() -> bool:
-    return gemini_ragas is not None and os.getenv("GEMINI_API_KEY") is not None
+    return cloud_ragas is not None and bool(cloud_ragas.providers_from_env())
 
 
 def _get_llm_client() -> Any:
     if not _llm_available():
-        raise RuntimeError("LLM não está disponível. Configure GEMINI_API_KEY.")
-    config = gemini_ragas.config_from_env()
-    return gemini_ragas.client_from_config(config)
+        raise RuntimeError("LLM não está disponível. Configure ao menos um provedor cloud suportado.")
+    return cloud_ragas.FreeTierCloudClient(
+        budget=cloud_ragas.CloudCallBudget(max_calls=int(os.getenv("MAX_CLOUD_CHAT_CALLS", "1"))),
+        providers=tuple(cloud_ragas.providers_from_env()),
+    )
 
 
 def synthesize_generative_answer(
@@ -128,7 +130,7 @@ def synthesize_generative_answer(
         Resposta sintetizada ou None se LLM indisponível.
     """
     if not _llm_available():
-        logger.info("LLM not available (missing GEMINI_API_KEY), skipping generative synthesis")
+        logger.info("LLM not available (missing supported cloud provider key), skipping generative synthesis")
         return None
 
     if not contexts:

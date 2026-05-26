@@ -98,7 +98,7 @@ class GoldenDatasetTests(unittest.TestCase):
                 patch.object(evaluation, "RAGAS_RESULTS_PATH", summary_path),
                 patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", detail_path),
                 patch.dict("os.environ", {}, clear=True),
-                patch.object(evaluation.gemini_ragas, "run_ragas") as run_ragas,
+                patch.object(evaluation.cloud_ragas, "run_ragas") as run_ragas,
             ):
                 evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline())
 
@@ -136,13 +136,13 @@ class GoldenDatasetTests(unittest.TestCase):
                 patch.dict(
                     "os.environ",
                     {
-                        "USE_GEMINI_FREE_RAGAS": "1",
+                        "USE_CLOUD_FREE_TIER_RAGAS": "1",
                         "ALLOW_CLOUD_FREE_TIER": "1",
                         "GEMINI_API_KEY": "key",
                     },
                     clear=True,
                 ),
-                patch.object(evaluation.gemini_ragas, "run_ragas") as run_ragas,
+                patch.object(evaluation.cloud_ragas, "run_ragas") as run_ragas,
             ):
                 evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline(), use_real_ragas=False)
 
@@ -301,7 +301,7 @@ class GoldenDatasetTests(unittest.TestCase):
 
             run.assert_called_once_with(pipeline="pipeline", use_real_ragas=False)
 
-    def test_gemini_ragas_opt_in_requires_cloud_free_tier_and_key(self):
+    def test_cloud_ragas_opt_in_requires_cloud_free_tier_and_provider(self):
         rows = [
             {
                 "question": "What is Python?",
@@ -312,7 +312,7 @@ class GoldenDatasetTests(unittest.TestCase):
         ]
 
         with (
-            patch.dict("os.environ", {"USE_GEMINI_FREE_RAGAS": "1"}, clear=True),
+            patch.dict("os.environ", {"USE_CLOUD_FREE_TIER_RAGAS": "1"}, clear=True),
             self.assertRaisesRegex(RuntimeError, "ALLOW_CLOUD_FREE_TIER"),
         ):
             evaluation.maybe_run_real_ragas(rows)
@@ -328,8 +328,9 @@ class GoldenDatasetTests(unittest.TestCase):
         ]
         recoverable = [
             requests.exceptions.Timeout("timeout"),
-            RuntimeError("MAX_GEMINI_CALLS exceeded"),
-            RuntimeError("Gemini models unavailable"),
+            RuntimeError("MAX_CLOUD_CALLS exceeded"),
+            RuntimeError("cloud providers unavailable"),
+            RuntimeError("Gemini embedding models unavailable"),
         ]
 
         for error in recoverable:
@@ -338,31 +339,31 @@ class GoldenDatasetTests(unittest.TestCase):
                 patch.dict(
                     "os.environ",
                     {
-                        "USE_GEMINI_FREE_RAGAS": "1",
+                        "USE_CLOUD_FREE_TIER_RAGAS": "1",
                         "ALLOW_CLOUD_FREE_TIER": "1",
                         "GEMINI_API_KEY": "key",
                     },
                     clear=True,
                 ),
-                patch.object(evaluation.gemini_ragas, "run_ragas", side_effect=error),
+                patch.object(evaluation.cloud_ragas, "run_ragas", side_effect=error),
             ):
-                self.assertIsNone(evaluation.maybe_run_real_ragas(rows, gemini_client=object()))
+                self.assertIsNone(evaluation.maybe_run_real_ragas(rows, cloud_client=object()))
 
         with (
             patch.dict(
                 "os.environ",
                 {
-                    "USE_GEMINI_FREE_RAGAS": "1",
+                    "USE_CLOUD_FREE_TIER_RAGAS": "1",
                     "ALLOW_CLOUD_FREE_TIER": "1",
                     "GEMINI_API_KEY": "key",
-                    "GEMINI_RAGAS_STRICT": "1",
+                    "CLOUD_RAGAS_STRICT": "1",
                 },
                 clear=True,
             ),
-            patch.object(evaluation.gemini_ragas, "run_ragas", side_effect=ValueError("bad json")),
+            patch.object(evaluation.cloud_ragas, "run_ragas", side_effect=ValueError("bad json")),
             self.assertRaisesRegex(ValueError, "bad json"),
         ):
-            evaluation.maybe_run_real_ragas(rows, gemini_client=object())
+            evaluation.maybe_run_real_ragas(rows, cloud_client=object())
 
     def test_integration_errors_do_not_fall_back_silently(self):
         rows = [
@@ -378,18 +379,59 @@ class GoldenDatasetTests(unittest.TestCase):
             patch.dict(
                 "os.environ",
                 {
-                    "USE_GEMINI_FREE_RAGAS": "1",
+                    "USE_CLOUD_FREE_TIER_RAGAS": "1",
                     "ALLOW_CLOUD_FREE_TIER": "1",
                     "GEMINI_API_KEY": "key",
                 },
                 clear=True,
             ),
-            patch.object(evaluation.gemini_ragas, "run_ragas", side_effect=ValueError("schema bug")),
+            patch.object(evaluation.cloud_ragas, "run_ragas", side_effect=ValueError("schema bug")),
             self.assertRaisesRegex(ValueError, "schema bug"),
         ):
-            evaluation.maybe_run_real_ragas(rows, gemini_client=object())
+            evaluation.maybe_run_real_ragas(rows, cloud_client=object())
 
-    def test_run_evaluation_reuses_one_gemini_client_across_strategies(self):
+    def test_real_ragas_uses_bounded_row_sample(self):
+        rows = [
+            {
+                "question": f"Question {index}?",
+                "answer": "Answer",
+                "contexts": '["context"]',
+                "ground_truth": "Answer",
+            }
+            for index in range(10)
+        ]
+        client = object()
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "USE_CLOUD_FREE_TIER_RAGAS": "1",
+                    "ALLOW_CLOUD_FREE_TIER": "1",
+                    "GEMINI_API_KEY": "key",
+                    "MAX_REAL_RAGAS_ROWS": "3",
+                },
+                clear=True,
+            ),
+            patch.object(
+                evaluation.cloud_ragas,
+                "run_ragas",
+                return_value={
+                    "faithfulness": 0.9,
+                    "answer_relevancy": 0.8,
+                    "context_recall": 0.7,
+                    "context_precision": 0.6,
+                },
+            ) as run_ragas,
+        ):
+            scores = evaluation.maybe_run_real_ragas(rows, cloud_client=client)
+
+        self.assertEqual(scores["faithfulness"], 0.9)
+        sampled_rows = run_ragas.call_args.args[0]
+        self.assertEqual(len(sampled_rows), 3)
+        self.assertEqual([row["question"] for row in sampled_rows], ["Question 0?", "Question 1?", "Question 2?"])
+
+    def test_run_evaluation_reuses_one_cloud_client_across_strategies(self):
         with TemporaryDirectory() as tmpdir:
             golden_path = Path(tmpdir) / "golden_dataset.json"
             golden_path.write_text(
@@ -415,15 +457,15 @@ class GoldenDatasetTests(unittest.TestCase):
                 patch.dict(
                     "os.environ",
                     {
-                        "USE_GEMINI_FREE_RAGAS": "1",
+                        "USE_CLOUD_FREE_TIER_RAGAS": "1",
                         "ALLOW_CLOUD_FREE_TIER": "1",
                         "GEMINI_API_KEY": "key",
                     },
                     clear=True,
                 ),
-                patch.object(evaluation.gemini_ragas, "client_from_config", return_value=client),
+                patch.object(evaluation.cloud_ragas, "client_from_config", return_value=client),
                 patch.object(
-                    evaluation.gemini_ragas,
+                    evaluation.cloud_ragas,
                     "run_ragas",
                     return_value={
                         "faithfulness": 0.9,
@@ -436,7 +478,7 @@ class GoldenDatasetTests(unittest.TestCase):
                 evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline())
 
             clients = [
-                call.kwargs["gemini_client"]
+                call.kwargs["cloud_client"]
                 for call in run_ragas.call_args_list
             ]
             self.assertEqual(clients, [client, client])
@@ -474,22 +516,22 @@ class GoldenDatasetTests(unittest.TestCase):
                 patch.dict(
                     "os.environ",
                     {
-                        "USE_GEMINI_FREE_RAGAS": "1",
+                        "USE_CLOUD_FREE_TIER_RAGAS": "1",
                         "ALLOW_CLOUD_FREE_TIER": "1",
                         "GEMINI_API_KEY": "key",
                     },
                     clear=True,
                 ),
-                patch.object(evaluation.gemini_ragas, "client_from_config", return_value=object()),
-                patch.object(evaluation.gemini_ragas, "run_ragas", return_value=ragas_scores),
+                patch.object(evaluation.cloud_ragas, "client_from_config", return_value=object()),
+                patch.object(evaluation.cloud_ragas, "run_ragas", return_value=ragas_scores),
             ):
                 evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline())
 
             detail = pd.read_csv(detail_path)
             summary = pd.read_csv(summary_path)
             self.assertEqual(detail.loc[0, "evaluation_backend"], "offline_heuristic")
-            self.assertEqual(detail.loc[0, "summary_backend"], "gemini_free_tier_ragas")
-            self.assertEqual(summary.loc[0, "summary_backend"], "gemini_free_tier_ragas")
+            self.assertEqual(detail.loc[0, "summary_backend"], "cloud_free_tier_ragas")
+            self.assertEqual(summary.loc[0, "summary_backend"], "cloud_free_tier_ragas")
 
     def test_requirements_exclude_direct_paid_provider_dependencies(self):
         requirements = Path("requirements.txt").read_text(encoding="utf-8").lower()

@@ -15,7 +15,7 @@ from typing import Any, Protocol, Sequence
 import pandas as pd
 import requests
 
-import gemini_ragas
+import cloud_ragas
 from pipeline import LocalRAGPipeline, load_local_context_nodes
 
 
@@ -118,23 +118,23 @@ class OfflineExtractiveQuestionProvider:
 
 
 @dataclass
-class GeminiQuestionProvider:
-    gemini_client: gemini_ragas.GeminiFreeTierClient | None = None
-    cache_dir: Path = gemini_ragas.DEFAULT_CACHE_DIR
+class CloudQuestionProvider:
+    cloud_client: cloud_ragas.FreeTierCloudClient | None = None
+    cache_dir: Path = cloud_ragas.DEFAULT_CACHE_DIR
     max_calls: int = 120
-    name: str = "gemini_2_5_flash"
+    name: str = "cloud_free_tier"
 
     @property
     def enabled(self) -> bool:
-        return bool(self.gemini_client) or (
-            gemini_ragas.gemini_ragas_enabled() and os.getenv("ALLOW_CLOUD_FREE_TIER") == "1"
+        return bool(self.cloud_client) or (
+            cloud_ragas.cloud_ragas_enabled() and os.getenv("ALLOW_CLOUD_FREE_TIER") == "1"
         )
 
     def generate(self, node: Any) -> dict[str, str]:
         if not self.enabled:
-            raise RuntimeError("Gemini disabled; set USE_GEMINI_FREE_RAGAS=1 and ALLOW_CLOUD_FREE_TIER=1.")
+            raise RuntimeError("Cloud RAGAS disabled; set USE_CLOUD_FREE_TIER_RAGAS=1 and ALLOW_CLOUD_FREE_TIER=1.")
 
-        client = self.gemini_client or gemini_ragas.client_from_config(gemini_ragas.config_from_env())
+        client = self.cloud_client or cloud_ragas.client_from_config(cloud_ragas.config_from_env())
         context = _node_text(node)[:6000]
         prompt = (
             "Generate one evaluation question and one ground truth answer from this context. "
@@ -146,11 +146,11 @@ class GeminiQuestionProvider:
 
 
 def default_question_providers(
-    gemini_client: gemini_ragas.GeminiFreeTierClient | None = None,
+    cloud_client: cloud_ragas.FreeTierCloudClient | None = None,
 ) -> list[QuestionProvider]:
-    if gemini_client is None and gemini_ragas.gemini_ragas_enabled() and os.getenv("ALLOW_CLOUD_FREE_TIER") == "1":
-        gemini_client = gemini_ragas.client_from_config(gemini_ragas.config_from_env())
-    return [GeminiQuestionProvider(gemini_client=gemini_client), OfflineExtractiveQuestionProvider()]
+    if cloud_client is None and cloud_ragas.cloud_ragas_enabled() and os.getenv("ALLOW_CLOUD_FREE_TIER") == "1":
+        cloud_client = cloud_ragas.client_from_config(cloud_ragas.config_from_env())
+    return [CloudQuestionProvider(cloud_client=cloud_client), OfflineExtractiveQuestionProvider()]
 
 
 def generate_golden_item(node: Any, providers: Sequence[QuestionProvider]) -> dict[str, str]:
@@ -301,7 +301,7 @@ def offline_metric_scores(question: str, answer: str, contexts: Sequence[str], g
 
 
 def _real_ragas_enabled() -> bool:
-    return gemini_ragas.gemini_ragas_enabled()
+    return cloud_ragas.cloud_ragas_enabled()
 
 
 def _index_build_enabled() -> bool:
@@ -342,41 +342,49 @@ def evaluate_strategy(
     return summary, rows
 
 
-def _strict_gemini_ragas_enabled() -> bool:
-    return os.getenv("GEMINI_RAGAS_STRICT") == "1"
+def _strict_cloud_ragas_enabled() -> bool:
+    return os.getenv("CLOUD_RAGAS_STRICT") == "1"
+
+
+def _max_real_ragas_rows() -> int:
+    raw_value = os.getenv("MAX_REAL_RAGAS_ROWS", "3")
+    try:
+        return max(1, int(raw_value))
+    except ValueError:
+        return 3
 
 
 def maybe_run_real_ragas(
     rows: Sequence[dict[str, Any]],
-    gemini_client: gemini_ragas.GeminiFreeTierClient | None = None,
+    cloud_client: cloud_ragas.FreeTierCloudClient | None = None,
     enabled: bool | None = None,
 ) -> dict[str, float] | None:
     if enabled is False or not _real_ragas_enabled():
         return None
 
-    config = gemini_ragas.config_from_env() if gemini_client is None else None
-    client = gemini_client or gemini_ragas.client_from_config(config)
+    config = cloud_ragas.config_from_env() if cloud_client is None else None
+    client = cloud_client or cloud_ragas.client_from_config(config)
     try:
         budget = getattr(client, "budget", None)
-        return gemini_ragas.run_ragas(
-            rows,
-            api_key=config.api_key if config else getattr(client, "api_key", ""),
-            cache_dir=config.cache_dir if config else getattr(client, "cache_dir", gemini_ragas.DEFAULT_CACHE_DIR),
+        sampled_rows = list(rows)[: _max_real_ragas_rows()]
+        return cloud_ragas.run_ragas(
+            sampled_rows,
+            cache_dir=config.cache_dir if config else getattr(client, "cache_dir", cloud_ragas.DEFAULT_CACHE_DIR),
             max_calls=config.max_calls if config else getattr(budget, "max_calls", 120),
-            gemini_client=client,
+            cloud_client=client,
         )
     except (
-        gemini_ragas.GeminiCloudUnavailable,
+        cloud_ragas.CloudProviderUnavailable,
         requests.exceptions.RequestException,
     ):
-        if _strict_gemini_ragas_enabled():
+        if _strict_cloud_ragas_enabled():
             raise
         return None
     except RuntimeError as exc:
-        if _strict_gemini_ragas_enabled():
+        if _strict_cloud_ragas_enabled():
             raise
         message = str(exc)
-        if "MAX_GEMINI_CALLS" in message or "cloud providers unavailable" in message or "Gemini models unavailable" in message:
+        if "MAX_CLOUD_CALLS" in message or "cloud providers unavailable" in message or "Gemini embedding models unavailable" in message:
             return None
         raise
 
@@ -384,7 +392,7 @@ def maybe_run_real_ragas(
 def run_evaluation(
     golden_path: Path = GOLDEN_DATASET_PATH,
     pipeline: LocalRAGPipeline | None = None,
-    gemini_client: gemini_ragas.GeminiFreeTierClient | None = None,
+    cloud_client: cloud_ragas.FreeTierCloudClient | None = None,
     use_real_ragas: bool | None = None,
 ) -> dict[str, dict[str, float]]:
     logger.info("run_evaluation: loading golden dataset from %s", golden_path)
@@ -393,8 +401,8 @@ def run_evaluation(
     pipeline = pipeline or LocalRAGPipeline()
     if use_real_ragas is None:
         use_real_ragas = _real_ragas_enabled()
-    if use_real_ragas and gemini_client is None:
-        gemini_client = gemini_ragas.client_from_config(gemini_ragas.config_from_env())
+    if use_real_ragas and cloud_client is None:
+        cloud_client = cloud_ragas.client_from_config(cloud_ragas.config_from_env())
     summaries: dict[str, dict[str, float]] = {}
     summary_backends: dict[str, str] = {}
     detail_rows: list[dict[str, Any]] = []
@@ -402,8 +410,8 @@ def run_evaluation(
     for strategy in STRATEGIES:
         logger.info("Evaluating strategy: %s", strategy)
         summary, rows = evaluate_strategy(dataset, strategy, pipeline)
-        real_scores = maybe_run_real_ragas(rows, gemini_client=gemini_client, enabled=use_real_ragas)
-        summary_backend = "gemini_free_tier_ragas" if real_scores else "offline_heuristic"
+        real_scores = maybe_run_real_ragas(rows, cloud_client=cloud_client, enabled=use_real_ragas)
+        summary_backend = "cloud_free_tier_ragas" if real_scores else "offline_heuristic"
         for row in rows:
             row["summary_backend"] = summary_backend
         summaries[strategy] = real_scores or summary
@@ -489,8 +497,8 @@ def main(use_real_ragas: bool | None = None) -> None:
     nodes: Sequence[Any] | None = None
     if use_real_ragas is None:
         use_real_ragas = _real_ragas_enabled()
-    gemini_client = (
-        gemini_ragas.client_from_config(gemini_ragas.config_from_env()) if use_real_ragas else None
+    cloud_client = (
+        cloud_ragas.client_from_config(cloud_ragas.config_from_env()) if use_real_ragas else None
     )
     invalidate_golden_dataset_if_stale()
     try:
@@ -509,18 +517,18 @@ def main(use_real_ragas: bool | None = None) -> None:
                     "Add files under data/raw or data/eval, or set ALLOW_INDEX_BUILD=1 to allow "
                     "scraping/model setup explicitly."
                 )
-        if gemini_client:
+        if cloud_client:
             generate_golden_dataset(
                 nodes,
                 output_path=GOLDEN_DATASET_PATH,
-                providers=default_question_providers(gemini_client=gemini_client),
+                providers=default_question_providers(cloud_client=cloud_client),
             )
         else:
             generate_golden_dataset(nodes, output_path=GOLDEN_DATASET_PATH)
 
     pipeline = pipeline or LocalRAGPipeline(nodes=nodes, allow_index_build=False)
-    if gemini_client:
-        run_evaluation(pipeline=pipeline, gemini_client=gemini_client, use_real_ragas=use_real_ragas)
+    if cloud_client:
+        run_evaluation(pipeline=pipeline, cloud_client=cloud_client, use_real_ragas=use_real_ragas)
     else:
         run_evaluation(pipeline=pipeline, use_real_ragas=use_real_ragas)
 

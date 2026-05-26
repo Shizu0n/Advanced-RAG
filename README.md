@@ -29,7 +29,7 @@ flowchart TD
     PIPE["pipeline.py (Orchestrator)<br/>Intent detection → Query rewriting → Strategy selection<br/>→ Confidence scoring → Answer synthesis"]
     RET["retrieval.py<br/>BM25 + Vector + RRF + Reranker<br/>4 strategies: semantic, bm25, hybrid, hybrid+rerank"]
     SYN["synthesis.py<br/>Generative + Extractive fallback"]
-    GEM["gemini_ragas.py<br/>Cloud provider client, fallback chain, budgets, caching"]
+    CLOUD["cloud_ragas.py<br/>Free-tier cloud provider client, fallback chain, budgets, caching"]
     ING["ingestion.py<br/>Chunking → Embedding → ChromaDB"]
     SRC["source_loader.py<br/>Local files + GitHub repos + Hugging Face cards"]
     EVA["evaluate.py<br/>Golden dataset + Offline heuristics + RAGAS integration"]
@@ -37,7 +37,7 @@ flowchart TD
     APP --> PIPE
     PIPE --> RET
     PIPE --> SYN
-    SYN --> GEM
+    SYN --> CLOUD
     RET --> ING
     ING --> SRC
     RET --> EVA
@@ -51,7 +51,7 @@ Core modules:
 - `pipeline.py` — coordinates query analysis, retrieval, synthesis, and fallback behavior
 - `synthesis.py` — handles generative and extractive answer synthesis
 - `evaluate.py` — generates golden datasets and runs evaluation
-- `gemini_ragas.py` — integrates optional free-tier cloud providers for synthesis and RAGAS evaluation
+- `cloud_ragas.py` — integrates optional free-tier cloud providers for synthesis and RAGAS evaluation
 - `app.py` — Streamlit interface for source preparation, querying, and evaluation
 
 ## Runtime Behavior
@@ -146,10 +146,11 @@ These variables affect evaluation only. They do not enable query-time cloud chat
 
 | Variable | Default | What it does |
 |---|---:|---|
-| `USE_GEMINI_FREE_RAGAS` | `0` | Enables Gemini-backed RAGAS evaluation paths |
+| `USE_CLOUD_FREE_TIER_RAGAS` | `0` | Enables cloud-backed RAGAS evaluation paths |
 | `ALLOW_CLOUD_FREE_TIER` | `0` | Allows cloud-backed free-tier evaluation flows |
-| `MAX_GEMINI_CALLS` | `120` | Sets the maximum evaluation API call budget |
-| `GEMINI_RAGAS_STRICT` | `0` | When `1`, evaluation fails hard instead of falling back to offline heuristics |
+| `MAX_CLOUD_CALLS` | `120` | Sets the maximum evaluation API call budget |
+| `CLOUD_RAGAS_STRICT` | `0` | When `1`, evaluation fails hard instead of falling back to offline heuristics |
+| `CLOUD_PROVIDER_ORDER` | `gemini,github,groq` | Configures the allowlisted provider fallback order |
 
 ### Session Overrides in the UI
 
@@ -161,12 +162,12 @@ The Streamlit UI exposes session-scoped toggles for:
 - `ALLOW_INDEX_BUILD`
 - `ALLOW_MODEL_DOWNLOADS`
 - `ALLOW_CLOUD_CHAT`
-- `USE_GEMINI_FREE_RAGAS`
+- `USE_CLOUD_FREE_TIER_RAGAS`
 - `ALLOW_CLOUD_FREE_TIER`
 
 These toggles use `.env` as the default source of truth, apply only to the current Streamlit session, and do not rewrite `.env`.
 
-Advanced limits such as `MAX_GEMINI_CALLS`, `CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS`, and `GEMINI_RAGAS_STRICT` remain environment-only.
+Advanced limits such as `MAX_CLOUD_CALLS`, `CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS`, and `CLOUD_RAGAS_STRICT` remain environment-only.
 
 ## Usage
 
@@ -251,7 +252,7 @@ ALLOW_CLOUD_CHAT=0 streamlit run app.py
 
 ```bash
 python evaluate.py
-USE_GEMINI_FREE_RAGAS=1 ALLOW_CLOUD_FREE_TIER=1 python evaluate.py
+USE_CLOUD_FREE_TIER_RAGAS=1 ALLOW_CLOUD_FREE_TIER=1 python evaluate.py
 ```
 
 Outputs:
@@ -269,7 +270,7 @@ Outputs:
 | Context recall | Whether retrieval captured the needed information |
 | Context precision | Whether retrieved context is focused rather than noisy |
 
-Offline heuristics use local overlap-based scoring. RAGAS evaluation uses Gemini as the judge model with local embeddings and no paid-provider dependency.
+Offline heuristics use local overlap-based scoring. Cloud RAGAS evaluation uses supported free-tier providers with local embeddings and no paid-provider dependency.
 
 ## Testing
 

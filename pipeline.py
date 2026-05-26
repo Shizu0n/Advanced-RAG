@@ -243,11 +243,11 @@ class ChatProviderPolicy:
     def from_env(cls) -> "ChatProviderPolicy":
         if not _env_enabled_by_default("ALLOW_CLOUD_CHAT"):
             return cls(enabled=False, providers=())
-        import gemini_ragas
+        import cloud_ragas
 
         return cls(
             enabled=True,
-            providers=tuple(gemini_ragas.providers_from_env()),
+            providers=tuple(cloud_ragas.providers_from_env()),
             max_calls=int(os.getenv("MAX_CLOUD_CHAT_CALLS", "1")),
             provider_timeout_seconds=float(os.getenv("CLOUD_CHAT_PROVIDER_TIMEOUT_SECONDS", "30")),
             total_timeout_seconds=float(os.getenv("CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS", "60")),
@@ -1054,13 +1054,11 @@ def _extract_technologies(contexts: Sequence[str], query: str = "") -> list[str]
 
 class ChatLLMClient:
     def __init__(self, policy: ChatProviderPolicy) -> None:
-        import gemini_ragas
+        import cloud_ragas
 
-        api_key = next((provider.api_key for provider in policy.providers if provider.name == "gemini"), policy.providers[0].api_key)
         self.cache_enabled = policy.cache_enabled
-        self.client = gemini_ragas.GeminiFreeTierClient(
-            api_key=api_key,
-            budget=gemini_ragas.GeminiCallBudget(max_calls=policy.max_calls),
+        self.client = cloud_ragas.FreeTierCloudClient(
+            budget=cloud_ragas.CloudCallBudget(max_calls=policy.max_calls),
             providers=policy.providers,
         )
 

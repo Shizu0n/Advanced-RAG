@@ -215,7 +215,7 @@ class AppHelperTests(unittest.TestCase):
             path = Path(tmpdir) / "ragas_results.csv"
             path.write_text(
                 "strategy,faithfulness,answer_relevancy,context_recall,context_precision,summary_backend\n"
-                "semantic_only,0.1,0.2,0.3,0.4,gemini_free_tier_ragas\n",
+                "semantic_only,0.1,0.2,0.3,0.4,cloud_free_tier_ragas\n",
                 encoding="utf-8",
             )
 
@@ -223,7 +223,7 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertEqual(frame.loc[0, "strategy"], "semantic_only")
         self.assertEqual(frame.loc[0, "faithfulness"], 0.1)
-        self.assertEqual(frame.loc[0, "summary_backend"], "gemini_free_tier_ragas")
+        self.assertEqual(frame.loc[0, "summary_backend"], "cloud_free_tier_ragas")
         self.assertEqual(list(frame.columns), ["strategy", *app.METRICS, "summary_backend", "evaluated_source"])
 
     def test_load_per_question_handles_empty_csv_file(self):
@@ -501,14 +501,14 @@ class AppHelperTests(unittest.TestCase):
         json_payloads = [event[1] for event in fake_st.events if event[0] == "json"]
         self.assertTrue(any(payload.get("used_rerank") is False for payload in json_payloads if isinstance(payload, dict)))
 
-    def test_run_query_allows_index_build_by_default(self):
+    def test_run_query_uses_existing_index_without_rebuilding(self):
         with patch("pipeline.answer_query", return_value={"answer": "ok"}) as query:
             result = app.run_query("question", "bm25_only")
 
         self.assertEqual(result["answer"], "ok")
-        query.assert_called_once_with("question", strategy="bm25_only", allow_index_build=True)
+        query.assert_called_once_with("question", strategy="bm25_only", allow_index_build=False)
 
-    def test_run_chat_query_allows_index_build_by_default(self):
+    def test_run_chat_query_uses_existing_index_without_rebuilding(self):
         history = [{"role": "user", "content": "before"}]
         with patch("pipeline.chat_query", return_value={"answer": "ok"}) as query:
             result = app.run_chat_query("question", history, "bm25_only")
@@ -518,7 +518,7 @@ class AppHelperTests(unittest.TestCase):
             "question",
             history=history,
             strategy="bm25_only",
-            allow_index_build=True,
+            allow_index_build=False,
         )
 
     def test_query_tab_persists_chat_messages_in_session_state(self):
@@ -599,7 +599,7 @@ class AppHelperTests(unittest.TestCase):
         summary = pd.DataFrame(
             [
                 {"strategy": "semantic_only", "summary_backend": "offline_heuristic"},
-                {"strategy": "hybrid_rerank", "summary_backend": "gemini_free_tier_ragas"},
+                {"strategy": "hybrid_rerank", "summary_backend": "cloud_free_tier_ragas"},
             ]
         )
         per_question = pd.DataFrame(
@@ -611,7 +611,7 @@ class AppHelperTests(unittest.TestCase):
 
         counts = app.eval_backend_counts(summary, per_question)
 
-        self.assertEqual(counts["summary_backends"]["gemini_free_tier_ragas"], 1)
+        self.assertEqual(counts["summary_backends"]["cloud_free_tier_ragas"], 1)
         self.assertEqual(counts["question_backends"]["offline_heuristic"], 2)
 
     def test_default_eval_paths_are_project_local_when_cwd_changes(self):
@@ -819,7 +819,7 @@ class AppHelperTests(unittest.TestCase):
         self.assertIn("ALLOW_HF_FETCH=1", text)
         self.assertIn("ALLOW_INDEX_BUILD=0", text)
         self.assertIn("ALLOW_CLOUD_CHAT=0", text)
-        self.assertIn("USE_GEMINI_FREE_RAGAS=1", text)
+        self.assertIn("USE_CLOUD_FREE_TIER_RAGAS=1", text)
 
     def test_is_golden_dataset_stale_returns_true_for_different_source(self):
         with TemporaryDirectory() as tmpdir:
@@ -866,16 +866,16 @@ class AppHelperTests(unittest.TestCase):
 
 
 class EvalTabTests(unittest.TestCase):
-    def test_eval_tab_runs_gemini_ragas_with_session_gate_overrides(self):
+    def test_eval_tab_runs_cloud_ragas_with_session_gate_overrides(self):
         fake_st = FakeStreamlit()
         fake_st._button_return_by_label = {
             "Generate pre-questions": False,
             "Run fast evaluation": False,
-            "Run Gemini RAGAS": True,
+            "Run Cloud RAGAS": True,
         }
         fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {
-            "USE_GEMINI_FREE_RAGAS": True,
+            "USE_CLOUD_FREE_TIER_RAGAS": True,
             "ALLOW_CLOUD_FREE_TIER": True,
         }
         current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
@@ -883,7 +883,7 @@ class EvalTabTests(unittest.TestCase):
 
         def capture_eval(use_real_ragas=True):
             observed["use_real_ragas"] = use_real_ragas
-            observed["USE_GEMINI_FREE_RAGAS"] = os.getenv("USE_GEMINI_FREE_RAGAS")
+            observed["USE_CLOUD_FREE_TIER_RAGAS"] = os.getenv("USE_CLOUD_FREE_TIER_RAGAS")
             observed["ALLOW_CLOUD_FREE_TIER"] = os.getenv("ALLOW_CLOUD_FREE_TIER")
 
         with TemporaryDirectory() as tmpdir:
@@ -909,7 +909,7 @@ class EvalTabTests(unittest.TestCase):
                 app._render_eval_tab(fake_st)
 
         self.assertTrue(observed["use_real_ragas"])
-        self.assertEqual(observed["USE_GEMINI_FREE_RAGAS"], "1")
+        self.assertEqual(observed["USE_CLOUD_FREE_TIER_RAGAS"], "1")
         self.assertEqual(observed["ALLOW_CLOUD_FREE_TIER"], "1")
 
     def test_eval_tab_generates_pre_questions_without_running_full_evaluation(self):
@@ -917,7 +917,7 @@ class EvalTabTests(unittest.TestCase):
         fake_st._button_return_by_label = {
             "Generate pre-questions": True,
             "Run fast evaluation": False,
-            "Run Gemini RAGAS": False,
+            "Run Cloud RAGAS": False,
         }
         fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
@@ -953,7 +953,7 @@ class EvalTabTests(unittest.TestCase):
         fake_st._button_return_by_label = {
             "Generate pre-questions": False,
             "Run fast evaluation": True,
-            "Run Gemini RAGAS": False,
+            "Run Cloud RAGAS": False,
         }
         fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
@@ -1092,7 +1092,7 @@ class EvalTabTests(unittest.TestCase):
         buttons = [event[1] for event in fake_st.events if event[0] == "button"]
         self.assertIn("Generate pre-questions", buttons)
         self.assertIn("Run fast evaluation", buttons)
-        self.assertIn("Run Gemini RAGAS", buttons)
+        self.assertIn("Run Cloud RAGAS", buttons)
 
 
 class SourceBadgeTests(unittest.TestCase):
@@ -1257,6 +1257,7 @@ class SourcesTabTests(unittest.TestCase):
         success_events = [event[1] for event in fake_st.events if event[0] == "success"]
         self.assertTrue(any("2 chunks" in s for s in success_events))
         self.assertTrue(any("test-repo" in s for s in success_events))
+        self.assertIn(("rerun",), fake_st.events)
 
     def test_build_index_uses_sidebar_index_gate_override(self):
         fake_st = FakeStreamlit()
@@ -1380,17 +1381,17 @@ class SourcesTabTests(unittest.TestCase):
         self.assertIn("Allow index build", labels)
         self.assertIn("Allow model downloads", labels)
         self.assertIn("Allow cloud chat", labels)
-        self.assertIn("Use Gemini RAGAS", labels)
+        self.assertIn("Use Cloud RAGAS", labels)
         self.assertIn("Allow cloud free tier", labels)
-        self.assertNotIn("MAX_GEMINI_CALLS", labels)
+        self.assertNotIn("MAX_CLOUD_CALLS", labels)
         self.assertNotIn("CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS", labels)
-        self.assertNotIn("GEMINI_RAGAS_STRICT", labels)
+        self.assertNotIn("CLOUD_RAGAS_STRICT", labels)
 
     def test_sidebar_shows_green_badge_when_indexed(self):
         fake_st = FakeStreamlit()
         with (
             patch("app.load_current_source", return_value={"source_slug": "test-repo", "indexed_at": "2025-01-01"}),
-            patch("app.get_source_badge_state", return_value="green"),
+            patch("app._has_chroma_index", return_value=True),
             patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
             patch("app.last_eval_date", return_value="2025-01-15 10:00"),
         ):
@@ -1636,7 +1637,7 @@ class QueryTabWarningTests(unittest.TestCase):
         button_labels = [event[1] for event in fake_st.events if event[0] == "button"]
         self.assertNotIn("Generate pre-questions", button_labels)
         self.assertNotIn("Run fast evaluation", button_labels)
-        self.assertNotIn("Run Gemini RAGAS", button_labels)
+        self.assertNotIn("Run Cloud RAGAS", button_labels)
 
     def test_current_source_for_ui_treats_slug_case_difference_as_same_source(self):
         fake_st = FakeStreamlit()
@@ -1648,6 +1649,18 @@ class QueryTabWarningTests(unittest.TestCase):
             result = app._current_source_for_ui(fake_st)
 
         self.assertEqual(result, indexed)
+
+    def test_cleanup_pending_source_clears_case_only_slug_match(self):
+        fake_st = FakeStreamlit()
+        fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "Shizu0n-ReferralSystem", "indexed_at": None}
+        fake_st.session_state["prepared_files"] = [Path("data/raw/Shizu0n-ReferralSystem/README.md")]
+        indexed = {"source_slug": "shizu0n-referralsystem", "indexed_at": "2026-05-24T00:00:00+00:00"}
+
+        with patch("app.load_current_source", return_value=indexed):
+            app._cleanup_pending_source_if_index_matches(fake_st)
+
+        self.assertNotIn(app.PREPARED_SOURCE_KEY, fake_st.session_state)
+        self.assertNotIn("prepared_files", fake_st.session_state)
 
     def test_query_tab_resets_chat_history_when_indexed_source_changes(self):
         fake_st = FakeStreamlit(messages=[{"role": "user", "content": "old source question"}])
@@ -1831,7 +1844,7 @@ class QueryTabWarningTests(unittest.TestCase):
         button_labels = [event[1] for event in fake_st.events if event[0] == "button"]
         self.assertIn("Generate pre-questions", button_labels)
         self.assertIn("Run fast evaluation", button_labels)
-        self.assertIn("Run Gemini RAGAS", button_labels)
+        self.assertIn("Run Cloud RAGAS", button_labels)
 
     def test_build_index_without_allow_index_build_surfaces_actionable_error(self):
         fake_st = FakeStreamlit()
@@ -1892,7 +1905,7 @@ class QueryTabWarningTests(unittest.TestCase):
         button_labels = [event[1] for event in fake_st.events if event[0] == "button"]
         self.assertNotIn("Generate pre-questions", button_labels)
         self.assertNotIn("Run fast evaluation", button_labels)
-        self.assertNotIn("Run Gemini RAGAS", button_labels)
+        self.assertNotIn("Run Cloud RAGAS", button_labels)
         self.assertFalse(any(event[0] == "metric" for event in fake_st.events))
         self.assertFalse(any(event[0] == "subheader" and event[1] == "Evaluation summary" for event in fake_st.events))
 
@@ -1972,6 +1985,24 @@ class QueryTabWarningTests(unittest.TestCase):
 
         sidebar_warnings = [event[1] for event in fake_st.events if event[0] == "sidebar_warning"]
         self.assertTrue(any("phi3-mini-sql-generator" in w for w in sidebar_warnings))
+
+    def test_sidebar_badge_uses_prepared_source_even_when_old_index_exists(self):
+        fake_st = FakeStreamlit()
+        prepared = {"source_slug": "new-source", "indexed_at": None}
+        with (
+            patch("app._current_source_for_ui", return_value=prepared),
+            patch("app.get_source_badge_state", return_value="green"),
+            patch("app._has_chroma_index", return_value=True),
+            patch("app.load_current_source", return_value={"source_slug": "old-source", "indexed_at": "2026-05-24T00:00:00+00:00"}),
+            patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+            patch("app.last_eval_date", return_value="Not available"),
+        ):
+            app._render_sidebar(fake_st)
+
+        sidebar_warnings = [event[1] for event in fake_st.events if event[0] == "sidebar_warning"]
+        sidebar_successes = [event[1] for event in fake_st.events if event[0] == "sidebar_success"]
+        self.assertTrue(any("new-source" in warning for warning in sidebar_warnings))
+        self.assertFalse(any("new-source" in success for success in sidebar_successes))
 
     def test_build_index_success_clears_pending_prepared_info(self):
         fake_st = FakeStreamlit()

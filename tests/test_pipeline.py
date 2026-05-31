@@ -647,6 +647,140 @@ npm install.
         self.assertIn("incrementReferrerScore", result["answer"])
         self.assertNotIn("import { ReferralCodeUtil", result["answer"])
 
+    def test_database_question_prioritizes_database_module_over_maintenance_script(self):
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="clear-db",
+                            text="Script para limpar o banco de dados SQLite. const dbPath = path.join(__dirname, 'database/referral-system.db');",
+                            metadata={"file_name": "backend/clear-database.js"},
+                        ),
+                        score=2.0,
+                    ),
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="database-module",
+                            text="TypeOrmModule.forRoot({ type: 'sqlite', database: 'database/referral-system.db', entities: [User], synchronize: true })",
+                            metadata={"file_name": "backend/src/database/database.module.ts"},
+                        ),
+                        score=0.5,
+                    ),
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="user-entity",
+                            text="@Entity('users') export class User { @PrimaryGeneratedColumn('uuid') id: string; }",
+                            metadata={"file_name": "backend/src/users/user.entity.ts"},
+                        ),
+                        score=0.4,
+                    ),
+                ],
+                {"strategy": strategy, "used_rerank": False},
+            )
+        )
+        pipeline = LocalRAGPipeline(nodes=[], retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "Which database configuration is used by the backend and how is the User entity registered?",
+                strategy="bm25_only",
+            )
+
+        self.assertIn("backend/src/database/database.module.ts", result["answer"])
+        self.assertIn("database/referral-system.db", result["answer"])
+        self.assertNotIn("backend/clear-database.js", result["answer"])
+
+    def test_users_service_question_prioritizes_get_profile_source(self):
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="auth-service",
+                            text="return { referralLink: referralLink, accessToken };",
+                            metadata={"file_name": "backend/src/auth/auth.service.ts"},
+                        ),
+                        score=2.0,
+                    ),
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="users-service",
+                            text=(
+                                "async getProfile(userId: string) { const user = await this.findById(userId); "
+                                "const referralLink = this.generateReferralLink(user.referralCode); "
+                                "return { id: user.id, name: user.name, referralCode: user.referralCode, referralLink: referralLink }; }"
+                            ),
+                            metadata={"file_name": "backend/src/users/users.service.ts"},
+                        ),
+                        score=0.5,
+                    ),
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="app-service",
+                            text="getHello(): string { return 'Hello World!'; }",
+                            metadata={"file_name": "backend/src/app.service.ts"},
+                        ),
+                        score=1.5,
+                    ),
+                ],
+                {"strategy": strategy, "used_rerank": False},
+            )
+        )
+        pipeline = LocalRAGPipeline(nodes=[], retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "What does UsersService.getProfile return and how does it build referralLink?",
+                strategy="bm25_only",
+            )
+
+        first_bullet = result["answer"].splitlines()[1]
+        self.assertIn("backend/src/users/users.service.ts", first_bullet)
+        self.assertIn("generateReferralLink", result["answer"])
+        self.assertNotIn("backend/src/app.service.ts", result["answer"])
+
+    def test_token_request_question_includes_cache_and_authorization_sources(self):
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="api-service",
+                            text=(
+                                "static async getProfile(token: string): Promise<any> { "
+                                "return fetchWithTimeout(`${API_URL}/user/profile`, { "
+                                "headers: { 'Authorization': `Bearer ${token.trim()}` } }); }"
+                            ),
+                            metadata={"file_name": "frontend/src/services/api.ts"},
+                        ),
+                        score=0.5,
+                    ),
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="cache",
+                            text="export const getAuthToken = (): string | null => localStorage.getItem('token'); export const setAuthToken = (token: string): void => localStorage.setItem('token', token);",
+                            metadata={"file_name": "frontend/src/utils/cache.ts"},
+                        ),
+                        score=0.5,
+                    ),
+                ],
+                {"strategy": strategy, "used_rerank": False},
+            )
+        )
+        pipeline = LocalRAGPipeline(nodes=[], retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "In the frontend, where is the auth token stored and how is it attached to API requests?",
+                strategy="bm25_only",
+            )
+
+        self.assertIn("frontend/src/utils/cache.ts", result["answer"])
+        self.assertIn("localStorage", result["answer"])
+        self.assertIn("frontend/src/services/api.ts", result["answer"])
+        self.assertIn("Authorization", result["answer"])
+
     def test_chat_query_stack_aggregates_technologies_with_evidence(self):
         nodes = [
             pipeline_module.LocalTextNode(

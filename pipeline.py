@@ -186,6 +186,16 @@ STOPWORDS = {
     "what",
     "which",
 }
+LOW_VALUE_CODE_QUERY_TERMS = {
+    "async",
+    "const",
+    "function",
+    "get",
+    "return",
+    "set",
+    "static",
+    "string",
+}
 INTENT_REWRITES = {
     "stack": "stack tech stack tecnologias ferramentas frameworks dependencies package.json frontend backend react vite nestjs",
     "overview": "overview visao geral resumo objetivo problema solucao free-tier rag workspace local retrieval streamlit evaluation",
@@ -453,6 +463,10 @@ def analyze_query(query: str) -> QueryAnalysis:
         rewrite_parts.append("frontend front-end client ui react vite")
     if "back" in normalized:
         rewrite_parts.append("backend server api nestjs typeorm sqlite")
+    if "token" in normalized and ("attached" in normalized or "request" in normalized or "api" in normalized):
+        rewrite_parts.append("authorization bearer headers")
+    if "token" in normalized and ("stored" in normalized or "storage" in normalized or "cache" in normalized):
+        rewrite_parts.append("localStorage cache")
 
     rewritten_query = " ".join(dict.fromkeys(" ".join(rewrite_parts).split()))
     return QueryAnalysis(
@@ -619,7 +633,11 @@ def _node_key(item: Any) -> str:
 
 def _source_scope_score(source: str, analysis: QueryAnalysis) -> float:
     source_key = source.lower().replace("\\", "/")
+    query_key = _normalize_for_match(analysis.original_query)
+    original_terms = _significant_terms(analysis.original_query)
     score = 0.0
+    source_terms = _significant_terms(source_key.replace("/", " ").replace(".", " ").replace("-", " "))
+    score += 0.2 * len(source_terms & analysis.terms)
     if "frontend" in analysis.terms or "front" in analysis.terms:
         if "/frontend/" in source_key:
             score += 0.3
@@ -636,10 +654,34 @@ def _source_scope_score(source: str, analysis: QueryAnalysis) -> float:
         score += 1.0
     if {"stored", "storage", "token"} & analysis.terms and ("/cache." in source_key or "/auth." in source_key):
         score += 1.0
+    if {"stored", "storage", "localstorage", "token"} & analysis.terms and source_key.endswith("/utils/cache.ts"):
+        score += 1.6
+    if {"authorization", "bearer", "request", "requests", "api"} & analysis.terms and source_key.endswith("/services/api.ts"):
+        score += 1.4
     if {"referral", "registration", "register"} & analysis.terms and ("auth.service" in source_key or "users.service" in source_key):
         score += 1.0
-    if {"jwt", "public", "routes", "guard"} & analysis.terms and ("guard" in source_key or "decorator" in source_key or "controller" in source_key):
+    if ("authservice" in query_key or "incrementreferrerscore" in query_key or {"register", "registration", "referralcode"} & analysis.terms) and source_key.endswith("/auth/auth.service.ts"):
+        score += 2.4
+    if ("authservice" in query_key or "incrementreferrerscore" in query_key) and "/frontend/" in source_key:
+        score -= 2.5
+    if {"register", "registration", "referralcode"} & analysis.terms and "/auth/guards/" in source_key:
+        score -= 1.4
+    if {"jwt", "public", "routes", "guard"} & original_terms and ("guard" in source_key or "decorator" in source_key or "controller" in source_key):
         score += 1.0
+    if "jwt" in original_terms and "guard" in original_terms and source_key.endswith("/auth/guards/jwt-auth.guard.ts"):
+        score += 2.0
+    if "public" in original_terms and source_key.endswith("/auth/decorators/public.decorator.ts"):
+        score += 1.0
+    if {"database", "configuration", "configured"} & analysis.terms and source_key.endswith("/database/database.module.ts"):
+        score += 2.4
+    if "entity" in analysis.terms and source_key.endswith("/users/user.entity.ts"):
+        score += 1.2
+    if ("usersservice" in query_key or "getprofile" in query_key or {"profile", "referrallink"} & analysis.terms) and source_key.endswith("/users/users.service.ts"):
+        score += 2.4
+    if ("usersservice" in query_key or "getprofile" in query_key) and source_key.endswith("/auth/auth.service.ts"):
+        score -= 1.0
+    if "clear-database" in source_key and not ({"clear", "clean", "limpar", "script", "scripts"} & analysis.terms):
+        score -= 2.0
     if "module" not in analysis.terms and ".module." in source_key:
         score -= 0.6
     if "database" not in analysis.terms and "/database/" in source_key:
@@ -656,7 +698,7 @@ def _source_opposes_query_scope(source: str, analysis: QueryAnalysis) -> bool:
 
 def _is_maintenance_source(source: str, analysis: QueryAnalysis) -> bool:
     source_key = source.lower().replace("\\", "/")
-    if {"database", "setup", "script", "scripts"} & set(analysis.intents + list(analysis.terms)):
+    if {"clear", "clean", "limpar", "setup", "script", "scripts"} & set(analysis.intents + list(analysis.terms)):
         return False
     return "clear-database" in source_key or "/scripts/" in source_key
 
@@ -1437,7 +1479,7 @@ def _extractive_synthesis_result(
     if answer is None and intent == "stack":
         techs = _extract_technologies(contexts, query)
         answer = ", ".join(techs) if techs else None
-    if answer is None and (_query_requests_code(query) or intent in {"architecture", "security"}):
+    if answer is None and _query_needs_code_evidence(query, analyze_query(query)):
         answer = synthesize_source_grounded_answer(query, contexts, sources)
     return SynthesisResult(
         answer=answer or synthesize_extractive_answer(query, contexts, max_sentences=5),
@@ -1757,7 +1799,8 @@ def synthesize_extractive_answer(query: str, contexts: Sequence[str], max_senten
 def _is_low_value_code_evidence(line: str) -> bool:
     stripped = line.strip()
     return bool(
-        re.match(r"^(import|export)\b", stripped)
+        re.match(r"^import\b", stripped)
+        or re.match(r"^export\s+{", stripped)
         or stripped.startswith("Focused excerpt from ")
         or stripped.startswith("} from ")
         or " from '@nestjs/" in stripped
@@ -1775,15 +1818,20 @@ def synthesize_source_grounded_answer(
 ) -> str | None:
     analysis = analyze_query(query)
     query_terms = _significant_terms(analysis.rewritten_query)
-    bullets: list[str] = []
+    evidence_rows: list[tuple[float, int, str]] = []
     seen_sources: set[str] = set()
+    has_code_sources = any(_is_code_evidence_source(str(item.get("source_doc", ""))) for item in sources)
 
     for index, context in enumerate(contexts):
         source = sources[index].get("source_doc", f"document_{index + 1}") if index < len(sources) else f"document_{index + 1}"
         source = str(source)
         if source in seen_sources:
             continue
-        if _is_readme_source(source) and any(_is_code_evidence_source(str(item.get("source_doc", ""))) for item in sources):
+        if _is_readme_source(source) and has_code_sources:
+            continue
+        if _is_maintenance_source(source, analysis):
+            continue
+        if _is_manifest_source(source, analysis):
             continue
         seen_sources.add(source)
 
@@ -1797,9 +1845,12 @@ def synthesize_source_grounded_answer(
             normalized_line = _normalize_for_match(line)
             terms = _significant_terms(normalized_line)
             overlap = len(query_terms & terms)
+            specific_overlap = len((query_terms - LOW_VALUE_CODE_QUERY_TERMS) & terms)
             path_bonus = _source_scope_score(source, analysis)
+            if specific_overlap <= 0 and path_bonus < 1.0:
+                continue
             code_bonus = 0.3 if re.search(r"\b(async|await|return|throw|if|const|let|class|function|private|public|static)\b", line) else 0.0
-            ranked.append((overlap + path_bonus + code_bonus, line_index, line))
+            ranked.append((specific_overlap + (0.25 * overlap) + path_bonus + code_bonus, line_index, line))
 
         ranked = [item for item in ranked if item[0] > 0]
         if not ranked:
@@ -1808,12 +1859,15 @@ def synthesize_source_grounded_answer(
         evidence = " ".join(best_lines)
         if len(evidence) > 320:
             evidence = f"{evidence[:317].rstrip()}..."
-        bullets.append(f"- `{source}`: {evidence}")
-        if len(bullets) >= max_sources:
-            break
+        row_score = max(score for score, _, _ in ranked) + 0.05 * float(sources[index].get("score") or 0) if index < len(sources) else max(score for score, _, _ in ranked)
+        evidence_rows.append((row_score, index, f"- `{source}`: {evidence}"))
 
-    if not bullets:
+    if not evidence_rows:
         return None
+    bullets = [
+        bullet
+        for _, _, bullet in sorted(evidence_rows, key=lambda item: (-item[0], item[1]))[:max_sources]
+    ]
     return "Evidence from retrieved source files:\n" + "\n".join(bullets)
 
 

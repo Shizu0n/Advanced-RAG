@@ -866,6 +866,95 @@ class AppHelperTests(unittest.TestCase):
 
 
 class EvalTabTests(unittest.TestCase):
+    def test_eval_tab_cloud_ragas_button_enables_required_cloud_gates(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return_by_label = {
+            "Generate pre-questions": False,
+            "Run fast evaluation": False,
+            "Run Cloud RAGAS": True,
+        }
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
+        fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {
+            "USE_CLOUD_FREE_TIER_RAGAS": False,
+            "ALLOW_CLOUD_FREE_TIER": False,
+        }
+        current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
+        observed = {}
+
+        def capture_eval(use_real_ragas=True):
+            observed["use_real_ragas"] = use_real_ragas
+            observed["USE_CLOUD_FREE_TIER_RAGAS"] = os.getenv("USE_CLOUD_FREE_TIER_RAGAS")
+            observed["ALLOW_CLOUD_FREE_TIER"] = os.getenv("ALLOW_CLOUD_FREE_TIER")
+
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=False),
+                patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+                patch("app.last_eval_date", return_value="Not available"),
+                patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+                patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.run_evaluation_inline", side_effect=capture_eval),
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                app._render_eval_tab(fake_st)
+
+        self.assertTrue(observed["use_real_ragas"])
+        self.assertEqual(observed["USE_CLOUD_FREE_TIER_RAGAS"], "1")
+        self.assertEqual(observed["ALLOW_CLOUD_FREE_TIER"], "1")
+
+    def test_eval_tab_cloud_ragas_timeout_returns_without_waiting_for_worker(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return_by_label = {
+            "Generate pre-questions": False,
+            "Run fast evaluation": False,
+            "Run Cloud RAGAS": True,
+        }
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
+        current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
+
+        def slow_eval(use_real_ragas=True):
+            import time
+
+            time.sleep(0.2)
+
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=False),
+                patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
+                patch("app.last_eval_date", return_value="Not available"),
+                patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+                patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.run_evaluation_inline", side_effect=slow_eval),
+                patch.dict(os.environ, {"CLOUD_RAGAS_TIMEOUT_SECONDS": "0"}, clear=True),
+            ):
+                start = __import__("time").monotonic()
+                app._render_eval_tab(fake_st)
+                elapsed = __import__("time").monotonic() - start
+
+        self.assertLess(elapsed, 0.1)
+        errors = [event[1] for event in fake_st.events if event[0] == "error"]
+        self.assertTrue(any("timed out" in error for error in errors))
+
     def test_eval_tab_runs_cloud_ragas_with_session_gate_overrides(self):
         fake_st = FakeStreamlit()
         fake_st._button_return_by_label = {
@@ -1285,6 +1374,7 @@ class SourcesTabTests(unittest.TestCase):
         fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         fake_st._radio_value = "HuggingFace model/dataset"
         fake_st._text_input_value = "hf:owner/model"
+        fake_st.session_state[app.UI_GATE_OVERRIDES_KEY] = {"ALLOW_HF_FETCH": True}
 
         with (
             patch("app.clear_source_cache"),

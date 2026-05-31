@@ -577,6 +577,47 @@ npm install.
         self.assertIn("def keyword", result["citations"][0]["snippet"])
         self.assertNotIn("text", result["citations"][0])
 
+    def test_chat_query_deepens_portuguese_layer_question_with_code_sources(self):
+        readme_result = NodeWithScore(
+            node=TextNode(
+                id_="readme-architecture-pt",
+                text="README arquitetura: backend tem autenticação e registro de indicação.",
+                metadata={"file_name": "README.md"},
+            ),
+            score=3.0,
+        )
+        code_nodes = [
+            pipeline_module.LocalTextNode(
+                text="AuthService.register validates referralCode, creates the user, and increments referrer score.",
+                node_id="auth-service#0",
+                metadata={"file_name": "backend/src/auth/auth.service.ts"},
+            ),
+            pipeline_module.LocalTextNode(
+                text="UsersService.generateReferralLink builds referral URLs for users.",
+                node_id="users-service#0",
+                metadata={"file_name": "backend/src/users/users.service.ts"},
+            ),
+        ]
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [readme_result],
+                {"strategy": strategy, "used_rerank": False},
+            )
+        )
+        pipeline = LocalRAGPipeline(nodes=code_nodes, retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "Explique a camada de autenticação e registro de indicação no backend",
+                strategy="bm25_only",
+            )
+
+        self.assertEqual(result["intent"], "architecture")
+        self.assertIn("backend/src/auth/auth.service.ts", result["answer"])
+        self.assertIn("backend/src/users/users.service.ts", result["answer"])
+        self.assertNotIn("README arquitetura", result["answer"])
+        self.assertEqual(result["trace"]["context_deepening"]["reason"], "code_evidence_diversity")
+
     def test_chat_query_deepens_readme_only_architecture_results_with_code_sources(self):
         readme_result = NodeWithScore(
             node=TextNode(

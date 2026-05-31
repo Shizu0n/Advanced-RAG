@@ -489,6 +489,21 @@ def run_evaluation_inline(use_real_ragas: bool = True) -> None:
     eval_main(use_real_ragas=use_real_ragas)
 
 
+def _run_with_timeout(fn, timeout_seconds: float) -> bool:
+    import concurrent.futures as _cf
+
+    _pool = _cf.ThreadPoolExecutor(max_workers=1)
+    _future = _pool.submit(fn)
+    try:
+        _future.result(timeout=timeout_seconds)
+        return True
+    except _cf.TimeoutError:
+        _future.cancel()
+        return False
+    finally:
+        _pool.shutdown(wait=False, cancel_futures=True)
+
+
 def last_eval_date(path: Path = RAGAS_RESULTS_PATH) -> str:
     if not path.exists():
         return "Not available"
@@ -1464,37 +1479,43 @@ def _render_eval_tab(st) -> None:
         if not _eval_should_allow_run(st):
             _render_eval_run_blocked(st)
         else:
-            _CLOUD_RAGAS_TIMEOUT_SECONDS = int(os.getenv("CLOUD_RAGAS_TIMEOUT_SECONDS", "300"))
+            cloud_ragas_timeout_seconds = float(os.getenv("CLOUD_RAGAS_TIMEOUT_SECONDS", "300"))
             spinner_msg = (
                 f"Running Cloud RAGAS evaluation "
-                f"(timeout: {_CLOUD_RAGAS_TIMEOUT_SECONDS}s — "
+                f"(timeout: {cloud_ragas_timeout_seconds:g}s — "
                 "check terminal for live provider logs)..."
             )
             with st.spinner(spinner_msg):
-                import concurrent.futures as _cf
-
                 def _run_cloud_ragas():
-                    return _with_session_gate_env(
-                        st,
-                        ["USE_CLOUD_FREE_TIER_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
-                        lambda: run_evaluation_inline(use_real_ragas=True),
-                    )
-
-                with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
-                    _future = _pool.submit(_run_cloud_ragas)
+                    previous = {name: os.environ.get(name) for name in ["USE_CLOUD_FREE_TIER_RAGAS", "ALLOW_CLOUD_FREE_TIER"]}
                     try:
-                        _future.result(timeout=_CLOUD_RAGAS_TIMEOUT_SECONDS)
+                        os.environ["USE_CLOUD_FREE_TIER_RAGAS"] = "1"
+                        os.environ["ALLOW_CLOUD_FREE_TIER"] = "1"
+                        return _with_session_gate_env(
+                            st,
+                            ["ALLOW_INDEX_BUILD"],
+                            lambda: run_evaluation_inline(use_real_ragas=True),
+                        )
+                    finally:
+                        for name, value in previous.items():
+                            if value is None:
+                                os.environ.pop(name, None)
+                            else:
+                                os.environ[name] = value
+
+                try:
+                    completed = _run_with_timeout(_run_cloud_ragas, cloud_ragas_timeout_seconds)
+                    if completed:
                         _show_eval_success(st)
                         st.rerun()
-                    except _cf.TimeoutError:
-                        _future.cancel()
+                    else:
                         st.error(
-                            f"Cloud RAGAS timed out after {_CLOUD_RAGAS_TIMEOUT_SECONDS}s. "
+                            f"Cloud RAGAS timed out after {cloud_ragas_timeout_seconds:g}s. "
                             "Likely cause: all providers are rate-limited (429). "
                             "Wait 60s and retry, or increase MAX_CLOUD_CALLS / CLOUD_RAGAS_TIMEOUT_SECONDS in .env."
                         )
-                    except Exception as exc:
-                        _show_eval_failure(st, exc)
+                except Exception as exc:
+                    _show_eval_failure(st, exc)
 
     st.subheader("Generated pre-questions")
     st.dataframe(load_golden_questions(), use_container_width=True)

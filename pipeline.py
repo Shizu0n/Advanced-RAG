@@ -199,7 +199,7 @@ LOW_VALUE_CODE_QUERY_TERMS = {
 INTENT_REWRITES = {
     "stack": "stack tech stack tecnologias ferramentas frameworks dependencies package.json frontend backend react vite nestjs",
     "overview": "overview visao geral resumo objetivo problema solucao free-tier rag workspace local retrieval streamlit evaluation",
-    "architecture": "architecture arquitetura modules modulos estrutura fluxo components backend frontend",
+    "architecture": "architecture arquitetura layer layers camada camadas modules modulos estrutura fluxo components backend frontend service services controller controllers repository repositories",
     "setup": "setup install instalar executar rodar ambiente env scripts npm",
     "security": "security seguranca auth authentication jwt password senha bcrypt guard token",
     "evaluation": "evaluation avaliacao metricas tests testes qualidade benchmark ragas",
@@ -446,7 +446,7 @@ def analyze_query(query: str) -> QueryAnalysis:
             "repo is about",
             "o que e",
         ),
-        "architecture": ("architecture", "arquitetura", "module", "modules", "modulo", "modulos", "estrutura", "fluxo"),
+        "architecture": ("architecture", "arquitetura", "layer", "layers", "camada", "camadas", "module", "modules", "modulo", "modulos", "estrutura", "fluxo"),
         "setup": ("setup", "install", "instalar", "executar", "rodar", "ambiente", "env", "script", "scripts"),
         "security": ("security", "seguranca", "auth", "authentication", "jwt", "senha", "password", "bcrypt", "token"),
         "evaluation": ("evaluation", "avaliacao", "avaliar", "metric", "metrics", "metrica", "metricas", "test", "tests"),
@@ -463,6 +463,12 @@ def analyze_query(query: str) -> QueryAnalysis:
         rewrite_parts.append("frontend front-end client ui react vite")
     if "back" in normalized:
         rewrite_parts.append("backend server api nestjs typeorm sqlite")
+    if "autenticacao" in normalized or "autentic" in normalized:
+        rewrite_parts.append("auth authentication service guard token")
+    if "indicacao" in normalized or "referencia" in normalized or "referral" in normalized:
+        rewrite_parts.append("referral referralCode referrer register registration service")
+    if "registro" in normalized or "cadastrar" in normalized or "cadastro" in normalized:
+        rewrite_parts.append("register registration create user service")
     if "token" in normalized and ("attached" in normalized or "request" in normalized or "api" in normalized):
         rewrite_parts.append("authorization bearer headers")
     if "token" in normalized and ("stored" in normalized or "storage" in normalized or "cache" in normalized):
@@ -537,6 +543,9 @@ def _source_priority(source: str, text: str, analysis: QueryAnalysis) -> float:
     source_key = source.lower().replace("\\", "/")
     text_key = _normalize_for_match(text)
     priority = 0.0
+
+    if "architecture" in analysis.intents and _is_code_evidence_source(source):
+        priority += 0.6
 
     if "stack" in analysis.intents:
         asks_frontend = "frontend" in analysis.terms or "front" in analysis.terms
@@ -618,9 +627,12 @@ def _query_needs_code_evidence(query: str, analysis: QueryAnalysis) -> bool:
         "implementation",
         "implements",
         "module",
+        "referral",
+        "referrer",
         "repository",
         "route",
         "service",
+        "services",
         "source",
     }
     return bool(analysis.terms & implementation_terms)

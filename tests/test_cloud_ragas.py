@@ -1,6 +1,7 @@
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
@@ -82,6 +83,7 @@ class CloudRagasTests(unittest.TestCase):
             metrics=["metric"],
             llm="llm",
             embeddings="embeddings",
+            batch_size=1,
             raise_exceptions=True,
             show_progress=False,
         )
@@ -104,6 +106,39 @@ class CloudRagasTests(unittest.TestCase):
                 "reference": "Python is a language.",
             },
         )
+
+    def test_provider_quota_error_sets_short_cooldown_for_next_request(self):
+        calls = []
+
+        def post(url, json, timeout, **kwargs):
+            calls.append(url)
+            if "generativelanguage.googleapis.com" in url:
+                return FakeResponse(429, {"error": {"message": "quota"}})
+            return FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})
+
+        with TemporaryDirectory() as tmpdir:
+            client = cloud_ragas.FreeTierCloudClient(
+                cache_dir=Path(tmpdir),
+                post=post,
+                max_calls=5,
+                providers=[
+                    cloud_ragas.CloudProvider("gemini", "gemini-2.5-flash", "key"),
+                    cloud_ragas.CloudProvider("groq", "llama-3.3-70b-versatile", "groq-key"),
+                ],
+            )
+            client.generate_text("first uncached prompt")
+            client.generate_text("second uncached prompt")
+
+        self.assertEqual(sum("generativelanguage.googleapis.com" in call for call in calls), 1)
+        self.assertEqual(sum("api.groq.com" in call for call in calls), 2)
+
+    def test_ragas_llm_reports_unfinished_empty_generation(self):
+        with patch.object(cloud_ragas, "FreeTierCloudClient"):
+            llm, _ = cloud_ragas.build_cloud_backends(cloud_client=object())
+
+        response = SimpleNamespace(generations=[[SimpleNamespace(text="")]])
+
+        self.assertFalse(llm.is_finished(response))
 
     def test_model_fallback_order_skips_quota_errors(self):
         calls = []

@@ -1464,17 +1464,37 @@ def _render_eval_tab(st) -> None:
         if not _eval_should_allow_run(st):
             _render_eval_run_blocked(st)
         else:
-            with st.spinner("Running Cloud RAGAS evaluation..."):
-                try:
-                    _with_session_gate_env(
+            _CLOUD_RAGAS_TIMEOUT_SECONDS = int(os.getenv("CLOUD_RAGAS_TIMEOUT_SECONDS", "300"))
+            spinner_msg = (
+                f"Running Cloud RAGAS evaluation "
+                f"(timeout: {_CLOUD_RAGAS_TIMEOUT_SECONDS}s — "
+                "check terminal for live provider logs)..."
+            )
+            with st.spinner(spinner_msg):
+                import concurrent.futures as _cf
+
+                def _run_cloud_ragas():
+                    return _with_session_gate_env(
                         st,
                         ["USE_CLOUD_FREE_TIER_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_INDEX_BUILD"],
                         lambda: run_evaluation_inline(use_real_ragas=True),
                     )
-                    _show_eval_success(st)
-                    st.rerun()
-                except Exception as exc:
-                    _show_eval_failure(st, exc)
+
+                with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+                    _future = _pool.submit(_run_cloud_ragas)
+                    try:
+                        _future.result(timeout=_CLOUD_RAGAS_TIMEOUT_SECONDS)
+                        _show_eval_success(st)
+                        st.rerun()
+                    except _cf.TimeoutError:
+                        _future.cancel()
+                        st.error(
+                            f"Cloud RAGAS timed out after {_CLOUD_RAGAS_TIMEOUT_SECONDS}s. "
+                            "Likely cause: all providers are rate-limited (429). "
+                            "Wait 60s and retry, or increase MAX_CLOUD_CALLS / CLOUD_RAGAS_TIMEOUT_SECONDS in .env."
+                        )
+                    except Exception as exc:
+                        _show_eval_failure(st, exc)
 
     st.subheader("Generated pre-questions")
     st.dataframe(load_golden_questions(), use_container_width=True)

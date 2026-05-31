@@ -327,6 +327,41 @@ npm install.
 
         self.assertIn("streamlit run app.py", answer)
 
+    def test_extractive_answer_preserves_documented_npm_commands_for_command_listing_question(self):
+        answer = pipeline_module.synthesize_extractive_answer(
+            "What commands are documented to run and test the project?",
+            [
+                "Available commands:\n"
+                "npm run build\n"
+                "npm run start:prod\n"
+                "npm test\n"
+                "npm run db:reset\n"
+                "npm run db:backup"
+            ],
+            max_sentences=5,
+        )
+
+        self.assertIn("npm run build", answer)
+        self.assertIn("npm run start:prod", answer)
+        self.assertIn("npm test", answer)
+        self.assertNotIn("Nao encontrei evidencia suficiente", answer)
+
+    def test_extractive_answer_keeps_code_like_sentences_when_retrieved_context_is_code_heavy(self):
+        answer = pipeline_module.synthesize_extractive_answer(
+            "What setup steps are present?",
+            [
+                "npm install\n"
+                "npm run build\n"
+                "npm test\n"
+                "python manage.py migrate"
+            ],
+            max_sentences=4,
+        )
+
+        self.assertIn("npm install", answer)
+        self.assertIn("npm run build", answer)
+        self.assertNotIn("Nao encontrei evidencia suficiente", answer)
+
     def test_answer_query_strips_wrapping_code_fences_from_offline_fallback(self):
         retriever = SimpleNamespace(
             ablation_retrieve=lambda query, strategy: (
@@ -439,7 +474,10 @@ npm install.
             Path(tmpdir, "README.md").write_text("Unrelated cwd-only document.", encoding="utf-8")
             try:
                 os.chdir(tmpdir)
-                with patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", [pipeline_module.PROJECT_ROOT / "README.md"]):
+                with (
+                    patch.object(pipeline_module, "LOCAL_CONTEXT_PATHS", [pipeline_module.PROJECT_ROOT / "README.md"]),
+                    patch.object(pipeline_module.LocalRAGPipeline, "_load_existing_index", return_value=(None, None)),
+                ):
                     result = answer_query("What is the Advanced-RAG project?", strategy="bm25_only", allow_index_build=False)
             finally:
                 os.chdir(old_cwd)
@@ -538,6 +576,76 @@ npm install.
         self.assertEqual(result["citations"][0]["score"], 0.9)
         self.assertIn("def keyword", result["citations"][0]["snippet"])
         self.assertNotIn("text", result["citations"][0])
+
+    def test_chat_query_deepens_readme_only_architecture_results_with_code_sources(self):
+        readme_result = NodeWithScore(
+            node=TextNode(
+                id_="readme-architecture",
+                text="README architecture overview says the backend has authentication and referral registration flow.",
+                metadata={"file_name": "README.md"},
+            ),
+            score=3.0,
+        )
+        code_nodes = [
+            pipeline_module.LocalTextNode(
+                text="AuthService.register hashes the password, validates referralCode, and creates the user.",
+                node_id="auth-service#0",
+                metadata={"file_name": "backend/src/auth/auth.service.ts"},
+            ),
+            pipeline_module.LocalTextNode(
+                text="UsersService.generateReferralLink stores referral codes and incrementReferrerScore updates totals.",
+                node_id="users-service#0",
+                metadata={"file_name": "backend/src/users/users.service.ts"},
+            ),
+        ]
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [readme_result],
+                {"strategy": strategy, "used_rerank": False},
+            )
+        )
+        pipeline = LocalRAGPipeline(nodes=code_nodes, retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "Explain the authentication architecture and referral registration flow from the code",
+                strategy="bm25_only",
+            )
+
+        citation_sources = {citation["source_doc"] for citation in result["citations"]}
+        self.assertIn("backend/src/auth/auth.service.ts", citation_sources)
+        self.assertIn("backend/src/users/users.service.ts", citation_sources)
+        self.assertEqual(result["trace"]["context_deepening"]["reason"], "code_evidence_diversity")
+
+    def test_code_question_extract_fallback_references_source_files_not_import_noise(self):
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="auth-service",
+                            text=(
+                                "import { ReferralCodeUtil } from '../common/utils/referral-code.util';\n"
+                                "async register(registerDto: RegisterDto): Promise<RegisterResponseDto> {\n"
+                                "const { name, email, password, referralCode } = registerDto;\n"
+                                "if (referrer) { await this.incrementReferrerScore(referrer.id); }\n"
+                            ),
+                            metadata={"file_name": "backend/src/auth/auth.service.ts"},
+                        ),
+                        score=0.9,
+                    )
+                ],
+                {"strategy": strategy, "used_rerank": False},
+            )
+        )
+        pipeline = LocalRAGPipeline(nodes=[], retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("Explain the registration referral code from the backend code", strategy="bm25_only")
+
+        self.assertIn("backend/src/auth/auth.service.ts", result["answer"])
+        self.assertIn("incrementReferrerScore", result["answer"])
+        self.assertNotIn("import { ReferralCodeUtil", result["answer"])
 
     def test_chat_query_stack_aggregates_technologies_with_evidence(self):
         nodes = [

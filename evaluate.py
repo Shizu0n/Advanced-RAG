@@ -26,6 +26,8 @@ RAGAS_RESULTS_PATH = EVAL_DIR / "ragas_results.csv"
 RAGAS_PER_QUESTION_PATH = EVAL_DIR / "ragas_per_question.csv"
 CURRENT_SOURCE_PATH = PROJECT_ROOT / "data" / "current_source.json"
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
+RAGAS_METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
+LEXICAL_METRICS = ["lexical_faithfulness", "lexical_answer_relevancy", "lexical_context_recall", "lexical_context_precision"]
 REQUIRED_GOLDEN_FIELDS = {"question", "ground_truth", "reference_context", "source_doc"}
 
 
@@ -180,6 +182,31 @@ def _specificity_score(item: dict[str, str]) -> tuple[int, int]:
     return (len(question), len(set(terms)))
 
 
+def _realistic_user_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
+    context = "\n\n".join(_node_text(node)[:1000] for node in list(nodes)[:3]).strip()
+    source_doc = _source_doc(nodes[0]) if nodes else "unknown"
+    return [
+        {
+            "question": "How do I set up and run this project?",
+            "ground_truth": "Use the setup and run instructions documented in the retrieved project context.",
+            "reference_context": context,
+            "source_doc": source_doc,
+        },
+        {
+            "question": "What is the architecture of this project?",
+            "ground_truth": "Describe the project architecture using only the retrieved project context.",
+            "reference_context": context,
+            "source_doc": source_doc,
+        },
+        {
+            "question": "How should I troubleshoot common setup or runtime problems?",
+            "ground_truth": "Use the troubleshooting, setup, and runtime evidence documented in the retrieved project context.",
+            "reference_context": context,
+            "source_doc": source_doc,
+        },
+    ] if context else []
+
+
 def filter_best_golden_items(candidates: Sequence[dict[str, str]], limit: int = 30) -> list[dict[str, str]]:
     ranked = sorted(candidates, key=_specificity_score, reverse=True)
     filtered: list[dict[str, str]] = []
@@ -207,14 +234,17 @@ def generate_golden_dataset(
     current_source = load_current_source()
     source_slug = current_source.get("source_slug", "") if current_source else ""
 
-    candidates = []
+    candidates = _realistic_user_query_items(nodes)
     for node in list(nodes)[:chunk_limit]:
         item = generate_golden_item(node, providers)
-        if source_slug:
-            item["source_slug"] = source_slug
         candidates.append(item)
+    if source_slug:
+        for item in candidates:
+            item["source_slug"] = source_slug
 
-    dataset = filter_best_golden_items(candidates, limit=final_limit)
+    realistic = candidates[:3]
+    remaining = filter_best_golden_items(candidates[3:], limit=max(final_limit - len(realistic), 0))
+    dataset = (realistic + remaining)[:final_limit]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(dataset, indent=2, ensure_ascii=False), encoding="utf-8")
     return dataset
@@ -293,10 +323,10 @@ def _overlap_score(left: str, right: str) -> float:
 def offline_metric_scores(question: str, answer: str, contexts: Sequence[str], ground_truth: str) -> dict[str, float]:
     joined_context = " ".join(contexts)
     return {
-        "faithfulness": _overlap_score(answer, joined_context),
-        "answer_relevancy": _overlap_score(question, answer),
-        "context_recall": _overlap_score(ground_truth, joined_context),
-        "context_precision": sum(_overlap_score(context, ground_truth) for context in contexts) / max(len(contexts), 1),
+        "lexical_faithfulness": _overlap_score(answer, joined_context),
+        "lexical_answer_relevancy": _overlap_score(question, answer),
+        "lexical_context_recall": _overlap_score(ground_truth, joined_context),
+        "lexical_context_precision": sum(_overlap_score(context, ground_truth) for context in contexts) / max(len(contexts), 1),
     }
 
 
@@ -315,7 +345,7 @@ def evaluate_strategy(
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     for item in dataset:
-        result = pipeline.answer_query(item["question"], strategy=strategy)
+        result = pipeline.chat_query(item["question"], strategy=strategy)
         scores = offline_metric_scores(
             item["question"],
             result["answer"],
@@ -337,7 +367,7 @@ def evaluate_strategy(
 
     summary = {
         metric: sum(row[metric] for row in rows) / max(len(rows), 1)
-        for metric in ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
+        for metric in LEXICAL_METRICS
     }
     return summary, rows
 
@@ -394,6 +424,7 @@ def run_evaluation(
     pipeline: LocalRAGPipeline | None = None,
     cloud_client: cloud_ragas.FreeTierCloudClient | None = None,
     use_real_ragas: bool | None = None,
+    progress_callback=None,
 ) -> dict[str, dict[str, float]]:
     logger.info("run_evaluation: loading golden dataset from %s", golden_path)
     dataset = load_golden_dataset(golden_path)
@@ -407,17 +438,30 @@ def run_evaluation(
     summary_backends: dict[str, str] = {}
     detail_rows: list[dict[str, Any]] = []
 
-    for strategy in STRATEGIES:
+    rows_by_strategy: dict[str, list[dict[str, Any]]] = {}
+    for index, strategy in enumerate(STRATEGIES):
+        if progress_callback:
+            progress_callback(index / max(len(STRATEGIES), 1), f"Evaluating {strategy}...")
         logger.info("Evaluating strategy: %s", strategy)
         summary, rows = evaluate_strategy(dataset, strategy, pipeline)
-        real_scores = maybe_run_real_ragas(rows, cloud_client=cloud_client, enabled=use_real_ragas)
-        summary_backend = "cloud_free_tier_ragas" if real_scores else "offline_heuristic"
-        for row in rows:
-            row["summary_backend"] = summary_backend
-        summaries[strategy] = real_scores or summary
-        summary_backends[strategy] = summary_backend
+        rows_by_strategy[strategy] = rows
+        summaries[strategy] = summary
+        summary_backends[strategy] = "offline_heuristic"
         detail_rows.extend(rows)
-        logger.info("Strategy %s: %s (backend=%s)", strategy, summary, summary_backend)
+        logger.info("Strategy %s: %s (backend=%s)", strategy, summary, "offline_heuristic")
+
+    real_scores = None
+    if use_real_ragas and cloud_client is not None:
+        preferred = "hybrid_rerank" if "hybrid_rerank" in rows_by_strategy else STRATEGIES[-1]
+        real_scores = maybe_run_real_ragas(rows_by_strategy.get(preferred, []), cloud_client=cloud_client, enabled=True)
+        if real_scores:
+            summaries[preferred] = real_scores
+            summary_backends[preferred] = "cloud_free_tier_ragas"
+
+    for row in detail_rows:
+        row["summary_backend"] = summary_backends.get(row["strategy"], "offline_heuristic")
+    if progress_callback:
+        progress_callback(1.0, "Evaluation complete.")
 
     EVAL_DIR.mkdir(parents=True, exist_ok=True)
     current_source = load_current_source()
@@ -438,11 +482,11 @@ def build_index():
 
 
 def print_markdown_report(results: dict[str, dict[str, float]]) -> None:
-    metrics = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
+    metrics = RAGAS_METRICS if any(set(scores) & set(RAGAS_METRICS) for scores in results.values()) else LEXICAL_METRICS
     print("| strategy | " + " | ".join(metrics) + " |")
     print("|---|" + "|".join("---" for _ in metrics) + "|")
     for strategy, scores in results.items():
-        values = " | ".join(f"{scores[metric]:.3f}" for metric in metrics)
+        values = " | ".join(f"{scores.get(metric, 0.0):.3f}" for metric in metrics)
         print(f"| {strategy} | {values} |")
 
     averages = {strategy: sum(scores.values()) / len(scores) for strategy, scores in results.items()}

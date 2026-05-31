@@ -19,7 +19,11 @@ CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
 
 def _tokenize(text: str) -> list[str]:
-    return re.findall(r"\w+", text.lower())
+    tokens: list[str] = []
+    for raw in re.findall(r"[A-Za-z0-9]+", text):
+        parts = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", raw).split()
+        tokens.extend(part.lower() for part in parts if part)
+    return tokens
 
 
 def _node_text(item: BaseNode | NodeWithScore) -> str:
@@ -44,6 +48,24 @@ def _score_rows(results: Sequence[NodeWithScore]) -> list[dict[str, float | str 
     ]
 
 
+class LocalLexicalPositionReranker:
+    def predict(self, pairs: Sequence[tuple[str, str]]) -> list[float]:
+        scores: list[float] = []
+        for query, text in pairs:
+            query_terms = set(_tokenize(query))
+            text_tokens = _tokenize(text)
+            if not query_terms or not text_tokens:
+                scores.append(0.0)
+                continue
+            text_terms = set(text_tokens)
+            coverage = len(query_terms & text_terms) / len(query_terms)
+            density = len(query_terms & text_terms) / len(text_terms)
+            first_positions = [text_tokens.index(term) for term in query_terms if term in text_tokens]
+            position = 1.0 / (1.0 + min(first_positions)) if first_positions else 0.0
+            scores.append(coverage + density + position)
+        return scores
+
+
 class BM25Retriever:
     """Small BM25 adapter that returns LlamaIndex NodeWithScore objects."""
 
@@ -57,11 +79,24 @@ class BM25Retriever:
         if not self._bm25:
             return []
 
-        scores = self._bm25.get_scores(_tokenize(query))
+        query_tokens = _tokenize(query)
+        scores = self._bm25.get_scores(query_tokens)
         ranked = sorted(enumerate(scores), key=lambda item: item[1], reverse=True)
-        return [
+        results = [
             NodeWithScore(node=self.nodes[index], score=float(score))
             for index, score in ranked[: self.top_k]
+            if score > 0
+        ]
+        if results:
+            return results
+        query_terms = set(query_tokens)
+        lexical = [
+            (index, len(query_terms & set(tokens)) / max(len(query_terms), 1))
+            for index, tokens in enumerate(self._tokenized_nodes)
+        ]
+        return [
+            NodeWithScore(node=self.nodes[index], score=float(score))
+            for index, score in sorted(lexical, key=lambda item: item[1], reverse=True)[: self.top_k]
             if score > 0
         ]
 
@@ -96,17 +131,13 @@ class HybridRetriever:
         if self.cross_encoder is not None:
             return self.cross_encoder
 
-        if os.getenv("ALLOW_MODEL_DOWNLOADS") != "1":
-            raise RuntimeError(
-                "Cross-encoder reranking requires ALLOW_MODEL_DOWNLOADS=1 because loading "
-                f"{self.cross_encoder_model} can download model artifacts. Pass an injected "
-                "cross_encoder for offline tests or local no-cost reranking."
-            )
+        if os.getenv("ALLOW_MODEL_DOWNLOADS") == "1":
+            from sentence_transformers import CrossEncoder
 
-        from sentence_transformers import CrossEncoder
+            self.cross_encoder = CrossEncoder(self.cross_encoder_model)
+            return self.cross_encoder
 
-        self.cross_encoder = CrossEncoder(self.cross_encoder_model)
-        return self.cross_encoder
+        return LocalLexicalPositionReranker()
 
     def retrieve(self, query: str) -> list[NodeWithScore]:
         results, _ = self.ablation_retrieve(query, "hybrid_rerank")
@@ -183,7 +214,11 @@ class HybridRetriever:
             "used_vector": bool(vector_results),
             "used_bm25": bool(bm25_results),
             "used_rerank": strategy == "hybrid_rerank",
-            "reranker": self.cross_encoder_model if strategy == "hybrid_rerank" else None,
+            "reranker": (
+                self.cross_encoder_model
+                if strategy == "hybrid_rerank" and (self.cross_encoder is not None or os.getenv("ALLOW_MODEL_DOWNLOADS") == "1")
+                else "local_lexical_position" if strategy == "hybrid_rerank" else None
+            ),
             "vector_scores": _score_rows(vector_results),
             "bm25_scores": _score_rows(bm25_results),
             "rrf_scores": _score_rows(fused_results),

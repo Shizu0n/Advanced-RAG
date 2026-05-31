@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 import hashlib
 import json
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -121,6 +122,7 @@ class FreeTierCloudClient:
         self.post = post
         self.budget = budget or CloudCallBudget(max_calls=max_calls)
         self.providers = tuple(providers or providers_from_env())
+        self._provider_backoff: dict[str, float] = {}
         if not self.providers:
             raise RuntimeError("Set at least one supported free-tier cloud provider key.")
 
@@ -174,7 +176,10 @@ class FreeTierCloudClient:
         providers: Sequence[CloudProvider],
     ) -> dict[str, Any]:
         errors: list[str] = []
-        for provider in providers:
+        now = time.monotonic()
+        available = [provider for provider in providers if now >= self._provider_backoff.get(provider.name, 0.0)]
+        provider_chain = available or list(providers)
+        for provider in provider_chain:
             cache_payload = {"provider": provider.name, "model": provider.model, "payload": payload}
             cache_key = self._cache_key(method, provider.model, cache_payload)
             cached = self._read_cache(cache_key)
@@ -188,6 +193,7 @@ class FreeTierCloudClient:
             response = self.post(url, json=request_payload, headers=headers, timeout=30)
             if getattr(response, "status_code", 200) in QUOTA_STATUS_CODES:
                 logger.warning("Provider %s returned HTTP %s, skipping", provider.name, response.status_code)
+                self._provider_backoff[provider.name] = time.monotonic() + 60.0
                 errors.append(f"{provider.name}/{provider.model}: HTTP {response.status_code}")
                 continue
             response.raise_for_status()
@@ -256,6 +262,7 @@ class FreeTierCloudClient:
             self.budget.consume()
             response = self.post(url, json=payload, headers=self._gemini_headers(provider.api_key), timeout=30)
             if getattr(response, "status_code", 200) in QUOTA_STATUS_CODES:
+                self._provider_backoff[provider.name] = time.monotonic() + 60.0
                 errors.append(f"{model}: HTTP {response.status_code}")
                 continue
             response.raise_for_status()
@@ -325,6 +332,13 @@ def build_cloud_backends(
             text = await client.agenerate_text(prompt, n=n, temperature=temperature)
             return LLMResult(generations=[[Generation(text=text)]])
 
+        def is_finished(self, response: Any) -> bool:
+            try:
+                text = response.generations[0][0].text
+            except (AttributeError, IndexError, TypeError):
+                return False
+            return bool(str(text).strip())
+
     class LocalRagasEmbeddings(BaseRagasEmbeddings):
         def embed_query(self, text: str) -> list[float]:
             return _local_embedding(text)
@@ -379,6 +393,7 @@ def run_ragas(
     cache_dir: Path = DEFAULT_CACHE_DIR,
     max_calls: int = 120,
     cloud_client: FreeTierCloudClient | None = None,
+    batch_size: int = 1,
 ) -> dict[str, float]:
     parts = _import_ragas_parts()
     llm, embeddings = build_cloud_backends(
@@ -388,14 +403,20 @@ def run_ragas(
     )
     records = [_ragas_record(row) for row in rows]
     dataset = parts["Dataset"].from_list(records)
-    result = parts["evaluate"](
-        dataset,
-        metrics=parts["metrics"],
-        llm=llm,
-        embeddings=embeddings,
-        raise_exceptions=True,
-        show_progress=False,
-    )
+    timeout = float(os.getenv("CLOUD_RAGAS_EVALUATE_TIMEOUT_SECONDS", "300"))
+
+    def _evaluate():
+        return parts["evaluate"](
+            dataset,
+            metrics=parts["metrics"],
+            llm=llm,
+            embeddings=embeddings,
+            batch_size=batch_size,
+            raise_exceptions=True,
+            show_progress=False,
+        )
+
+    result = asyncio.run(asyncio.wait_for(asyncio.to_thread(_evaluate), timeout=timeout))
     return _result_to_scores(result)
 
 

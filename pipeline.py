@@ -57,6 +57,36 @@ LOCAL_CONTEXT_EXTENSIONS = {
     ".yml",
 }
 LOCAL_CONTEXT_FILENAMES = {"Dockerfile", "Makefile", "Procfile"}
+CODE_EVIDENCE_EXTENSIONS = {
+    ".c",
+    ".cs",
+    ".cpp",
+    ".cxx",
+    ".go",
+    ".h",
+    ".hpp",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".mjs",
+    ".py",
+    ".pyi",
+    ".rb",
+    ".rs",
+    ".sh",
+    ".sql",
+    ".ts",
+    ".tsx",
+}
+CODE_EVIDENCE_FILENAMES = {
+    "Dockerfile",
+    "Makefile",
+    "Procfile",
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+}
 LOCAL_CONTEXT_IGNORED_FILENAMES = {
     "Cargo.lock",
     "Pipfile.lock",
@@ -259,7 +289,11 @@ class ChatProviderPolicy:
 
 
 def _tokenize(text: str) -> set[str]:
-    return set(re.findall(r"\w+", text.lower()))
+    tokens: set[str] = set()
+    for raw in re.findall(r"[A-Za-z0-9_]+", text):
+        parts = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|_", " ", raw).split()
+        tokens.update(part.lower() for part in parts if part)
+    return tokens
 
 
 def _normalize_for_match(text: str) -> str:
@@ -268,7 +302,8 @@ def _normalize_for_match(text: str) -> str:
 
 
 def _significant_terms(text: str) -> set[str]:
-    return {term for term in _tokenize(_normalize_for_match(text)) if term not in STOPWORDS and len(term) > 1}
+    terms = _tokenize(text) | _tokenize(_normalize_for_match(text))
+    return {term for term in terms if term not in STOPWORDS and len(term) > 1}
 
 
 CODE_REQUEST_PATTERNS = (
@@ -285,7 +320,15 @@ CODE_REQUEST_PATTERNS = (
     r"\bclass\b",
     r"\bscript\b",
     r"\bcommand\b",
+    r"\bcommands\b",
     r"\bcomando\b",
+    r"\bcomandos\b",
+    r"\brun\b.*\bscript\b",
+    r"\bscripts?\b",
+    r"\bhow to run\b",
+    r"\bhow to build\b",
+    r"\bnpm run\b",
+    r"\bstep.*run\b",
     r"\bshow code\b",
     r"\bcode example\b",
     r"\bexample code\b",
@@ -365,6 +408,14 @@ def _is_code_like_sentence(sentence: str) -> bool:
     return False
 
 
+def _is_mostly_code(text: str) -> bool:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    code_lines = sum(1 for line in lines if _is_code_like_sentence(line))
+    return code_lines / len(lines) >= 0.5
+
+
 def analyze_query(query: str) -> QueryAnalysis:
     normalized = _normalize_for_match(query)
     intents: list[str] = []
@@ -408,7 +459,7 @@ def analyze_query(query: str) -> QueryAnalysis:
         original_query=query,
         rewritten_query=rewritten_query,
         intents=intents,
-        terms=_significant_terms(rewritten_query),
+        terms=_significant_terms(query) | _significant_terms(rewritten_query),
     )
 
 
@@ -492,7 +543,7 @@ def _source_priority(source: str, text: str, analysis: QueryAnalysis) -> float:
         priority += 0.5
     if "overview" in analysis.intents and source_key.endswith("readme.md"):
         priority += 0.5
-        if "free-tier rag workspace" in text_key or "advanced rag" in text_key:
+        if "free-tier rag workspace" in text_key or "advanced rag" in text_key or "advanced-rag" in text_key:
             priority += 1.2
         if "using your own github projects" in text_key or "configuration" in text_key:
             priority -= 0.5
@@ -506,6 +557,289 @@ def _source_priority(source: str, text: str, analysis: QueryAnalysis) -> float:
     return priority
 
 
+def _is_readme_source(source: str) -> bool:
+    return source.lower().replace("\\", "/").endswith("readme.md")
+
+
+def _is_code_evidence_source(source: str) -> bool:
+    source_key = source.lower().replace("\\", "/")
+    name = Path(source_key).name
+    if _is_readme_source(source_key):
+        return False
+    if name in {filename.lower() for filename in CODE_EVIDENCE_FILENAMES}:
+        return True
+    return Path(source_key).suffix.lower() in CODE_EVIDENCE_EXTENSIONS
+
+
+def _is_test_source(source: str) -> bool:
+    source_key = source.lower().replace("\\", "/")
+    name = Path(source_key).name
+    return (
+        "/test/" in source_key
+        or "/tests/" in source_key
+        or ".spec." in name
+        or ".test." in name
+    )
+
+
+def _query_needs_code_evidence(query: str, analysis: QueryAnalysis) -> bool:
+    if _query_requests_code(query):
+        return True
+    if any(intent in analysis.intents for intent in ("architecture", "security")):
+        return True
+    implementation_terms = {
+        "api",
+        "auth",
+        "backend",
+        "class",
+        "component",
+        "controller",
+        "database",
+        "entity",
+        "flow",
+        "frontend",
+        "function",
+        "guard",
+        "hook",
+        "implementation",
+        "implements",
+        "module",
+        "repository",
+        "route",
+        "service",
+        "source",
+    }
+    return bool(analysis.terms & implementation_terms)
+
+
+def _node_key(item: Any) -> str:
+    node = getattr(item, "node", item)
+    return str(getattr(node, "node_id", "") or _source_doc(item))
+
+
+def _source_scope_score(source: str, analysis: QueryAnalysis) -> float:
+    source_key = source.lower().replace("\\", "/")
+    score = 0.0
+    if "frontend" in analysis.terms or "front" in analysis.terms:
+        if "/frontend/" in source_key:
+            score += 0.3
+        if "/backend/" in source_key:
+            score -= 0.8
+    if "backend" in analysis.terms or "back" in analysis.terms:
+        if "/backend/" in source_key:
+            score += 0.3
+        if "/frontend/" in source_key:
+            score -= 0.8
+    if {"api", "request", "requests"} & analysis.terms and ("api." in source_key or "/services/" in source_key):
+        score += 1.0
+    if {"login", "state"} & analysis.terms and ("authcontext" in source_key or "/contexts/" in source_key):
+        score += 1.0
+    if {"stored", "storage", "token"} & analysis.terms and ("/cache." in source_key or "/auth." in source_key):
+        score += 1.0
+    if {"referral", "registration", "register"} & analysis.terms and ("auth.service" in source_key or "users.service" in source_key):
+        score += 1.0
+    if {"jwt", "public", "routes", "guard"} & analysis.terms and ("guard" in source_key or "decorator" in source_key or "controller" in source_key):
+        score += 1.0
+    if "module" not in analysis.terms and ".module." in source_key:
+        score -= 0.6
+    if "database" not in analysis.terms and "/database/" in source_key:
+        score -= 0.6
+    return score
+
+
+def _source_opposes_query_scope(source: str, analysis: QueryAnalysis) -> bool:
+    source_key = source.lower().replace("\\", "/")
+    asks_frontend = "frontend" in analysis.terms or "front" in analysis.terms
+    asks_backend = "backend" in analysis.terms or "back" in analysis.terms
+    return (asks_frontend and "/backend/" in source_key) or (asks_backend and "/frontend/" in source_key)
+
+
+def _is_maintenance_source(source: str, analysis: QueryAnalysis) -> bool:
+    source_key = source.lower().replace("\\", "/")
+    if {"database", "setup", "script", "scripts"} & set(analysis.intents + list(analysis.terms)):
+        return False
+    return "clear-database" in source_key or "/scripts/" in source_key
+
+
+def _is_manifest_source(source: str, analysis: QueryAnalysis) -> bool:
+    source_key = source.lower().replace("\\", "/")
+    if {"stack", "setup"} & set(analysis.intents):
+        return False
+    if {"package", "dependency", "dependencies", "script", "scripts"} & analysis.terms:
+        return False
+    return source_key.endswith("package.json") or source_key.endswith("requirements.txt") or source_key.endswith("pyproject.toml")
+
+
+def _source_path(source: str) -> Path | None:
+    path = Path(source)
+    candidate = path if path.is_absolute() else PROJECT_ROOT / path
+    return candidate if candidate.exists() and candidate.is_file() else None
+
+
+def _focused_file_excerpt(source: str, analysis: QueryAnalysis, max_lines: int = 12) -> str | None:
+    path = _source_path(source)
+    if path is None:
+        return None
+    text = _safe_read_text(path)
+    lines = [line.rstrip() for line in text.splitlines()]
+    query_terms = analysis.terms
+    ranked: list[tuple[float, int]] = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or _is_low_value_code_evidence(stripped):
+            continue
+        normalized = _normalize_for_match(re.sub(r"(?<=[a-z])(?=[A-Z])|_", " ", stripped))
+        terms = _significant_terms(normalized)
+        overlap = len(query_terms & terms)
+        if overlap <= 0:
+            continue
+        code_bonus = 0.4 if re.search(r"\b(async|await|return|throw|if|const|let|class|function|private|public|static)\b", stripped) else 0.0
+        ranked.append((overlap + code_bonus, index))
+    if not ranked:
+        return None
+
+    selected_indexes = sorted(index for _, index in sorted(ranked, key=lambda item: (-item[0], item[1]))[:4])
+    excerpt_indexes: set[int] = set()
+    for index in selected_indexes:
+        excerpt_indexes.update(range(max(index - 1, 0), min(index + 2, len(lines))))
+    excerpt_lines = [lines[index].strip() for index in sorted(excerpt_indexes) if lines[index].strip()]
+    if not excerpt_lines:
+        return None
+    return f"Focused excerpt from {source}:\n" + "\n".join(excerpt_lines[:max_lines])
+
+
+def _dedupe_results(results: Sequence[Any]) -> list[Any]:
+    deduped: list[Any] = []
+    seen: set[tuple[str, str]] = set()
+    for result in results:
+        signature = (_source_doc(result), _snippet(_node_text(result), max_chars=180))
+        if signature in seen:
+            continue
+        seen.add(signature)
+        deduped.append(result)
+    return deduped
+
+
+def _deepen_code_evidence_results(
+    query: str,
+    results: Sequence[Any],
+    candidate_nodes: Sequence[Any],
+    top_k: int,
+) -> tuple[list[Any], dict[str, Any]]:
+    analysis = analyze_query(query)
+    trace = {
+        "enabled": False,
+        "added_sources": [],
+        "reason": None,
+    }
+    allow_tests = "evaluation" in analysis.intents
+    selected = _dedupe_results(results)
+    if not _query_needs_code_evidence(query, analysis) or not candidate_nodes:
+        return selected, trace
+
+    scoped_selected = [result for result in selected if not _source_opposes_query_scope(_source_doc(result), analysis)]
+    if scoped_selected:
+        selected = scoped_selected
+    if not allow_tests:
+        non_test_selected = [result for result in selected if not _is_test_source(_source_doc(result))]
+        if non_test_selected:
+            selected = non_test_selected
+    non_manifest_selected = [result for result in selected if not _is_manifest_source(_source_doc(result), analysis)]
+    if non_manifest_selected:
+        selected = non_manifest_selected
+    selected_keys = {_node_key(result) for result in selected}
+    wanted_code_sources = 3 if _query_requests_code(query) else 2 if any(intent in analysis.intents for intent in ("architecture", "security")) else 1
+
+    candidates_by_source: dict[str, LocalNodeWithScore] = {}
+    for node in candidate_nodes:
+        if _node_key(node) in selected_keys:
+            continue
+        source = _source_doc(node)
+        if not _is_code_evidence_source(source):
+            continue
+        if _source_opposes_query_scope(source, analysis) or _is_maintenance_source(source, analysis) or _is_manifest_source(source, analysis):
+            continue
+        if _is_test_source(source) and not allow_tests:
+            continue
+        score = (
+            _score_local_node(node, analysis)
+            + (0.5 * _lexical_score(analysis.rewritten_query, source))
+            + _source_scope_score(source, analysis)
+        )
+        if score <= 0:
+            continue
+        candidate = LocalNodeWithScore(node=getattr(node, "node", node), score=score)
+        if source not in candidates_by_source or score > (candidates_by_source[source].score or 0):
+            candidates_by_source[source] = candidate
+
+    for source, candidate in list(candidates_by_source.items()):
+        excerpt = _focused_file_excerpt(source, analysis)
+        if not excerpt:
+            continue
+        focused_node = LocalTextNode(
+            text=excerpt,
+            node_id=f"{source}#focused",
+            metadata={"file_name": source, "source": "focused_file_excerpt"},
+        )
+        candidates_by_source[source] = LocalNodeWithScore(
+            node=focused_node,
+            score=(candidate.score or 0) + 1.0,
+        )
+
+    candidates = list(candidates_by_source.values())
+    candidates.sort(key=lambda item: (item.score, _is_test_source(_source_doc(item)), _source_doc(item)), reverse=True)
+    added_sources: list[str] = []
+    for candidate in candidates:
+        selected_code_sources = {
+            _source_doc(result)
+            for result in selected
+            if _is_code_evidence_source(_source_doc(result))
+            and (allow_tests or not _is_test_source(_source_doc(result)))
+        }
+        selected_top_candidate_sources = selected_code_sources & { _source_doc(item) for item in candidates[:wanted_code_sources] }
+        if len(selected_top_candidate_sources) >= min(wanted_code_sources, len(candidates)):
+            break
+        source = _source_doc(candidate)
+        if source in added_sources:
+            continue
+        if source in selected_code_sources:
+            existing_index = next((index for index, result in enumerate(selected) if _source_doc(result) == source), None)
+            if existing_index is not None:
+                existing_score = (
+                    _score_local_node(selected[existing_index], analysis)
+                    + (0.5 * _lexical_score(analysis.rewritten_query, source))
+                    + _source_scope_score(source, analysis)
+                )
+                if (candidate.score or 0) > existing_score:
+                    selected[existing_index] = candidate
+                    added_sources.append(source)
+            continue
+        if len(selected) >= top_k:
+            removable_index = next(
+                (
+                    index
+                    for index in range(len(selected) - 1, -1, -1)
+                    if _is_readme_source(_source_doc(selected[index])) or (_is_test_source(_source_doc(selected[index])) and not allow_tests)
+                ),
+                len(selected) - 1,
+            )
+            selected.pop(removable_index)
+        selected.append(candidate)
+        selected_keys.add(_node_key(candidate))
+        added_sources.append(source)
+
+    if added_sources:
+        selected.sort(key=lambda item: (_score(item) if _score(item) is not None else 0.0), reverse=True)
+        trace.update(
+            {
+                "enabled": True,
+                "added_sources": added_sources,
+                "reason": "code_evidence_diversity",
+            }
+        )
+    return selected, trace
+
+
 def _local_retrieval_score(query: str, text: str, source: str) -> float:
     analysis = analyze_query(query)
     lexical = _lexical_score(analysis.rewritten_query, text)
@@ -517,7 +851,7 @@ def _score_local_node(node: Any, analysis: QueryAnalysis) -> float:
     return _lexical_score(analysis.rewritten_query, text) + _source_priority(_source_doc(node), text, analysis)
 
 
-def _chunk_text(text: str, max_chars: int = 1200) -> list[str]:
+def _chunk_text(text: str, max_chars: int = 2400) -> list[str]:
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
     chunks: list[str] = []
     current = ""
@@ -990,7 +1324,7 @@ def _format_json_document(path: Path, text: str | None = None) -> str | None:
 
 
 def _context_for_synthesis(context: str) -> str:
-    if _looks_like_json_text(context):
+    if _looks_like_json_text(context) and not context.lstrip().startswith("JSON document summary"):
         return _format_json_document(Path("retrieved.json"), text=context) or "JSON context could not be summarized."
     return context
 
@@ -1092,12 +1426,19 @@ def _provider_attempts(policy: ChatProviderPolicy, *, outcome: str, error_class:
 def _extractive_synthesis_result(
     query: str,
     contexts: Sequence[str],
+    sources: Sequence[dict[str, Any]],
     error: SynthesisError,
     policy: ChatProviderPolicy | None = None,
     provider_attempts: list[dict[str, Any]] | None = None,
     fine_tune_metadata: FineTuneMetadata | None = None,
+    intent: str = "general",
 ) -> SynthesisResult:
     answer = _format_fine_tune_extract_answer(fine_tune_metadata) if fine_tune_metadata else None
+    if answer is None and intent == "stack":
+        techs = _extract_technologies(contexts, query)
+        answer = ", ".join(techs) if techs else None
+    if answer is None and (_query_requests_code(query) or intent in {"architecture", "security"}):
+        answer = synthesize_source_grounded_answer(query, contexts, sources)
     return SynthesisResult(
         answer=answer or synthesize_extractive_answer(query, contexts, max_sentences=5),
         mode="extractive",
@@ -1151,25 +1492,31 @@ def synthesize_chat_answer(
         return _extractive_synthesis_result(
             query,
             contexts,
+            sources,
             _chat_cloud_error(SYNTHESIS_CLOUD_CHAT_DISABLED, retryable=False),
             policy,
             fine_tune_metadata=fine_tune_metadata,
+            intent=intent,
         )
     if not policy.providers:
         return _extractive_synthesis_result(
             query,
             contexts,
+            sources,
             _chat_cloud_error(SYNTHESIS_NO_PROVIDER_CONFIGURED, retryable=False),
             policy,
             fine_tune_metadata=fine_tune_metadata,
+            intent=intent,
         )
     if policy.max_calls <= 0:
         return _extractive_synthesis_result(
             query,
             contexts,
+            sources,
             _chat_cloud_error(SYNTHESIS_BUDGET_EXCEEDED, retryable=False),
             policy,
             fine_tune_metadata=fine_tune_metadata,
+            intent=intent,
         )
 
     provider_attempts = _provider_attempts(policy, outcome="started")
@@ -1184,19 +1531,23 @@ def synthesize_chat_answer(
         return _extractive_synthesis_result(
             query,
             contexts,
+            sources,
             _chat_cloud_error(SYNTHESIS_PROVIDER_TIMEOUT, retryable=True, stage="provider"),
             policy,
             provider_attempts=_provider_attempts(policy, outcome="timeout", error_class="TimeoutError"),
             fine_tune_metadata=fine_tune_metadata,
+            intent=intent,
         )
     except Exception as exc:
         return _extractive_synthesis_result(
             query,
             contexts,
+            sources,
             _chat_cloud_error(SYNTHESIS_PROVIDER_EXHAUSTED, retryable=True, stage="provider"),
             policy,
             provider_attempts=_provider_attempts(policy, outcome="error", error_class=type(exc).__name__),
             fine_tune_metadata=fine_tune_metadata,
+            intent=intent,
         )
 
     answer = _post_process_llm_response(raw_answer)
@@ -1204,10 +1555,12 @@ def synthesize_chat_answer(
         return _extractive_synthesis_result(
             query,
             contexts,
+            sources,
             _chat_cloud_error(SYNTHESIS_PROVIDER_EXHAUSTED, retryable=False, stage="provider"),
             policy,
             provider_attempts=_provider_attempts(policy, outcome="empty_response"),
             fine_tune_metadata=fine_tune_metadata,
+            intent=intent,
         )
     return SynthesisResult(
         answer=answer,
@@ -1358,15 +1711,20 @@ def synthesize_extractive_answer(query: str, contexts: Sequence[str], max_senten
 
     query_terms = _tokenize(query)
     request_code = _query_requests_code(query)
+    cleaned_contexts = [_context_for_synthesis(context) for context in contexts]
+    code_heavy_context = bool(cleaned_contexts) and sum(
+        1 for context in cleaned_contexts if _is_mostly_code(context)
+    ) > len(cleaned_contexts) / 2
+    should_include_code = request_code or code_heavy_context
     ranked: list[tuple[float, int, str]] = []
 
-    for context_index, context in enumerate(contexts):
-        context = _context_for_synthesis(context)
-        if not request_code:
-            context = re.sub(r"```[\s\S]*?```", " ", context)
-        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", context) if part.strip()]
+    for context_index, context in enumerate(cleaned_contexts):
+        if not should_include_code:
+            context = re.sub(r"```[\w-]*\n[\s\S]*?\n?```", " ", context, flags=re.MULTILINE)
+            context = context.replace("```", " ").replace("`", " ")
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+|\n+", context) if part.strip()]
         for sentence_index, sentence in enumerate(sentences or [context.strip()]):
-            if not request_code and _is_code_like_sentence(sentence):
+            if not should_include_code and _is_code_like_sentence(sentence):
                 continue
             terms = _tokenize(sentence)
             overlap = len(query_terms & terms)
@@ -1374,18 +1732,89 @@ def synthesize_extractive_answer(query: str, contexts: Sequence[str], max_senten
             ranked.append((overlap + density, context_index * 1000 + sentence_index, sentence))
 
     if not ranked:
-        if request_code:
+        if should_include_code:
             return _strip_wrapping_code_fences(contexts[0][:500]) if contexts else "No relevant context was retrieved."
         return "No non-code evidence was retrieved for this question. Ask for code if you want code examples."
 
-    if not request_code:
+    if not should_include_code:
         ranked = [item for item in ranked if not _is_code_like_sentence(item[2])]
         if not ranked:
             return "No non-code evidence was retrieved for this question. Ask for code if you want code examples."
 
+    positive = [item for item in ranked if item[0] > 0]
+    if positive:
+        ranked = positive
+
+    json_contexts = [context for context in cleaned_contexts if context.startswith("JSON document summary")]
+    if json_contexts:
+        return _strip_wrapping_code_fences(json_contexts[0][:500])
+
     best = sorted(ranked, key=lambda item: (-item[0], item[1]))[:max_sentences]
     answer = " ".join(sentence for _, _, sentence in sorted(best, key=lambda item: item[1]))
-    return _strip_wrapping_code_fences(answer or contexts[0][:500])
+    return _strip_wrapping_code_fences(answer or contexts[0][:500]).replace("```", "").strip()
+
+
+def _is_low_value_code_evidence(line: str) -> bool:
+    stripped = line.strip()
+    return bool(
+        re.match(r"^(import|export)\b", stripped)
+        or stripped.startswith("Focused excerpt from ")
+        or stripped.startswith("} from ")
+        or " from '@nestjs/" in stripped
+        or " from 'react" in stripped
+        or re.match(r"^from\s+['\"A-Za-z0-9_./@-]+", stripped)
+        or stripped in {"{", "}", "});", "};", ");"}
+    )
+
+
+def synthesize_source_grounded_answer(
+    query: str,
+    contexts: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+    max_sources: int = 5,
+) -> str | None:
+    analysis = analyze_query(query)
+    query_terms = _significant_terms(analysis.rewritten_query)
+    bullets: list[str] = []
+    seen_sources: set[str] = set()
+
+    for index, context in enumerate(contexts):
+        source = sources[index].get("source_doc", f"document_{index + 1}") if index < len(sources) else f"document_{index + 1}"
+        source = str(source)
+        if source in seen_sources:
+            continue
+        if _is_readme_source(source) and any(_is_code_evidence_source(str(item.get("source_doc", ""))) for item in sources):
+            continue
+        seen_sources.add(source)
+
+        lines = [
+            line.strip()
+            for line in _context_for_synthesis(context).splitlines()
+            if line.strip() and not _is_low_value_code_evidence(line)
+        ]
+        ranked: list[tuple[float, int, str]] = []
+        for line_index, line in enumerate(lines):
+            normalized_line = _normalize_for_match(line)
+            terms = _significant_terms(normalized_line)
+            overlap = len(query_terms & terms)
+            path_bonus = _source_scope_score(source, analysis)
+            code_bonus = 0.3 if re.search(r"\b(async|await|return|throw|if|const|let|class|function|private|public|static)\b", line) else 0.0
+            ranked.append((overlap + path_bonus + code_bonus, line_index, line))
+
+        ranked = [item for item in ranked if item[0] > 0]
+        if not ranked:
+            continue
+        best_lines = [line for _, _, line in sorted(sorted(ranked, key=lambda item: (-item[0], item[1]))[:5], key=lambda item: item[1])]
+        evidence = " ".join(best_lines)
+        if len(evidence) > 320:
+            evidence = f"{evidence[:317].rstrip()}..."
+        bullets.append(f"- `{source}`: {evidence}")
+        if len(bullets) >= max_sources:
+            break
+
+    if not bullets:
+        return None
+    return "Evidence from retrieved source files:\n" + "\n".join(bullets)
 
 
 class LocalLexicalCrossEncoder:
@@ -1589,6 +2018,9 @@ class LocalRAGPipeline:
         logger.info("answer_query: strategy=%s, query=%s", strategy, query[:80])
         self._ensure_ready()
         results, metadata = self.retriever.ablation_retrieve(query, strategy)
+        results, deepening_trace = _deepen_code_evidence_results(query, results, self.nodes or [], self.top_k)
+        if deepening_trace["enabled"]:
+            metadata = {**metadata, "context_deepening": deepening_trace}
         contexts = [_node_text(result) for result in results]
         logger.info("answer_query: retrieved %d contexts, %d results", len(contexts), len(results))
         answer = synthesize_extractive_answer(query, contexts) if contexts else EMPTY_LOCAL_CONTEXT_ANSWER
@@ -1624,6 +2056,9 @@ class LocalRAGPipeline:
         intent = analysis.intents[0] if analysis.intents else "general"
 
         results, metadata = self.retriever.ablation_retrieve(retrieval_query, strategy)
+        results, deepening_trace = _deepen_code_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
+        if deepening_trace["enabled"]:
+            metadata = {**metadata, "context_deepening": deepening_trace}
         contexts = [_node_text(result) for result in results]
         sources = self._source_rows(results)
         citations = _make_citations(results)

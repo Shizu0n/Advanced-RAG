@@ -31,10 +31,20 @@ class StaticProvider:
 class StaticPipeline:
     def __init__(self, nodes=None):
         self.nodes = list(nodes or [])
+        self.answer_calls = []
+        self.chat_calls = []
 
     def answer_query(self, question, strategy):
+        self.answer_calls.append((question, strategy))
         return {
-            "answer": f"answer for {question}",
+            "answer": f"extractive answer for {question}",
+            "contexts": [f"context for {question}"],
+        }
+
+    def chat_query(self, question, strategy):
+        self.chat_calls.append((question, strategy))
+        return {
+            "answer": f"chat answer for {question}",
             "contexts": [f"context for {question}"],
         }
 
@@ -72,6 +82,27 @@ class GoldenDatasetTests(unittest.TestCase):
         self.assertIn("stack", questions)
         self.assertIn("data/eval/project_abstract.md", sources)
         self.assertIn("data/eval/stack_discovery.md", sources)
+
+    def test_evaluate_strategy_uses_chat_query_user_path_and_lexical_metric_names(self):
+        pipeline = StaticPipeline()
+        dataset = [
+            {
+                "question": "How do users run the project?",
+                "ground_truth": "Use npm run build.",
+                "reference_context": "Use npm run build.",
+                "source_doc": "README.md",
+            }
+        ]
+
+        summary, rows = evaluation.evaluate_strategy(dataset, "bm25_only", pipeline)
+
+        self.assertEqual(pipeline.answer_calls, [])
+        self.assertEqual(pipeline.chat_calls, [("How do users run the project?", "bm25_only")])
+        self.assertIn("chat answer", rows[0]["answer"])
+        for metric in evaluation.LEXICAL_METRICS:
+            self.assertIn(metric, summary)
+            self.assertIn(metric, rows[0])
+        self.assertNotIn("faithfulness", summary)
 
     def test_run_evaluation_offline_never_calls_ragas_and_labels_backends_honestly(self):
         with TemporaryDirectory() as tmpdir:
@@ -431,6 +462,99 @@ class GoldenDatasetTests(unittest.TestCase):
         self.assertEqual(len(sampled_rows), 3)
         self.assertEqual([row["question"] for row in sampled_rows], ["Question 0?", "Question 1?", "Question 2?"])
 
+    def test_generate_golden_dataset_includes_realistic_user_queries_before_chunk_questions(self):
+        nodes = [TextNode(id_="readme", text="README explains setup, architecture, auth flow, deployment, and troubleshooting.")]
+
+        with TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "golden_dataset.json"
+            dataset = evaluation.generate_golden_dataset(
+                nodes,
+                output_path=output_path,
+                providers=[StaticProvider()],
+                chunk_limit=1,
+                final_limit=6,
+            )
+
+        questions = [item["question"].lower() for item in dataset]
+        self.assertTrue(any("set up" in question or "install" in question for question in questions))
+        self.assertTrue(any("architecture" in question for question in questions))
+        self.assertTrue(any("troubleshoot" in question for question in questions))
+
+    def test_run_evaluation_reports_progress_for_each_strategy(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(
+                json.dumps(
+                    [{"question": "Q?", "ground_truth": "A", "reference_context": "ctx", "source_doc": "doc.md"}]
+                ),
+                encoding="utf-8",
+            )
+            events = []
+
+            with (
+                patch.object(evaluation, "STRATEGIES", ["semantic_only", "bm25_only"]),
+                patch.object(evaluation, "EVAL_DIR", Path(tmpdir)),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", Path(tmpdir) / "summary.csv"),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", Path(tmpdir) / "detail.csv"),
+            ):
+                evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline(), progress_callback=lambda pct, msg: events.append((pct, msg)))
+
+        self.assertEqual(events[0], (0.0, "Evaluating semantic_only..."))
+        self.assertEqual(events[1], (0.5, "Evaluating bm25_only..."))
+        self.assertEqual(events[-1], (1.0, "Evaluation complete."))
+
+    def test_run_evaluation_calls_real_ragas_once_after_all_strategies(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "What is Python?",
+                            "ground_truth": "Python is a language.",
+                            "reference_context": "Python is a language.",
+                            "source_doc": "doc.md",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            client = object()
+
+            with (
+                patch.object(evaluation, "STRATEGIES", ["semantic_only", "bm25_only", "hybrid_rerank"]),
+                patch.object(evaluation, "EVAL_DIR", Path(tmpdir)),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", Path(tmpdir) / "summary.csv"),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", Path(tmpdir) / "detail.csv"),
+                patch.dict(
+                    "os.environ",
+                    {
+                        "USE_CLOUD_FREE_TIER_RAGAS": "1",
+                        "ALLOW_CLOUD_FREE_TIER": "1",
+                        "GEMINI_API_KEY": "key",
+                    },
+                    clear=True,
+                ),
+                patch.object(evaluation.cloud_ragas, "client_from_config", return_value=client),
+                patch.object(
+                    evaluation.cloud_ragas,
+                    "run_ragas",
+                    return_value={
+                        "faithfulness": 0.9,
+                        "answer_relevancy": 0.8,
+                        "context_recall": 0.7,
+                        "context_precision": 0.6,
+                    },
+                ) as run_ragas,
+            ):
+                evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline())
+
+            run_ragas.assert_called_once()
+            self.assertEqual(run_ragas.call_args.kwargs["cloud_client"], client)
+            sampled_rows = run_ragas.call_args.args[0]
+            self.assertTrue(sampled_rows)
+            self.assertTrue(all(row["strategy"] == "hybrid_rerank" for row in sampled_rows))
+
     def test_run_evaluation_reuses_one_cloud_client_across_strategies(self):
         with TemporaryDirectory() as tmpdir:
             golden_path = Path(tmpdir) / "golden_dataset.json"
@@ -481,7 +605,7 @@ class GoldenDatasetTests(unittest.TestCase):
                 call.kwargs["cloud_client"]
                 for call in run_ragas.call_args_list
             ]
-            self.assertEqual(clients, [client, client])
+            self.assertEqual(clients, [client])
 
     def test_run_evaluation_keeps_per_question_backend_honest_when_summary_uses_ragas(self):
         with TemporaryDirectory() as tmpdir:

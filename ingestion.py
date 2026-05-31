@@ -30,7 +30,9 @@ CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 CHROMA_COLLECTION_NAME = "advanced_rag"
 PYTHON_TUTORIAL_URL = "https://docs.python.org/3/tutorial/"
 PAGE_LIMIT = 50
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+CHUNK_SIZE_TOKENS = 512
+CHUNK_OVERLAP_TOKENS = 64
+EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 SOURCE_EXTENSIONS = {
     ".c",
     ".cfg",
@@ -340,7 +342,7 @@ def build_index(
     if not documents:
         raise RuntimeError("No readable text documents were found in the provided source files.")
 
-    splitter = SentenceSplitter(chunk_size=512, chunk_overlap=50)
+    splitter = SentenceSplitter(chunk_size=CHUNK_SIZE_TOKENS, chunk_overlap=CHUNK_OVERLAP_TOKENS)
     nodes = splitter.get_nodes_from_documents(documents)
 
     try:

@@ -27,6 +27,35 @@ def result(node_id, text, score=1.0):
 
 
 class HybridRetrieverTests(unittest.TestCase):
+    def test_tokenizer_splits_code_identifiers_for_bm25(self):
+        node = TextNode(id_="auth", text="class JwtAuthGuard protects auth.guard.ts routes")
+        retriever = __import__("retrieval").BM25Retriever([node], top_k=1)
+
+        results = retriever.retrieve("jwt auth guard")
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].node.node_id, "auth")
+
+    def test_default_no_download_reranker_prefers_early_dense_query_matches(self):
+        vector = [
+            result("late", "This long explanation mentions many unrelated words before finally saying jwt auth guard near the end."),
+            result("early", "JwtAuthGuard auth guard protects routes."),
+        ]
+        bm25 = list(vector)
+        retriever = HybridRetriever(
+            index=None,
+            nodes=[],
+            top_k=1,
+            vector_retriever=StaticRetriever(vector),
+            bm25_retriever=StaticRetriever(bm25),
+        )
+
+        with patch.dict("os.environ", {}, clear=True):
+            results, metadata = retriever.ablation_retrieve("jwt auth guard", "hybrid_rerank")
+
+        self.assertEqual([item.node.node_id for item in results], ["early"])
+        self.assertEqual(metadata["reranker"], "local_lexical_position")
+
     def test_rrf_prefers_documents_that_appear_in_multiple_rankings(self):
         vector = [result("a", "semantic"), result("b", "shared")]
         bm25 = [result("b", "shared"), result("c", "keyword")]
@@ -93,8 +122,8 @@ class HybridRetrieverTests(unittest.TestCase):
         self.assertEqual(bm25_metadata["bm25_scores"], [{"source": "b", "score": 1.0}])
         self.assertEqual(bm25_metadata["vector_scores"], [])
 
-    def test_default_reranker_requires_explicit_model_download_opt_in(self):
-        vector = [result("a", "semantic")]
+    def test_default_reranker_does_not_require_model_download_opt_in(self):
+        vector = [result("a", "semantic query match")]
         bm25 = [result("b", "keyword")]
         retriever = HybridRetriever(
             index=None,
@@ -105,8 +134,10 @@ class HybridRetrieverTests(unittest.TestCase):
         )
 
         with patch.dict("os.environ", {}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "ALLOW_MODEL_DOWNLOADS"):
-                retriever.ablation_retrieve("query", "hybrid_rerank")
+            results, metadata = retriever.ablation_retrieve("semantic query", "hybrid_rerank")
+
+        self.assertTrue(results)
+        self.assertEqual(metadata["reranker"], "local_lexical_position")
 
 
 if __name__ == "__main__":

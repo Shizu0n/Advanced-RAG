@@ -9,9 +9,10 @@ import cloud_ragas
 
 
 class FakeResponse:
-    def __init__(self, status_code, payload):
+    def __init__(self, status_code, payload, headers=None):
         self.status_code = status_code
         self._payload = payload
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -107,6 +108,26 @@ class CloudRagasTests(unittest.TestCase):
             },
         )
 
+    def test_result_to_scores_ignores_nan_metric_values(self):
+        fake_result = Mock()
+        fake_result.to_pandas.return_value = Mock(
+            to_dict=Mock(
+                return_value={
+                    "faithfulness": {0: float("nan")},
+                    "answer_relevancy": {0: 0.5, 1: float("nan")},
+                    "context_recall": [float("nan")],
+                    "context_precision": 0.75,
+                }
+            )
+        )
+
+        scores = cloud_ragas._result_to_scores(fake_result)
+
+        self.assertNotIn("faithfulness", scores)
+        self.assertEqual(scores["answer_relevancy"], 0.5)
+        self.assertNotIn("context_recall", scores)
+        self.assertEqual(scores["context_precision"], 0.75)
+
     def test_provider_quota_error_sets_short_cooldown_for_next_request(self):
         calls = []
 
@@ -131,6 +152,32 @@ class CloudRagasTests(unittest.TestCase):
 
         self.assertEqual(sum("generativelanguage.googleapis.com" in call for call in calls), 1)
         self.assertEqual(sum("api.groq.com" in call for call in calls), 2)
+
+    def test_provider_fallback_respects_backoff_when_all_providers_are_cooling_down(self):
+        calls = []
+
+        def post(url, json, timeout, **kwargs):
+            calls.append(url)
+            return FakeResponse(429, {"error": {"message": "quota"}}, headers={"Retry-After": "30"})
+
+        with TemporaryDirectory() as tmpdir:
+            client = cloud_ragas.FreeTierCloudClient(
+                cache_dir=Path(tmpdir),
+                post=post,
+                max_calls=10,
+                providers=[
+                    cloud_ragas.CloudProvider("gemini", "gemini-2.5-flash", "key"),
+                    cloud_ragas.CloudProvider("github", "gpt-5-mini", "github-key"),
+                    cloud_ragas.CloudProvider("groq", "llama-3.3-70b-versatile", "groq-key"),
+                ],
+            )
+
+            with self.assertRaises(cloud_ragas.CloudProviderUnavailable):
+                client.generate_text("first uncached prompt")
+            with self.assertRaisesRegex(cloud_ragas.CloudProviderUnavailable, "cooling down"):
+                client.generate_text("second uncached prompt")
+
+        self.assertEqual(len(calls), 3)
 
     def test_ragas_llm_reports_unfinished_empty_generation(self):
         with patch.object(cloud_ragas, "FreeTierCloudClient"):

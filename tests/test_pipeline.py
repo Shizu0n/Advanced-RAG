@@ -577,12 +577,12 @@ npm install.
         self.assertIn("def keyword", result["citations"][0]["snippet"])
         self.assertNotIn("text", result["citations"][0])
 
-    def test_chat_query_deepens_portuguese_layer_question_with_code_sources(self):
+    def test_chat_query_deepens_portuguese_layer_question_with_prepared_backend_paths(self):
         readme_result = NodeWithScore(
             node=TextNode(
                 id_="readme-architecture-pt",
                 text="README arquitetura: backend tem autenticação e registro de indicação.",
-                metadata={"file_name": "README.md"},
+                metadata={"file_name": "C:/repo/data/raw/Shizu0n-ReferralSystem/README.md"},
             ),
             score=3.0,
         )
@@ -590,12 +590,12 @@ npm install.
             pipeline_module.LocalTextNode(
                 text="AuthService.register validates referralCode, creates the user, and increments referrer score.",
                 node_id="auth-service#0",
-                metadata={"file_name": "backend/src/auth/auth.service.ts"},
+                metadata={"file_name": "C:/repo/data/raw/Shizu0n-ReferralSystem/backend/src/auth/auth.service.ts"},
             ),
             pipeline_module.LocalTextNode(
                 text="UsersService.generateReferralLink builds referral URLs for users.",
                 node_id="users-service#0",
-                metadata={"file_name": "backend/src/users/users.service.ts"},
+                metadata={"file_name": "C:/repo/data/raw/Shizu0n-ReferralSystem/backend/src/users/users.service.ts"},
             ),
         ]
         retriever = SimpleNamespace(
@@ -615,7 +615,7 @@ npm install.
         self.assertEqual(result["intent"], "architecture")
         self.assertIn("backend/src/auth/auth.service.ts", result["answer"])
         self.assertIn("backend/src/users/users.service.ts", result["answer"])
-        self.assertNotIn("README arquitetura", result["answer"])
+        self.assertIn("README arquitetura", result["answer"])
         self.assertEqual(result["trace"]["context_deepening"]["reason"], "code_evidence_diversity")
 
     def test_chat_query_deepens_readme_only_architecture_results_with_code_sources(self):
@@ -657,6 +657,130 @@ npm install.
         self.assertIn("backend/src/auth/auth.service.ts", citation_sources)
         self.assertIn("backend/src/users/users.service.ts", citation_sources)
         self.assertEqual(result["trace"]["context_deepening"]["reason"], "code_evidence_diversity")
+
+    def test_chat_query_deepens_layer_question_for_generic_architecture_paths(self):
+        readme_result = NodeWithScore(
+            node=TextNode(
+                id_="readme-layered-architecture",
+                text="README says the project uses a layered architecture.",
+                metadata={"file_name": "README.md"},
+            ),
+            score=3.0,
+        )
+        code_nodes = [
+            pipeline_module.LocalTextNode(
+                text="Account aggregate enforces business invariants before signup continues.",
+                node_id="domain-account#0",
+                metadata={"file_name": "src/domain/account.py"},
+            ),
+            pipeline_module.LocalTextNode(
+                text="RegisterUserUseCase orchestrates signup and calls the port for persistence.",
+                node_id="application-register-user#0",
+                metadata={"file_name": "src/application/register_user.py"},
+            ),
+            pipeline_module.LocalTextNode(
+                text="SqlUserRepository persists account records through the database adapter.",
+                node_id="infrastructure-user-repository#0",
+                metadata={"file_name": "src/infrastructure/sql_user_repository.py"},
+            ),
+        ]
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [readme_result],
+                {"strategy": strategy, "used_rerank": False},
+            )
+        )
+        pipeline = LocalRAGPipeline(nodes=code_nodes, retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "Explique as camadas de dominio, aplicacao e infraestrutura da arquitetura",
+                strategy="bm25_only",
+            )
+
+        citation_sources = {citation["source_doc"] for citation in result["citations"]}
+        self.assertIn("src/domain/account.py", citation_sources)
+        self.assertIn("src/application/register_user.py", citation_sources)
+        self.assertIn("src/infrastructure/sql_user_repository.py", citation_sources)
+        self.assertIn("README says", result["answer"])
+
+    def test_project_architecture_question_preserves_readme_and_confirms_with_code(self):
+        readme_result = NodeWithScore(
+            node=TextNode(
+                id_="readme-mvc",
+                text="README architecture says the application follows a layered service architecture, not classic MVC.",
+                metadata={"file_name": "README.md"},
+            ),
+            score=2.0,
+        )
+        code_nodes = [
+            pipeline_module.LocalTextNode(
+                text="AuthController exposes HTTP endpoints and delegates registration to AuthService.",
+                node_id="auth-controller#0",
+                metadata={"file_name": "src/controllers/auth.controller.ts"},
+            ),
+            pipeline_module.LocalTextNode(
+                text="AuthService implements registration workflow and password hashing.",
+                node_id="auth-service#0",
+                metadata={"file_name": "src/services/auth.service.ts"},
+            ),
+            pipeline_module.LocalTextNode(
+                text="UserRepository persists users and referral scores.",
+                node_id="user-repository#0",
+                metadata={"file_name": "src/repositories/user.repository.ts"},
+            ),
+        ]
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [readme_result],
+                {"strategy": strategy, "used_rerank": False},
+            )
+        )
+        pipeline = LocalRAGPipeline(nodes=code_nodes, retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("Mostre a arquitetura do projeto, e MVC?", strategy="bm25_only")
+
+        citation_sources = {citation["source_doc"] for citation in result["citations"]}
+        self.assertIn("README.md", citation_sources)
+        self.assertIn("src/controllers/auth.controller.ts", citation_sources)
+        self.assertIn("src/services/auth.service.ts", citation_sources)
+        self.assertIn("README architecture says", result["answer"])
+
+    def test_project_deploy_question_uses_readme_instead_of_shallow_code(self):
+        readme = pipeline_module.LocalTextNode(
+            text="## Deployment\n\nDeploy with Docker Compose for local infrastructure, then publish the web service on Render.",
+            node_id="readme#deploy",
+            metadata={"file_name": "README.md"},
+        )
+        shallow_code = pipeline_module.LocalTextNode(
+            text="const deployStatus = await api.get('/status');",
+            node_id="api#deploy",
+            metadata={"file_name": "src/services/api.ts"},
+        )
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="api-result",
+                            text="const deployStatus = await api.get('/status');",
+                            metadata={"file_name": "src/services/api.ts"},
+                        ),
+                        score=1.0,
+                    )
+                ],
+                {"strategy": strategy, "used_rerank": False},
+            )
+        )
+        pipeline = LocalRAGPipeline(nodes=[shallow_code, readme], retriever=retriever)
+
+        result = pipeline.answer_query("Como fazer deploy desse projeto?", strategy="bm25_only")
+
+        source_docs = [source["source_doc"] for source in result["sources"]]
+        self.assertIn("README.md", source_docs)
+        self.assertIn("Docker Compose", result["answer"])
+        self.assertIn("Render", result["answer"])
 
     def test_code_question_extract_fallback_references_source_files_not_import_noise(self):
         retriever = SimpleNamespace(
@@ -845,6 +969,106 @@ npm install.
             self.assertIn(tech, result["answer"])
         self.assertTrue(all({"source_doc", "score", "snippet"} <= set(citation) for citation in result["citations"]))
 
+    def test_chat_query_stack_uses_readme_declarations_and_manifest_confirmation(self):
+        readme = pipeline_module.LocalTextNode(
+            text=(
+                "## Stack e Ferramentas\n\n"
+                "### Backend\n\n"
+                "- NestJS 11\n- TypeScript\n- TypeORM 0.3\n- SQLite3\n- JWT (`@nestjs/jwt`)\n"
+                "- `class-validator`, `class-transformer`, `bcrypt`\n\n"
+                "### Frontend\n\n"
+                "- React 19\n- TypeScript 5\n- Vite 7\n- React Router DOM 7\n- Axios\n\n"
+                "### Qualidade\n\n"
+                "- ESLint\n- Jest (backend)\n- Prettier"
+            ),
+            node_id="readme#stack",
+            metadata={"file_name": "README.md"},
+        )
+        backend_package = pipeline_module.LocalTextNode(
+            text=(
+                "Package manifest for backend package backend with framework and platform hints: "
+                "NestJS, TypeORM, SQLite3, JWT, class-validator, class-transformer, bcrypt, TypeScript, Jest, Prettier."
+            ),
+            node_id="backend-package#0",
+            metadata={"file_name": "backend/package.json"},
+        )
+        frontend_package = pipeline_module.LocalTextNode(
+            text=(
+                "Package manifest for frontend package frontend with framework and platform hints: "
+                "React, TypeScript, Vite, React Router DOM, Axios, ESLint, Prettier."
+            ),
+            node_id="frontend-package#0",
+            metadata={"file_name": "frontend/package.json"},
+        )
+        api = pipeline_module.LocalTextNode(
+            text="Frontend api client uses fetch and JSON payloads.",
+            node_id="api#0",
+            metadata={"file_name": "frontend/src/services/api.ts"},
+        )
+        hash_util = pipeline_module.LocalTextNode(
+            text="bcrypt hashes and compares passwords.",
+            node_id="hash#0",
+            metadata={"file_name": "backend/src/common/utils/hash.util.ts"},
+        )
+        pipeline = LocalRAGPipeline(nodes=[api, hash_util, backend_package, frontend_package, readme])
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("quais sao as stacks desse projeto", strategy="hybrid_rerank")
+
+        for tech in [
+            "NestJS",
+            "TypeScript",
+            "TypeORM",
+            "SQLite3",
+            "JWT",
+            "class-validator",
+            "class-transformer",
+            "bcrypt",
+            "React",
+            "Vite",
+            "React Router DOM",
+            "Axios",
+            "ESLint",
+            "Jest",
+            "Prettier",
+        ]:
+            self.assertIn(tech, result["answer"])
+        self.assertIn("Stack do projeto", result["answer"])
+        self.assertNotIn("declared in README", result["answer"])
+        self.assertNotIn("confirmed by", result["answer"])
+        citation_sources = {citation["source_doc"] for citation in result["citations"]}
+        self.assertIn("README.md", citation_sources)
+        self.assertIn("backend/package.json", citation_sources)
+        self.assertIn("frontend/package.json", citation_sources)
+
+    def test_stack_query_is_not_dominated_by_shallow_code_sources(self):
+        readme = pipeline_module.LocalTextNode(
+            text="## Stack e Ferramentas\n\n### Frontend\n\n- React 19\n- TypeScript 5\n- Vite 7\n- Axios",
+            node_id="readme#stack",
+            metadata={"file_name": "README.md"},
+        )
+        package = pipeline_module.LocalTextNode(
+            text="Package manifest for frontend package frontend with framework and platform hints: React, TypeScript, Vite, Axios.",
+            node_id="package#0",
+            metadata={"file_name": "frontend/package.json"},
+        )
+        shallow_sources = [
+            pipeline_module.LocalTextNode(
+                text="fetch JSON API request VITE_API_URL frontend backend stack",
+                node_id=f"api#{index}",
+                metadata={"file_name": f"frontend/src/services/api{index}.ts"},
+            )
+            for index in range(4)
+        ]
+        pipeline = LocalRAGPipeline(nodes=[*shallow_sources, package, readme])
+
+        result = pipeline.answer_query("quais sao as stacks desse projeto", strategy="bm25_only")
+        top_sources = [source["source_doc"] for source in result["sources"][:2]]
+
+        self.assertEqual(top_sources, ["README.md", "frontend/package.json"])
+        self.assertIn("React", result["answer"])
+        self.assertIn("Axios", result["answer"])
+
     def test_chat_query_frontend_stack_does_not_mix_backend_technologies(self):
         nodes = [
             pipeline_module.LocalTextNode(
@@ -985,6 +1209,7 @@ npm install.
 
         self.assertTrue(policy.enabled)
         self.assertEqual([provider.name for provider in policy.providers], ["gemini", "github", "groq"])
+        self.assertEqual(policy.max_calls, 3)
 
     def test_cloud_chat_policy_accepts_groq_without_gemini_key(self):
         with patch.dict(

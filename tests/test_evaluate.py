@@ -1,5 +1,7 @@
 import unittest
+import io
 import json
+from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -103,6 +105,29 @@ class GoldenDatasetTests(unittest.TestCase):
             self.assertIn(metric, summary)
             self.assertIn(metric, rows[0])
         self.assertNotIn("faithfulness", summary)
+
+    def test_markdown_report_does_not_render_missing_ragas_metrics_as_zero(self):
+        results = {
+            "semantic_only": {
+                "lexical_faithfulness": 0.6,
+                "lexical_answer_relevancy": 0.2,
+                "lexical_context_recall": 0.3,
+                "lexical_context_precision": 0.1,
+            },
+            "hybrid_rerank": {
+                "answer_relevancy": 0.093,
+                "context_recall": 0.667,
+                "context_precision": 0.833,
+            },
+        }
+        output = io.StringIO()
+
+        with redirect_stdout(output):
+            evaluation.print_markdown_report(results)
+
+        text = output.getvalue()
+        self.assertIn("| semantic_only | n/a | n/a | n/a | n/a |", text)
+        self.assertNotIn("| semantic_only | 0.000 | 0.000 | 0.000 | 0.000 |", text)
 
     def test_run_evaluation_offline_never_calls_ragas_and_labels_backends_honestly(self):
         with TemporaryDirectory() as tmpdir:
@@ -503,7 +528,7 @@ class GoldenDatasetTests(unittest.TestCase):
         self.assertEqual(events[1], (0.5, "Evaluating bm25_only..."))
         self.assertEqual(events[-1], (1.0, "Evaluation complete."))
 
-    def test_run_evaluation_calls_real_ragas_once_after_all_strategies(self):
+    def test_run_evaluation_calls_real_ragas_for_each_strategy_after_offline_pass(self):
         with TemporaryDirectory() as tmpdir:
             golden_path = Path(tmpdir) / "golden_dataset.json"
             golden_path.write_text(
@@ -549,11 +574,73 @@ class GoldenDatasetTests(unittest.TestCase):
             ):
                 evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline())
 
-            run_ragas.assert_called_once()
-            self.assertEqual(run_ragas.call_args.kwargs["cloud_client"], client)
-            sampled_rows = run_ragas.call_args.args[0]
-            self.assertTrue(sampled_rows)
-            self.assertTrue(all(row["strategy"] == "hybrid_rerank" for row in sampled_rows))
+            self.assertEqual(run_ragas.call_count, 3)
+            for call in run_ragas.call_args_list:
+                self.assertEqual(call.kwargs["cloud_client"], client)
+                sampled_rows = call.args[0]
+                self.assertTrue(sampled_rows)
+                self.assertTrue(all(row["strategy"] == sampled_rows[0]["strategy"] for row in sampled_rows))
+            self.assertEqual(
+                [call.args[0][0]["strategy"] for call in run_ragas.call_args_list],
+                ["semantic_only", "bm25_only", "hybrid_rerank"],
+            )
+
+    def test_run_evaluation_keeps_offline_backend_for_strategy_when_cloud_ragas_fails(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            summary_path = Path(tmpdir) / "summary.csv"
+            detail_path = Path(tmpdir) / "detail.csv"
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "What is Python?",
+                            "ground_truth": "Python is a language.",
+                            "reference_context": "Python is a language.",
+                            "source_doc": "doc.md",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            calls = []
+
+            def fake_ragas(rows, **kwargs):
+                strategy = rows[0]["strategy"]
+                calls.append(strategy)
+                if strategy == "bm25_only":
+                    raise evaluation.cloud_ragas.CloudProviderUnavailable("cooling down")
+                return {
+                    "faithfulness": 0.9,
+                    "answer_relevancy": 0.8,
+                    "context_recall": 0.7,
+                    "context_precision": 0.6,
+                }
+
+            with (
+                patch.object(evaluation, "STRATEGIES", ["semantic_only", "bm25_only", "hybrid_rerank"]),
+                patch.object(evaluation, "EVAL_DIR", Path(tmpdir)),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.dict(
+                    "os.environ",
+                    {
+                        "USE_CLOUD_FREE_TIER_RAGAS": "1",
+                        "ALLOW_CLOUD_FREE_TIER": "1",
+                        "GEMINI_API_KEY": "key",
+                    },
+                    clear=True,
+                ),
+                patch.object(evaluation.cloud_ragas, "run_ragas", side_effect=fake_ragas),
+            ):
+                evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline(), cloud_client=object())
+
+            self.assertEqual(calls, ["semantic_only", "bm25_only", "hybrid_rerank"])
+            summary = pd.read_csv(summary_path)
+            backends = dict(zip(summary["strategy"], summary["summary_backend"]))
+            self.assertEqual(backends["semantic_only"], "cloud_free_tier_ragas")
+            self.assertEqual(backends["bm25_only"], "offline_heuristic")
+            self.assertEqual(backends["hybrid_rerank"], "cloud_free_tier_ragas")
 
     def test_run_evaluation_reuses_one_cloud_client_across_strategies(self):
         with TemporaryDirectory() as tmpdir:
@@ -605,7 +692,7 @@ class GoldenDatasetTests(unittest.TestCase):
                 call.kwargs["cloud_client"]
                 for call in run_ragas.call_args_list
             ]
-            self.assertEqual(clients, [client])
+            self.assertEqual(clients, [client, client])
 
     def test_run_evaluation_keeps_per_question_backend_honest_when_summary_uses_ragas(self):
         with TemporaryDirectory() as tmpdir:
@@ -693,6 +780,126 @@ class SourceScopedEvalTests(unittest.TestCase):
             self.assertEqual(len(dataset), 1)
             self.assertEqual(dataset[0]["source_slug"], "current-repo")
             self.assertTrue(golden_path.exists())
+
+    def test_generate_pre_questions_uses_non_readme_indexed_source_when_available(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+            readme = TextNode(
+                id_="readme",
+                text="README overview explains setup and high-level architecture.",
+                metadata={"file_name": "README.md"},
+            )
+            usecase = TextNode(
+                id_="usecase",
+                text="RegisterUserUseCase coordinates account creation across application services.",
+                metadata={"file_name": "src/application/register_user.py"},
+            )
+            repository = TextNode(
+                id_="repository",
+                text="SqlUserRepository persists accounts in the infrastructure layer.",
+                metadata={"file_name": "src/infrastructure/sql_user_repository.py"},
+            )
+            indexed_pipeline = StaticPipeline(nodes=[readme, usecase, repository])
+            current_source_path.write_text(json.dumps({"source_slug": "layered-repo"}), encoding="utf-8")
+
+            with (
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=indexed_pipeline),
+            ):
+                dataset = evaluation.generate_pre_questions(
+                    output_path=golden_path,
+                    providers=[StaticProvider()],
+                    chunk_limit=1,
+                    final_limit=4,
+                )
+
+        source_docs = {item["source_doc"] for item in dataset}
+        self.assertIn("src/application/register_user.py", source_docs)
+        self.assertNotEqual(source_docs, {"README.md"})
+
+    def test_generate_pre_questions_adds_composite_stack_context_from_readme_manifest_and_code(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+            readme = TextNode(
+                id_="readme",
+                text="## Stack e Ferramentas\n\n### Backend\n\n- NestJS 11\n\n### Frontend\n\n- React 19",
+                metadata={"file_name": "README.md"},
+            )
+            package = TextNode(
+                id_="package",
+                text="Package manifest for frontend package frontend with framework and platform hints: React, Vite.",
+                metadata={"file_name": "frontend/package.json"},
+            )
+            code = TextNode(
+                id_="code",
+                text="export class AuthService { register() { return 'ok'; } }",
+                metadata={"file_name": "backend/src/auth/auth.service.ts"},
+            )
+            indexed_pipeline = StaticPipeline(nodes=[readme, package, code])
+            current_source_path.write_text(json.dumps({"source_slug": "stack-repo"}), encoding="utf-8")
+
+            with (
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=indexed_pipeline),
+            ):
+                dataset = evaluation.generate_pre_questions(
+                    output_path=golden_path,
+                    providers=[StaticProvider()],
+                    chunk_limit=3,
+                    final_limit=6,
+                )
+
+        stack_items = [item for item in dataset if "stack" in item["question"].lower()]
+        self.assertTrue(stack_items)
+        context = stack_items[0]["reference_context"]
+        self.assertIn("README.md", context)
+        self.assertIn("frontend/package.json", context)
+        self.assertIn("backend/src/auth/auth.service.ts", context)
+
+    def test_generate_pre_questions_adds_composite_project_context_for_architecture(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+            readme = TextNode(
+                id_="readme",
+                text="## Architecture\n\nThe project is organized as domain, application, and infrastructure layers.",
+                metadata={"file_name": "README.md"},
+            )
+            docs = TextNode(
+                id_="docs",
+                text="Deployment docs explain Docker Compose and Render environments.",
+                metadata={"file_name": "docs/deployment.md"},
+            )
+            code = TextNode(
+                id_="code",
+                text="class RegisterUserUseCase: pass",
+                metadata={"file_name": "src/application/register_user.py"},
+            )
+            indexed_pipeline = StaticPipeline(nodes=[readme, docs, code])
+            current_source_path.write_text(json.dumps({"source_slug": "architecture-repo"}), encoding="utf-8")
+
+            with (
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=indexed_pipeline),
+            ):
+                dataset = evaluation.generate_pre_questions(
+                    output_path=golden_path,
+                    providers=[StaticProvider()],
+                    chunk_limit=3,
+                    final_limit=6,
+                )
+
+        architecture_items = [item for item in dataset if "architecture" in item["question"].lower()]
+        self.assertTrue(architecture_items)
+        context = architecture_items[0]["reference_context"]
+        self.assertIn("README.md", context)
+        self.assertIn("docs/deployment.md", context)
+        self.assertIn("src/application/register_user.py", context)
 
     def test_run_evaluation_writes_evaluated_source_column_to_csv(self):
         with TemporaryDirectory() as tmpdir:

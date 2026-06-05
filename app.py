@@ -33,6 +33,7 @@ GOLDEN_DATASET_PATH = EVAL_DIR / "golden_dataset.json"
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
+LEXICAL_METRICS = ["lexical_faithfulness", "lexical_answer_relevancy", "lexical_context_recall", "lexical_context_precision"]
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 CHAT_MESSAGES_KEY = "chat_messages"
 PREPARED_SOURCE_KEY = "prepared_source"
@@ -90,7 +91,7 @@ def _read_csv(path: Path, columns: list[str]) -> pd.DataFrame:
 
 
 def _coerce_metric_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    for metric in METRICS:
+    for metric in [*METRICS, *LEXICAL_METRICS]:
         if metric not in frame.columns:
             frame[metric] = pd.NA
         frame[metric] = pd.to_numeric(frame[metric], errors="coerce")
@@ -98,7 +99,8 @@ def _coerce_metric_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_eval_summary(path: Path = RAGAS_RESULTS_PATH) -> pd.DataFrame:
-    frame = _read_csv(path, ["strategy", *METRICS, "summary_backend", "evaluated_source"])
+    columns = ["strategy", *METRICS, *LEXICAL_METRICS, "summary_backend", "evaluated_source"]
+    frame = _read_csv(path, columns)
     if "strategy" not in frame.columns:
         frame.insert(0, "strategy", None)
     if "summary_backend" not in frame.columns:
@@ -106,7 +108,7 @@ def load_eval_summary(path: Path = RAGAS_RESULTS_PATH) -> pd.DataFrame:
     if "evaluated_source" not in frame.columns:
         frame["evaluated_source"] = ""
     frame = _coerce_metric_columns(frame)
-    return frame[["strategy", *METRICS, "summary_backend", "evaluated_source"]]
+    return frame[columns]
 
 
 def load_per_question(path: Path = RAGAS_PER_QUESTION_PATH) -> pd.DataFrame:
@@ -148,10 +150,15 @@ def metric_card_values(summary: pd.DataFrame, strategy: str | None = None) -> di
 
 
 def filter_questions_below_threshold(frame: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    available_metrics = [metric for metric in METRICS if metric in frame.columns]
+    available_metrics = [
+        metric
+        for metric in [*METRICS, *LEXICAL_METRICS]
+        if metric in frame.columns and frame[metric].notna().any()
+    ]
     if frame.empty or not available_metrics:
         return frame.copy()
-    mask = frame[available_metrics].lt(threshold).any(axis=1)
+    metric_values = frame[available_metrics].apply(pd.to_numeric, errors="coerce")
+    mask = metric_values.lt(threshold).fillna(False).any(axis=1)
     return frame[mask].copy()
 
 
@@ -492,6 +499,9 @@ def run_evaluation_inline(use_real_ragas: bool = True) -> None:
 def _run_with_timeout(fn, timeout_seconds: float) -> bool:
     import concurrent.futures as _cf
 
+    if timeout_seconds <= 0:
+        return False
+
     _pool = _cf.ThreadPoolExecutor(max_workers=1)
     _future = _pool.submit(fn)
     try:
@@ -513,17 +523,33 @@ def last_eval_date(path: Path = RAGAS_RESULTS_PATH) -> str:
 def build_grouped_bar_chart(summary: pd.DataFrame):
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(9, 4.5))
     if summary.empty:
+        fig, ax = plt.subplots(figsize=(9, 4.5))
         ax.text(0.5, 0.5, "No evaluation data", ha="center", va="center")
         ax.axis("off")
         return fig
 
-    summary.set_index("strategy")[METRICS].plot(kind="bar", ax=ax)
-    ax.set_xlabel("Strategy")
-    ax.set_ylabel("Score")
-    ax.set_ylim(0, 1)
-    ax.legend(loc="best")
+    ragas_metrics = [metric for metric in METRICS if metric in summary.columns and summary[metric].notna().any()]
+    lexical_metrics = [metric for metric in LEXICAL_METRICS if metric in summary.columns and summary[metric].notna().any()]
+    metric_groups = [("Cloud RAGAS metrics", ragas_metrics), ("Offline lexical metrics", lexical_metrics)]
+    metric_groups = [(title, metrics) for title, metrics in metric_groups if metrics]
+    if not metric_groups:
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.text(0.5, 0.5, "No finite evaluation metrics", ha="center", va="center")
+        ax.axis("off")
+        return fig
+
+    fig, axes = plt.subplots(len(metric_groups), 1, figsize=(9, 4.5 * len(metric_groups)))
+    if len(metric_groups) == 1:
+        axes = [axes]
+    indexed = summary.set_index("strategy")
+    for ax, (title, metrics) in zip(axes, metric_groups):
+        indexed[metrics].plot(kind="bar", ax=ax)
+        ax.set_title(title)
+        ax.set_xlabel("Strategy")
+        ax.set_ylabel("Score")
+        ax.set_ylim(0, 1)
+        ax.legend(loc="best")
     fig.tight_layout()
     return fig
 
@@ -1321,22 +1347,18 @@ def _chat_history(st) -> list[dict[str, Any]]:
     return st.session_state[CHAT_MESSAGES_KEY]
 
 
-def _citation_text(citation: dict[str, Any], max_snippet_chars: int = 180) -> str:
+def _citation_text(citation: dict[str, Any], index: int) -> str:
     source = citation.get("source_doc") or citation.get("source") or "unknown source"
-    snippet = str(citation.get("snippet") or "").strip()
-    if len(snippet) > max_snippet_chars:
-        snippet = f"{snippet[: max_snippet_chars - 1].rstrip()}..."
-    score = citation.get("score")
-    score_text = f" score={score:.3f}" if isinstance(score, (int, float)) else ""
-    return f"{source}{score_text}: {snippet}" if snippet else f"{source}{score_text}"
+    return f"{index}. {source}"
 
 
 def _render_citations(st, citations: list[dict[str, Any]]) -> None:
     if not citations:
         st.caption("No citations returned.")
         return
-    for citation in citations[:5]:
-        st.caption(_citation_text(citation))
+    st.write("Sources")
+    for index, citation in enumerate(citations[:5], start=1):
+        st.caption(_citation_text(citation, index))
 
 
 def _synthesis_status_caption(synthesis: dict[str, Any] | None) -> str:
@@ -1465,11 +1487,19 @@ def _render_eval_tab(st) -> None:
         else:
             with st.spinner("Running fast offline evaluation..."):
                 try:
-                    _with_session_gate_env(
-                        st,
-                        ["ALLOW_INDEX_BUILD"],
-                        lambda: run_evaluation_inline(use_real_ragas=False),
-                    )
+                    previous_cloud_chat = os.environ.get("ALLOW_CLOUD_CHAT")
+                    try:
+                        os.environ["ALLOW_CLOUD_CHAT"] = "0"
+                        _with_session_gate_env(
+                            st,
+                            ["ALLOW_INDEX_BUILD"],
+                            lambda: run_evaluation_inline(use_real_ragas=False),
+                        )
+                    finally:
+                        if previous_cloud_chat is None:
+                            os.environ.pop("ALLOW_CLOUD_CHAT", None)
+                        else:
+                            os.environ["ALLOW_CLOUD_CHAT"] = previous_cloud_chat
                     _show_eval_success(st)
                     st.rerun()
                 except Exception as exc:
@@ -1487,10 +1517,11 @@ def _render_eval_tab(st) -> None:
             )
             with st.spinner(spinner_msg):
                 def _run_cloud_ragas():
-                    previous = {name: os.environ.get(name) for name in ["USE_CLOUD_FREE_TIER_RAGAS", "ALLOW_CLOUD_FREE_TIER"]}
+                    previous = {name: os.environ.get(name) for name in ["USE_CLOUD_FREE_TIER_RAGAS", "ALLOW_CLOUD_FREE_TIER", "ALLOW_CLOUD_CHAT"]}
                     try:
                         os.environ["USE_CLOUD_FREE_TIER_RAGAS"] = "1"
                         os.environ["ALLOW_CLOUD_FREE_TIER"] = "1"
+                        os.environ["ALLOW_CLOUD_CHAT"] = "0"
                         return _with_session_gate_env(
                             st,
                             ["ALLOW_INDEX_BUILD"],

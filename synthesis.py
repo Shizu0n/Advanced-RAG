@@ -7,6 +7,7 @@ import os
 
 logger = logging.getLogger(__name__)
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -59,7 +60,8 @@ def _build_prompt(
         "2. NÃO retorne JSON cru, listas de código ou snippets sem explicação.",
         "3. Sintetize as informações em uma resposta completa e coerente em linguagem natural.",
         "4. Se a informação for insuficiente, diga claramente que não há evidências suficientes.",
-        "5. Ao final, cite os documentos referenciados.",
+        "5. Do not include citations, source lists, or referenced-document footers in the answer body; "
+        "the interface will display sources separately.",
         fine_tune_rules,
         "",
         f"PERGUNTA: {query}",
@@ -159,8 +161,25 @@ def _strip_wrapping_code_fences(raw: str) -> str:
     return text.strip()
 
 
-def _post_process_llm_response(raw: str) -> str:
+def _fold_for_footer_match(text: str) -> str:
+    normalized = unicodedata.normalize("NFKD", text.lower())
+    return "".join(char for char in normalized if not unicodedata.combining(char))
+
+
+def _strip_generated_citation_footer(text: str) -> str:
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        folded_line = _fold_for_footer_match(line)
+        if re.search(r"^\s*(citacao|citacoes|citation|citations|fontes?|sources?|documentos?\s+referenciados?)\s*:", folded_line):
+            folded_footer = _fold_for_footer_match("\n".join(lines[index:]))
+            if re.search(r"\bdocumento\s+\d+\b", folded_footer) or re.search(r"\b(readme|package\.json|\.tsx?|\.py|\.md)\b", folded_footer):
+                return "\n".join(lines[:index]).rstrip()
+    return text
+
+
+def _post_process_llm_response(raw: str) -> str | None:
     text = _strip_wrapping_code_fences(raw)
+    text = _strip_generated_citation_footer(text)
     if not text:
         return None
     return text

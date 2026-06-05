@@ -136,7 +136,7 @@ Runtime defaults come from `.env`. The Streamlit UI can override selected operat
 | Variable | Default | What it does |
 |---|---:|---|
 | `ALLOW_CLOUD_CHAT` | `1` | Allows query-time generative synthesis; set `ALLOW_CLOUD_CHAT=0` to force extractive fallback |
-| `MAX_CLOUD_CHAT_CALLS` | `1` | Limits how many cloud chat calls the query path may make |
+| `MAX_CLOUD_CHAT_CALLS` | provider count | Limits how many cloud chat provider attempts the query path may make |
 | `CLOUD_CHAT_PROVIDER_TIMEOUT_SECONDS` | `10` | Per-provider timeout for a single cloud chat attempt |
 | `CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS` | `30` | Total timeout budget across the cloud chat flow |
 
@@ -149,8 +149,10 @@ These variables affect evaluation only. They do not enable query-time cloud chat
 | `USE_CLOUD_FREE_TIER_RAGAS` | `0` | Enables cloud-backed RAGAS evaluation paths |
 | `ALLOW_CLOUD_FREE_TIER` | `0` | Allows cloud-backed free-tier evaluation flows |
 | `MAX_CLOUD_CALLS` | `120` | Sets the maximum evaluation API call budget |
+| `MAX_REAL_RAGAS_ROWS` | `3` | Limits how many rows per strategy are sent to Cloud RAGAS |
 | `CLOUD_RAGAS_STRICT` | `0` | When `1`, evaluation fails hard instead of falling back to offline heuristics |
 | `CLOUD_PROVIDER_ORDER` | `gemini,github,groq` | Configures the allowlisted provider fallback order |
+| `CLOUD_PROVIDER_COOLDOWN_SECONDS` | `60` | Default provider cooldown after quota responses when `Retry-After` is absent |
 
 ### Session Overrides in the UI
 
@@ -167,7 +169,7 @@ The Streamlit UI exposes session-scoped toggles for:
 
 These toggles use `.env` as the default source of truth, apply only to the current Streamlit session, and do not rewrite `.env`.
 
-Advanced limits such as `MAX_CLOUD_CALLS`, `CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS`, and `CLOUD_RAGAS_STRICT` remain environment-only.
+Advanced limits such as `MAX_CLOUD_CALLS`, `MAX_REAL_RAGAS_ROWS`, `CLOUD_PROVIDER_COOLDOWN_SECONDS`, `CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS`, and `CLOUD_RAGAS_STRICT` remain environment-only.
 
 ## Usage
 
@@ -270,7 +272,7 @@ Outputs:
 | Context recall | Whether retrieval captured the needed information |
 | Context precision | Whether retrieved context is focused rather than noisy |
 
-Offline heuristics use local overlap-based scoring. Cloud RAGAS evaluation uses supported free-tier providers with local embeddings and no paid-provider dependency.
+Offline heuristics use local overlap-based scoring. Cloud RAGAS evaluation samples each retrieval strategy, uses supported free-tier providers with local embeddings, and keeps per-strategy offline fallbacks when a cloud pass is unavailable.
 
 ## Testing
 

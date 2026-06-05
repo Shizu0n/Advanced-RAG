@@ -6,6 +6,7 @@ import json
 import logging
 
 logger = logging.getLogger(__name__)
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -16,7 +17,7 @@ import pandas as pd
 import requests
 
 import cloud_ragas
-from pipeline import LocalRAGPipeline, load_local_context_nodes
+from pipeline import LocalRAGPipeline, load_local_context_nodes, _is_code_evidence_source, _is_readme_source
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -182,10 +183,97 @@ def _specificity_score(item: dict[str, str]) -> tuple[int, int]:
     return (len(question), len(set(terms)))
 
 
+def _question_source_group(node: Any) -> str:
+    source = _source_doc(node)
+    source_key = source.lower().replace("\\", "/")
+    if source_key.endswith(("package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod")):
+        return "manifest"
+    if _is_code_evidence_source(source):
+        return "code"
+    if _is_readme_source(source):
+        return "readme"
+    if Path(source_key).suffix.lower() in {".md", ".rst", ".txt"}:
+        return "docs"
+    return "other"
+
+
+def _select_question_source_nodes(nodes: Sequence[Any], limit: int) -> list[Any]:
+    if limit <= 0:
+        return []
+
+    grouped: dict[str, list[Any]] = {"code": [], "docs": [], "manifest": [], "readme": [], "other": []}
+    for node in nodes:
+        grouped.setdefault(_question_source_group(node), []).append(node)
+
+    selected: list[Any] = []
+    seen: set[str] = set()
+    for group in ("code", "docs", "manifest", "readme", "other"):
+        for node in grouped.get(group, []):
+            key = f"{_source_doc(node)}::{getattr(node, 'node_id', id(node))}"
+            if key in seen:
+                continue
+            selected.append(node)
+            seen.add(key)
+            break
+
+    for node in nodes:
+        if len(selected) >= limit:
+            break
+        key = f"{_source_doc(node)}::{getattr(node, 'node_id', id(node))}"
+        if key in seen:
+            continue
+        selected.append(node)
+        seen.add(key)
+
+    return selected[:limit]
+
+
+@dataclass(frozen=True)
+class CompositeQuestionNode:
+    text: str
+    node_id: str
+    metadata: dict[str, str]
+
+    def get_content(self) -> str:
+        return self.text
+
+
+def _build_composite_question_nodes(nodes: Sequence[Any]) -> list[Any]:
+    grouped: dict[str, list[Any]] = {"readme": [], "manifest": [], "code": [], "docs": [], "other": []}
+    for node in nodes:
+        grouped.setdefault(_question_source_group(node), []).append(node)
+
+    readme = grouped.get("readme", [])[:1]
+    docs = grouped.get("docs", [])[:1]
+    manifests = grouped.get("manifest", [])[:2]
+    code = grouped.get("code", [])[:2]
+    composites: list[Any] = []
+    if readme and (docs or manifests or code):
+        parts = [*readme, *docs, *manifests, *code]
+        context = "\n\n".join(
+            f"Source: {_source_doc(node)}\n{_node_text(node)[:1200]}"
+            for node in parts
+        ).strip()
+        composites.append(
+            CompositeQuestionNode(
+                text=context,
+                node_id="composite-project-readme-and-source",
+                metadata={"file_name": "composite:README+source-evidence"},
+            )
+        )
+    return composites
+
+
 def _realistic_user_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
     context = "\n\n".join(_node_text(node)[:1000] for node in list(nodes)[:3]).strip()
     source_doc = _source_doc(nodes[0]) if nodes else "unknown"
     return [
+        {
+            "question": "What stack and tools does this project use?",
+            "ground_truth": "List the stack declared in project documentation and confirm it with package manifests or source evidence when available.",
+            "reference_context": context,
+            "source_doc": source_doc,
+        },
         {
             "question": "How do I set up and run this project?",
             "ground_truth": "Use the setup and run instructions documented in the retrieved project context.",
@@ -233,17 +321,19 @@ def generate_golden_dataset(
     providers = list(providers or default_question_providers())
     current_source = load_current_source()
     source_slug = current_source.get("source_slug", "") if current_source else ""
+    question_nodes = _select_question_source_nodes(nodes, chunk_limit)
+    composite_nodes = _build_composite_question_nodes(question_nodes or nodes)
 
-    candidates = _realistic_user_query_items(nodes)
-    for node in list(nodes)[:chunk_limit]:
+    candidates = _realistic_user_query_items([*composite_nodes, *(question_nodes or nodes)])
+    for node in [*composite_nodes, *question_nodes]:
         item = generate_golden_item(node, providers)
         candidates.append(item)
     if source_slug:
         for item in candidates:
             item["source_slug"] = source_slug
 
-    realistic = candidates[:3]
-    remaining = filter_best_golden_items(candidates[3:], limit=max(final_limit - len(realistic), 0))
+    realistic = candidates[:4]
+    remaining = filter_best_golden_items(candidates[4:], limit=max(final_limit - len(realistic), 0))
     dataset = (realistic + remaining)[:final_limit]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(dataset, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -450,13 +540,14 @@ def run_evaluation(
         detail_rows.extend(rows)
         logger.info("Strategy %s: %s (backend=%s)", strategy, summary, "offline_heuristic")
 
-    real_scores = None
     if use_real_ragas and cloud_client is not None:
-        preferred = "hybrid_rerank" if "hybrid_rerank" in rows_by_strategy else STRATEGIES[-1]
-        real_scores = maybe_run_real_ragas(rows_by_strategy.get(preferred, []), cloud_client=cloud_client, enabled=True)
-        if real_scores:
-            summaries[preferred] = real_scores
-            summary_backends[preferred] = "cloud_free_tier_ragas"
+        for index, strategy in enumerate(STRATEGIES):
+            if progress_callback:
+                progress_callback(index / max(len(STRATEGIES), 1), f"Cloud RAGAS: {strategy}...")
+            real_scores = maybe_run_real_ragas(rows_by_strategy.get(strategy, []), cloud_client=cloud_client, enabled=True)
+            if real_scores:
+                summaries[strategy] = real_scores
+                summary_backends[strategy] = "cloud_free_tier_ragas"
 
     for row in detail_rows:
         row["summary_backend"] = summary_backends.get(row["strategy"], "offline_heuristic")
@@ -482,20 +573,32 @@ def build_index():
 
 
 def print_markdown_report(results: dict[str, dict[str, float]]) -> None:
-    metrics = RAGAS_METRICS if any(set(scores) & set(RAGAS_METRICS) for scores in results.values()) else LEXICAL_METRICS
+    has_ragas = any(set(scores) & set(RAGAS_METRICS) for scores in results.values())
+    has_lexical = any(set(scores) & set(LEXICAL_METRICS) for scores in results.values())
+    metrics = [*(RAGAS_METRICS if has_ragas else []), *(LEXICAL_METRICS if has_lexical else [])]
+    if not metrics:
+        metrics = RAGAS_METRICS
     print("| strategy | " + " | ".join(metrics) + " |")
     print("|---|" + "|".join("---" for _ in metrics) + "|")
     for strategy, scores in results.items():
-        values = " | ".join(f"{scores.get(metric, 0.0):.3f}" for metric in metrics)
+        values = " | ".join(_format_metric_value(scores.get(metric)) for metric in metrics)
         print(f"| {strategy} | {values} |")
 
-    averages = {strategy: sum(scores.values()) / len(scores) for strategy, scores in results.items()}
+    averages = {
+        strategy: sum(values) / len(values)
+        for strategy, scores in results.items()
+        if (values := [float(value) for value in scores.values() if isinstance(value, (int, float)) and math.isfinite(float(value))])
+    }
+    if not averages:
+        print("\nBest strategy: n/a (no finite metric values were produced).")
+        return
     best = max(averages, key=averages.get)
     worst_strategy, worst_metric, worst_value = min(
         (
             (strategy, metric, value)
             for strategy, scores in results.items()
             for metric, value in scores.items()
+            if isinstance(value, (int, float)) and math.isfinite(float(value))
         ),
         key=lambda item: item[2],
     )
@@ -504,6 +607,12 @@ def print_markdown_report(results: dict[str, dict[str, float]]) -> None:
         f"Worst metric: {worst_metric} on {worst_strategy} = {worst_value:.3f}. "
         "Hypothesis: retrieved context or extractive answer lacks enough lexical overlap with the reference."
     )
+
+
+def _format_metric_value(value: Any) -> str:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return "n/a"
+    return f"{float(value):.3f}"
 
 
 def _load_indexed_pipeline() -> LocalRAGPipeline | None:

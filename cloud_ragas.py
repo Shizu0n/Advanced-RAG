@@ -8,6 +8,7 @@ import logging
 logger = logging.getLogger(__name__)
 import hashlib
 import json
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ QUOTA_STATUS_CODES = {403, 429, 500, 502, 503, 504}
 METRIC_NAMES = ("faithfulness", "answer_relevancy", "context_recall", "context_precision")
 SUPPORTED_CLOUD_PROVIDERS = ("gemini", "github", "groq")
 DEFAULT_PROVIDER_ORDER = ("gemini", "github", "groq")
+DEFAULT_PROVIDER_COOLDOWN_SECONDS = 60.0
 
 
 class CloudProviderUnavailable(RuntimeError):
@@ -177,9 +179,7 @@ class FreeTierCloudClient:
     ) -> dict[str, Any]:
         errors: list[str] = []
         now = time.monotonic()
-        available = [provider for provider in providers if now >= self._provider_backoff.get(provider.name, 0.0)]
-        provider_chain = available or list(providers)
-        for provider in provider_chain:
+        for provider in providers:
             cache_payload = {"provider": provider.name, "model": provider.model, "payload": payload}
             cache_key = self._cache_key(method, provider.model, cache_payload)
             cached = self._read_cache(cache_key)
@@ -187,13 +187,20 @@ class FreeTierCloudClient:
                 logger.debug("Cache hit for %s/%s", provider.name, provider.model)
                 return cached
 
+            backoff_until = self._provider_backoff.get(provider.name, 0.0)
+            if now < backoff_until:
+                remaining = max(1, int(backoff_until - now))
+                logger.info("Provider %s cooling down for %ds, skipping", provider.name, remaining)
+                errors.append(f"{provider.name}/{provider.model}: cooling down for {remaining}s")
+                continue
+
             logger.info("Trying provider %s/%s (budget: %d/%d)", provider.name, provider.model, self.budget.calls_made, self.budget.max_calls)
             self.budget.consume()
             url, request_payload, headers = self._provider_request(provider, payload)
             response = self.post(url, json=request_payload, headers=headers, timeout=30)
             if getattr(response, "status_code", 200) in QUOTA_STATUS_CODES:
                 logger.warning("Provider %s returned HTTP %s, skipping", provider.name, response.status_code)
-                self._provider_backoff[provider.name] = time.monotonic() + 60.0
+                self._provider_backoff[provider.name] = time.monotonic() + self._quota_cooldown_seconds(response)
                 errors.append(f"{provider.name}/{provider.model}: HTTP {response.status_code}")
                 continue
             response.raise_for_status()
@@ -202,6 +209,17 @@ class FreeTierCloudClient:
             logger.info("Provider %s succeeded", provider.name)
             return data
         raise CloudProviderUnavailable("; ".join(errors) or "cloud providers unavailable")
+
+    def _quota_cooldown_seconds(self, response: Any) -> float:
+        default = float(os.getenv("CLOUD_PROVIDER_COOLDOWN_SECONDS", str(DEFAULT_PROVIDER_COOLDOWN_SECONDS)))
+        headers = getattr(response, "headers", {}) or {}
+        retry_after = headers.get("Retry-After") or headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(1.0, float(retry_after))
+            except ValueError:
+                pass
+        return max(1.0, default)
 
     def _provider_request(self, provider: CloudProvider, payload: dict[str, Any]) -> tuple[str, dict[str, Any], dict[str, str]]:
         prompt = payload["contents"][0]["parts"][0]["text"]
@@ -262,7 +280,7 @@ class FreeTierCloudClient:
             self.budget.consume()
             response = self.post(url, json=payload, headers=self._gemini_headers(provider.api_key), timeout=30)
             if getattr(response, "status_code", 200) in QUOTA_STATUS_CODES:
-                self._provider_backoff[provider.name] = time.monotonic() + 60.0
+                self._provider_backoff[provider.name] = time.monotonic() + self._quota_cooldown_seconds(response)
                 errors.append(f"{model}: HTTP {response.status_code}")
                 continue
             response.raise_for_status()
@@ -444,10 +462,15 @@ def _result_to_scores(result: Any) -> dict[str, float]:
     for metric in METRIC_NAMES:
         value = data.get(metric)
         if isinstance(value, dict):
-            values = [float(item) for item in value.values()]
-            scores[metric] = sum(values) / max(len(values), 1)
+            values = [float(item) for item in value.values() if math.isfinite(float(item))]
+            if values:
+                scores[metric] = sum(values) / len(values)
         elif isinstance(value, list):
-            scores[metric] = sum(float(item) for item in value) / max(len(value), 1)
+            values = [float(item) for item in value if math.isfinite(float(item))]
+            if values:
+                scores[metric] = sum(values) / len(values)
         elif value is not None:
-            scores[metric] = float(value)
+            numeric = float(value)
+            if math.isfinite(numeric):
+                scores[metric] = numeric
     return scores

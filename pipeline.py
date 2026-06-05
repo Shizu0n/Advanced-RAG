@@ -117,13 +117,19 @@ EMPTY_LOCAL_CONTEXT_ANSWER = "No local context files were found for offline retr
 LOW_EVIDENCE_ANSWER = "Nao encontrei evidencia suficiente no contexto recuperado para responder sem inventar."
 LOW_EVIDENCE_THRESHOLD = 0.08
 KNOWN_TECHNOLOGIES = (
+    "React Router DOM",
     "React Router",
     "TypeScript",
     "Next.js",
     "NestJS",
     "Express",
     "TypeORM",
+    "SQLite3",
     "SQLite",
+    "JWT",
+    "class-validator",
+    "class-transformer",
+    "bcrypt",
     "React",
     "Vite",
     "Axios",
@@ -199,11 +205,36 @@ LOW_VALUE_CODE_QUERY_TERMS = {
 INTENT_REWRITES = {
     "stack": "stack tech stack tecnologias ferramentas frameworks dependencies package.json frontend backend react vite nestjs",
     "overview": "overview visao geral resumo objetivo problema solucao free-tier rag workspace local retrieval streamlit evaluation",
-    "architecture": "architecture arquitetura layer layers camada camadas modules modulos estrutura fluxo components backend frontend service services controller controllers repository repositories",
-    "setup": "setup install instalar executar rodar ambiente env scripts npm",
+    "architecture": "architecture arquitetura mvc layer layers camada camadas modules modulos estrutura fluxo components backend frontend service services controller controllers repository repositories model models view views",
+    "setup": "setup install instalar executar rodar ambiente env scripts npm deploy deployment docker compose build",
     "security": "security seguranca auth authentication jwt password senha bcrypt guard token",
     "evaluation": "evaluation avaliacao metricas tests testes qualidade benchmark ragas",
     "fine_tune": "fine tune training dataset hyperparameters lora qlora phi training_details",
+}
+ARCHITECTURE_LAYER_ALIASES = {
+    "adapter": {"adapter", "adapters", "gateway", "gateways", "integration", "integrations"},
+    "adapters": {"adapter", "adapters", "gateway", "gateways", "integration", "integrations"},
+    "aplicacao": {"application", "usecase", "usecases", "interactor", "service"},
+    "application": {"application", "usecase", "usecases", "interactor", "service"},
+    "app": {"application", "usecase", "usecases", "interactor", "service"},
+    "core": {"core", "domain", "shared"},
+    "domain": {"domain", "entity", "entities", "model", "models", "aggregate", "aggregates"},
+    "dominio": {"domain", "entity", "entities", "model", "models", "aggregate", "aggregates"},
+    "infra": {"infrastructure", "repository", "repositories", "persistence", "database", "adapter", "adapters"},
+    "infrastructure": {"infrastructure", "repository", "repositories", "persistence", "database", "adapter", "adapters"},
+    "infraestrutura": {"infrastructure", "repository", "repositories", "persistence", "database", "adapter", "adapters"},
+    "interface": {"interface", "interfaces", "presentation", "controller", "controllers", "route", "routes", "api"},
+    "interfaces": {"interface", "interfaces", "presentation", "controller", "controllers", "route", "routes", "api"},
+    "mvc": {"model", "models", "view", "views", "controller", "controllers", "route", "routes"},
+    "presentation": {"presentation", "controller", "controllers", "route", "routes", "api", "view", "views"},
+    "usecase": {"usecase", "usecases", "application", "interactor", "service"},
+    "usecases": {"usecase", "usecases", "application", "interactor", "service"},
+}
+ARCHITECTURE_LAYER_GROUPS = {
+    "domain": {"domain", "entity", "entities", "model", "models", "aggregate", "aggregates", "core"},
+    "application": {"application", "app", "usecase", "usecases", "interactor", "service", "services", "command", "commands", "query", "queries", "handler", "handlers"},
+    "infrastructure": {"infrastructure", "infra", "repository", "repositories", "persistence", "database", "adapter", "adapters", "gateway", "gateways", "client", "clients"},
+    "presentation": {"presentation", "interface", "interfaces", "controller", "controllers", "route", "routes", "api", "view", "views", "page", "pages", "component", "components"},
 }
 SYNTHESIS_SUCCESS = "success"
 SYNTHESIS_NO_CONTEXTS = "no_contexts"
@@ -285,10 +316,11 @@ class ChatProviderPolicy:
             return cls(enabled=False, providers=())
         import cloud_ragas
 
+        providers = tuple(cloud_ragas.providers_from_env())
         return cls(
             enabled=True,
-            providers=tuple(cloud_ragas.providers_from_env()),
-            max_calls=int(os.getenv("MAX_CLOUD_CHAT_CALLS", "1")),
+            providers=providers,
+            max_calls=int(os.getenv("MAX_CLOUD_CHAT_CALLS", str(max(len(providers), 1)))),
             provider_timeout_seconds=float(os.getenv("CLOUD_CHAT_PROVIDER_TIMEOUT_SECONDS", "30")),
             total_timeout_seconds=float(os.getenv("CLOUD_CHAT_TOTAL_TIMEOUT_SECONDS", "60")),
             cache_enabled=os.getenv("CLOUD_CHAT_CACHE", "0") == "1",
@@ -314,6 +346,30 @@ def _normalize_for_match(text: str) -> str:
 def _significant_terms(text: str) -> set[str]:
     terms = _tokenize(text) | _tokenize(_normalize_for_match(text))
     return {term for term in terms if term not in STOPWORDS and len(term) > 1}
+
+
+def _expand_architecture_layer_terms(terms: set[str]) -> set[str]:
+    expanded = set(terms)
+    for term in list(terms):
+        expanded.update(ARCHITECTURE_LAYER_ALIASES.get(term, set()))
+    return expanded
+
+
+def _source_path_terms(source: str) -> set[str]:
+    source_key = source.lower().replace("\\", "/")
+    return _significant_terms(source_key.replace("/", " ").replace(".", " ").replace("-", " "))
+
+
+def _architecture_layer_bucket(source: str) -> str | None:
+    source_terms = _source_path_terms(source)
+    for bucket, terms in ARCHITECTURE_LAYER_GROUPS.items():
+        if source_terms & terms:
+            return bucket
+    return None
+
+
+def _requested_architecture_layer_count(analysis: QueryAnalysis) -> int:
+    return sum(1 for terms in ARCHITECTURE_LAYER_GROUPS.values() if analysis.terms & terms)
 
 
 CODE_REQUEST_PATTERNS = (
@@ -352,10 +408,36 @@ CODE_REQUEST_PATTERNS = (
     r"\bsample code\b",
 )
 
+SOURCE_CODE_REQUEST_PATTERNS = (
+    r"\bsource code\b",
+    r"\bshow code\b",
+    r"\bcode example\b",
+    r"\bexample code\b",
+    r"\bpython code\b",
+    r"\bjavascript code\b",
+    r"\btypescript code\b",
+    r"\bbash code\b",
+    r"\bshell code\b",
+    r"\bcode sample\b",
+    r"\bsample code\b",
+    r"\bfrom the code\b",
+    r"\bfrom code\b",
+    r"\bno codigo\b",
+    r"\bno cÃ³digo\b",
+    r"\bpelo codigo\b",
+    r"\bpelo cÃ³digo\b",
+    r"\bsource files?\b",
+)
+
 
 def _query_requests_code(query: str) -> bool:
     normalized_query = _normalize_for_match(query)
     return any(re.search(pattern, normalized_query) for pattern in CODE_REQUEST_PATTERNS)
+
+
+def _query_requests_source_code(query: str) -> bool:
+    normalized_query = _normalize_for_match(query)
+    return any(re.search(pattern, normalized_query) for pattern in SOURCE_CODE_REQUEST_PATTERNS)
 
 
 _CODE_LIKE_PROSE_WORDS = {
@@ -446,8 +528,8 @@ def analyze_query(query: str) -> QueryAnalysis:
             "repo is about",
             "o que e",
         ),
-        "architecture": ("architecture", "arquitetura", "layer", "layers", "camada", "camadas", "module", "modules", "modulo", "modulos", "estrutura", "fluxo"),
-        "setup": ("setup", "install", "instalar", "executar", "rodar", "ambiente", "env", "script", "scripts"),
+        "architecture": ("architecture", "arquitetura", "mvc", "layer", "layers", "camada", "camadas", "module", "modules", "modulo", "modulos", "estrutura", "fluxo", "controller", "controllers"),
+        "setup": ("setup", "install", "instalar", "executar", "rodar", "ambiente", "env", "script", "scripts", "deploy", "deployment", "docker", "compose", "build"),
         "security": ("security", "seguranca", "auth", "authentication", "jwt", "senha", "password", "bcrypt", "token"),
         "evaluation": ("evaluation", "avaliacao", "avaliar", "metric", "metrics", "metrica", "metricas", "test", "tests"),
         "fine_tune": ("fine tune", "fine-tune", "fine tunning", "fine tuning", "finetuning", "training data", "hyperparameter", "lora", "qlora", "dataset"),
@@ -474,12 +556,18 @@ def analyze_query(query: str) -> QueryAnalysis:
     if "token" in normalized and ("stored" in normalized or "storage" in normalized or "cache" in normalized):
         rewrite_parts.append("localStorage cache")
 
+    layer_terms = _expand_architecture_layer_terms(_significant_terms(normalized))
+    layer_expansion = sorted(layer_terms - _significant_terms(normalized))
+    if layer_expansion:
+        rewrite_parts.append(" ".join(layer_expansion))
+
     rewritten_query = " ".join(dict.fromkeys(" ".join(rewrite_parts).split()))
+    terms = _expand_architecture_layer_terms(_significant_terms(query) | _significant_terms(rewritten_query))
     return QueryAnalysis(
         original_query=query,
         rewritten_query=rewritten_query,
         intents=intents,
-        terms=_significant_terms(query) | _significant_terms(rewritten_query),
+        terms=terms,
     )
 
 
@@ -547,6 +635,9 @@ def _source_priority(source: str, text: str, analysis: QueryAnalysis) -> float:
     if "architecture" in analysis.intents and _is_code_evidence_source(source):
         priority += 0.6
 
+    if _query_prefers_project_documentation(analysis.original_query, analysis) and _is_readme_source(source_key):
+        priority += 0.7
+
     if "stack" in analysis.intents:
         asks_frontend = "frontend" in analysis.terms or "front" in analysis.terms
         if source_key.endswith("readme.md") and ("stack e ferramentas" in text_key or "stack" in text_key):
@@ -605,9 +696,54 @@ def _is_test_source(source: str) -> bool:
     )
 
 
-def _query_needs_code_evidence(query: str, analysis: QueryAnalysis) -> bool:
-    if _query_requests_code(query):
+PROJECT_DOCUMENTATION_INTENTS = {"stack", "overview", "architecture", "setup", "security", "evaluation", "fine_tune"}
+PROJECT_DOCUMENTATION_TERMS = {
+    "about",
+    "architecture",
+    "arquitetura",
+    "build",
+    "deploy",
+    "deployment",
+    "docs",
+    "documentation",
+    "documentacao",
+    "documentado",
+    "features",
+    "ferramentas",
+    "install",
+    "license",
+    "limitations",
+    "mvc",
+    "overview",
+    "project",
+    "projeto",
+    "readme",
+    "roadmap",
+    "setup",
+    "stack",
+    "troubleshoot",
+    "troubleshooting",
+}
+
+
+def _query_prefers_project_documentation(query: str, analysis: QueryAnalysis) -> bool:
+    if _query_requests_source_code(query):
+        return False
+    if PROJECT_DOCUMENTATION_INTENTS & set(analysis.intents):
         return True
+    return bool(PROJECT_DOCUMENTATION_TERMS & analysis.terms)
+
+
+def _is_markdown_documentation_source(source: str) -> bool:
+    source_key = source.lower().replace("\\", "/")
+    return Path(source_key).suffix.lower() in {".md", ".rst", ".txt"} and not _is_readme_source(source_key)
+
+
+def _query_needs_code_evidence(query: str, analysis: QueryAnalysis) -> bool:
+    if _query_requests_source_code(query):
+        return True
+    if "stack" in analysis.intents:
+        return False
     if any(intent in analysis.intents for intent in ("architecture", "security")):
         return True
     implementation_terms = {
@@ -648,14 +784,18 @@ def _source_scope_score(source: str, analysis: QueryAnalysis) -> float:
     query_key = _normalize_for_match(analysis.original_query)
     original_terms = _significant_terms(analysis.original_query)
     score = 0.0
-    source_terms = _significant_terms(source_key.replace("/", " ").replace(".", " ").replace("-", " "))
+    source_terms = _source_path_terms(source_key)
     score += 0.2 * len(source_terms & analysis.terms)
-    if "frontend" in analysis.terms or "front" in analysis.terms:
+    if "architecture" in analysis.intents:
+        for layer_terms in ARCHITECTURE_LAYER_GROUPS.values():
+            if (analysis.terms & layer_terms) and (source_terms & layer_terms):
+                score += 1.0
+    if "frontend" in original_terms or "front" in original_terms:
         if "/frontend/" in source_key:
             score += 0.3
         if "/backend/" in source_key:
             score -= 0.8
-    if "backend" in analysis.terms or "back" in analysis.terms:
+    if "backend" in original_terms or "back" in original_terms:
         if "/backend/" in source_key:
             score += 0.3
         if "/frontend/" in source_key:
@@ -703,8 +843,9 @@ def _source_scope_score(source: str, analysis: QueryAnalysis) -> float:
 
 def _source_opposes_query_scope(source: str, analysis: QueryAnalysis) -> bool:
     source_key = source.lower().replace("\\", "/")
-    asks_frontend = "frontend" in analysis.terms or "front" in analysis.terms
-    asks_backend = "backend" in analysis.terms or "back" in analysis.terms
+    original_terms = _significant_terms(analysis.original_query)
+    asks_frontend = "frontend" in original_terms or "front" in original_terms
+    asks_backend = "backend" in original_terms or "back" in original_terms
     return (asks_frontend and "/backend/" in source_key) or (asks_backend and "/frontend/" in source_key)
 
 
@@ -721,7 +862,28 @@ def _is_manifest_source(source: str, analysis: QueryAnalysis) -> bool:
         return False
     if {"package", "dependency", "dependencies", "script", "scripts"} & analysis.terms:
         return False
-    return source_key.endswith("package.json") or source_key.endswith("requirements.txt") or source_key.endswith("pyproject.toml")
+    return _is_dependency_manifest_source(source_key)
+
+
+def _is_dependency_manifest_source(source: str) -> bool:
+    source_key = source.lower().replace("\\", "/")
+    return source_key.endswith(
+        (
+            "package.json",
+            "requirements.txt",
+            "pyproject.toml",
+            "cargo.toml",
+            "go.mod",
+            "pom.xml",
+            "build.gradle",
+            "build.gradle.kts",
+            "gemfile",
+            "composer.json",
+            "pubspec.yaml",
+            "mix.exs",
+            "deno.json",
+        )
+    )
 
 
 def _source_path(source: str) -> Path | None:
@@ -787,6 +949,7 @@ def _deepen_code_evidence_results(
         "reason": None,
     }
     allow_tests = "evaluation" in analysis.intents
+    preserve_project_docs = _query_prefers_project_documentation(query, analysis)
     selected = _dedupe_results(results)
     if not _query_needs_code_evidence(query, analysis) or not candidate_nodes:
         return selected, trace
@@ -802,7 +965,14 @@ def _deepen_code_evidence_results(
     if non_manifest_selected:
         selected = non_manifest_selected
     selected_keys = {_node_key(result) for result in selected}
-    wanted_code_sources = 3 if _query_requests_code(query) else 2 if any(intent in analysis.intents for intent in ("architecture", "security")) else 1
+    if _query_requests_code(query):
+        wanted_code_sources = 3
+    elif "architecture" in analysis.intents:
+        wanted_code_sources = max(2, min(3, _requested_architecture_layer_count(analysis)))
+    elif "security" in analysis.intents:
+        wanted_code_sources = 2
+    else:
+        wanted_code_sources = 1
 
     candidates_by_source: dict[str, LocalNodeWithScore] = {}
     for node in candidate_nodes:
@@ -869,14 +1039,34 @@ def _deepen_code_evidence_results(
                     added_sources.append(source)
             continue
         if len(selected) >= top_k:
-            removable_index = next(
-                (
-                    index
-                    for index in range(len(selected) - 1, -1, -1)
-                    if _is_readme_source(_source_doc(selected[index])) or (_is_test_source(_source_doc(selected[index])) and not allow_tests)
-                ),
-                len(selected) - 1,
-            )
+            if preserve_project_docs:
+                removable_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if not _is_readme_source(_source_doc(selected[index]))
+                        and not _is_dependency_manifest_source(_source_doc(selected[index]))
+                        and (_is_test_source(_source_doc(selected[index])) or not preserve_project_docs)
+                    ),
+                    next(
+                        (
+                            index
+                            for index in range(len(selected) - 1, -1, -1)
+                            if not _is_readme_source(_source_doc(selected[index]))
+                            and not _is_dependency_manifest_source(_source_doc(selected[index]))
+                        ),
+                        len(selected) - 1,
+                    ),
+                )
+            else:
+                removable_index = next(
+                    (
+                        index
+                        for index in range(len(selected) - 1, -1, -1)
+                        if _is_readme_source(_source_doc(selected[index])) or (_is_test_source(_source_doc(selected[index])) and not allow_tests)
+                    ),
+                    len(selected) - 1,
+                )
             selected.pop(removable_index)
         selected.append(candidate)
         selected_keys.add(_node_key(candidate))
@@ -889,6 +1079,227 @@ def _deepen_code_evidence_results(
                 "enabled": True,
                 "added_sources": added_sources,
                 "reason": "code_evidence_diversity",
+            }
+        )
+    return selected, trace
+
+
+def _project_evidence_group(source: str, analysis: QueryAnalysis) -> int:
+    if _is_readme_source(source):
+        return 0
+    if _is_dependency_manifest_source(source):
+        return 1
+    if _is_markdown_documentation_source(source):
+        return 2
+    if _is_code_evidence_source(source):
+        return 3
+    return 4
+
+
+def _balance_project_evidence_results(
+    query: str,
+    results: Sequence[Any],
+    candidate_nodes: Sequence[Any],
+    top_k: int,
+) -> tuple[list[Any], dict[str, Any]]:
+    analysis = analyze_query(query)
+    trace = {
+        "enabled": False,
+        "added_sources": [],
+        "reason": None,
+    }
+    if not _query_prefers_project_documentation(query, analysis) or not candidate_nodes:
+        return list(results), trace
+
+    selected = _dedupe_results(results)
+    selected_keys = {_node_key(result) for result in selected}
+    selected_sources = {_source_doc(result) for result in selected}
+
+    def candidate_allowed(source: str) -> bool:
+        if _source_opposes_query_scope(source, analysis):
+            return False
+        if _is_maintenance_source(source, analysis):
+            return False
+        if _is_test_source(source) and "evaluation" not in analysis.intents:
+            return False
+        return (
+            _is_readme_source(source)
+            or _is_markdown_documentation_source(source)
+            or _is_dependency_manifest_source(source)
+            or (_query_needs_code_evidence(query, analysis) and _is_code_evidence_source(source))
+        )
+
+    candidates: list[LocalNodeWithScore] = []
+    for node in candidate_nodes:
+        if _node_key(node) in selected_keys:
+            continue
+        source = _source_doc(node)
+        if source in selected_sources or not candidate_allowed(source):
+            continue
+        text = _node_text(node)
+        score = _score_local_node(node, analysis)
+        if _is_readme_source(source):
+            score += 1.5
+        elif _is_dependency_manifest_source(source):
+            score += 0.6 if {"stack", "setup"} & set(analysis.intents) else 0.2
+        elif _is_markdown_documentation_source(source):
+            score += 0.4
+        elif _is_code_evidence_source(source):
+            score += _source_scope_score(source, analysis)
+        if score <= 0:
+            continue
+        candidates.append(LocalNodeWithScore(node=getattr(node, "node", node), score=score))
+
+    def project_rank(item: Any) -> tuple[int, float, str]:
+        source = _source_doc(item)
+        return (_project_evidence_group(source, analysis), -float(_score(item) or 0.0), source)
+
+    def removable_index() -> int:
+        return next(
+            (
+                index
+                for index in range(len(selected) - 1, -1, -1)
+                if not _is_readme_source(_source_doc(selected[index]))
+                and not _is_dependency_manifest_source(_source_doc(selected[index]))
+            ),
+            len(selected) - 1,
+        )
+
+    added_sources: list[str] = []
+    for candidate in sorted(candidates, key=project_rank):
+        source = _source_doc(candidate)
+        if source in {_source_doc(item) for item in selected}:
+            continue
+        group = _project_evidence_group(source, analysis)
+        if group == 3 and any(
+            _project_evidence_group(_source_doc(item), analysis) == 3
+            and _architecture_layer_bucket(_source_doc(item)) == _architecture_layer_bucket(source)
+            for item in selected
+        ):
+            continue
+        if len(selected) >= top_k:
+            selected.pop(removable_index())
+        selected.append(candidate)
+        added_sources.append(source)
+
+        has_readme = any(_is_readme_source(_source_doc(item)) for item in selected)
+        support_count = sum(
+            1
+            for item in selected
+            if not _is_readme_source(_source_doc(item))
+            and (
+                _is_dependency_manifest_source(_source_doc(item))
+                or _is_markdown_documentation_source(_source_doc(item))
+                or _is_code_evidence_source(_source_doc(item))
+            )
+        )
+        if has_readme and support_count >= 2:
+            break
+
+    if added_sources:
+        selected = sorted(selected, key=project_rank)[:top_k]
+        trace.update(
+            {
+                "enabled": True,
+                "added_sources": added_sources,
+                "reason": "project_documentation_and_source_evidence",
+            }
+        )
+    return selected, trace
+
+
+def _balance_stack_evidence_results(
+    query: str,
+    results: Sequence[Any],
+    candidate_nodes: Sequence[Any],
+    top_k: int,
+) -> tuple[list[Any], dict[str, Any]]:
+    analysis = analyze_query(query)
+    trace = {
+        "enabled": False,
+        "added_sources": [],
+        "reason": None,
+    }
+    if "stack" not in analysis.intents or not candidate_nodes:
+        return list(results), trace
+
+    selected = _dedupe_results(results)
+    selected_keys = {_node_key(result) for result in selected}
+    asks_frontend = "frontend" in analysis.terms or "front" in analysis.terms
+    asks_backend = "backend" in analysis.terms or "back" in analysis.terms
+
+    def in_scope(source: str) -> bool:
+        source_key = source.lower().replace("\\", "/")
+        if asks_frontend and "/backend/" in source_key:
+            return False
+        if asks_backend and "/frontend/" in source_key:
+            return False
+        return True
+
+    candidates: list[LocalNodeWithScore] = []
+    for node in candidate_nodes:
+        if _node_key(node) in selected_keys:
+            continue
+        source = _source_doc(node)
+        if not in_scope(source):
+            continue
+        source_key = source.lower().replace("\\", "/")
+        is_readme = _is_readme_source(source)
+        is_manifest = _is_dependency_manifest_source(source)
+        if not is_readme and not is_manifest:
+            continue
+        text = _node_text(node)
+        score = _score_local_node(node, analysis)
+        if is_readme and ("stack" in _normalize_for_match(text) or "ferramentas" in _normalize_for_match(text)):
+            score += 2.0
+        if is_manifest:
+            score += 1.5
+        if asks_frontend and "/frontend/" in source_key:
+            score += 1.0
+        if asks_backend and "/backend/" in source_key:
+            score += 1.0
+        if score <= 0:
+            continue
+        candidates.append(LocalNodeWithScore(node=getattr(node, "node", node), score=score))
+
+    def stack_rank(item: Any) -> tuple[int, float, str]:
+        source = _source_doc(item)
+        if _is_readme_source(source):
+            group = 0
+        elif _is_dependency_manifest_source(source):
+            group = 1
+        elif _is_code_evidence_source(source):
+            group = 2
+        else:
+            group = 3
+        return (group, -float(_score(item) or 0.0), source)
+
+    added_sources: list[str] = []
+    for candidate in sorted(candidates, key=stack_rank):
+        source = _source_doc(candidate)
+        if source in {_source_doc(item) for item in selected}:
+            continue
+        if len(selected) >= top_k:
+            removable_index = next(
+                (
+                    index
+                    for index in range(len(selected) - 1, -1, -1)
+                    if not _is_readme_source(_source_doc(selected[index]))
+                    and not _is_dependency_manifest_source(_source_doc(selected[index]))
+                ),
+                len(selected) - 1,
+            )
+            selected.pop(removable_index)
+        selected.append(candidate)
+        added_sources.append(source)
+
+    if added_sources:
+        selected = sorted(selected, key=stack_rank)[:top_k]
+        trace.update(
+            {
+                "enabled": True,
+                "added_sources": added_sources,
+                "reason": "stack_declared_and_confirmed_evidence",
             }
         )
     return selected, trace
@@ -958,7 +1369,15 @@ def _format_package_manifest(path: Path) -> str | None:
     if "typeorm" in all_dependency_names or "@nestjs/typeorm" in all_dependency_names:
         framework_hints.append("TypeORM")
     if "sqlite3" in all_dependency_names:
-        framework_hints.append("SQLite")
+        framework_hints.append("SQLite3")
+    if "@nestjs/jwt" in all_dependency_names or "jsonwebtoken" in all_dependency_names:
+        framework_hints.append("JWT")
+    if "class-validator" in all_dependency_names:
+        framework_hints.append("class-validator")
+    if "class-transformer" in all_dependency_names:
+        framework_hints.append("class-transformer")
+    if "bcrypt" in all_dependency_names:
+        framework_hints.append("bcrypt")
     if "vite" in all_dependency_names or "@vitejs/plugin-react" in all_dependency_names:
         framework_hints.append("Vite")
     if "react" in all_dependency_names:
@@ -1425,8 +1844,8 @@ def _extract_technologies(contexts: Sequence[str], query: str = "") -> list[str]
     query_terms = _significant_terms(query)
     frontend_only = "frontend" in query_terms or "front" in query_terms
     backend_only = "backend" in query_terms or "back" in query_terms
-    frontend_tech = {"React Router", "TypeScript", "React", "Vite", "Axios", "ESLint", "Jest", "Prettier"}
-    backend_tech = {"NestJS", "Express", "TypeORM", "SQLite"}
+    frontend_tech = {"React Router DOM", "React Router", "TypeScript", "React", "Vite", "Axios", "ESLint", "Jest", "Prettier"}
+    backend_tech = {"NestJS", "Express", "TypeORM", "SQLite3", "SQLite", "JWT", "class-validator", "class-transformer", "bcrypt"}
     found: list[str] = []
     for tech in KNOWN_TECHNOLOGIES:
         if frontend_only and tech in backend_tech:
@@ -1436,6 +1855,110 @@ def _extract_technologies(contexts: Sequence[str], query: str = "") -> list[str]
         if _normalize_for_match(tech) in normalized:
             found.append(tech)
     return found
+
+
+STACK_GROUPS = {
+    "Backend": (
+        "NestJS",
+        "Express",
+        "TypeScript",
+        "TypeORM",
+        "SQLite3",
+        "SQLite",
+        "JWT",
+        "class-validator",
+        "class-transformer",
+        "bcrypt",
+    ),
+    "Frontend": (
+        "React",
+        "TypeScript",
+        "Vite",
+        "React Router DOM",
+        "React Router",
+        "Axios",
+    ),
+    "Qualidade": (
+        "ESLint",
+        "Jest",
+        "Prettier",
+    ),
+}
+
+
+def _context_mentions_tech(context: str, tech: str) -> bool:
+    normalized = _normalize_for_match(context)
+    if _normalize_for_match(tech) in normalized:
+        return True
+    aliases = {
+        "JWT": ("@nestjs/jwt", "jsonwebtoken"),
+        "SQLite3": ("sqlite3", "sqlite"),
+        "React Router DOM": ("react-router-dom", "react router"),
+        "class-validator": ("class-validator", "class validator"),
+        "class-transformer": ("class-transformer", "class transformer"),
+    }
+    return any(_normalize_for_match(alias) in normalized for alias in aliases.get(tech, ()))
+
+
+def _stack_group_for_context(source: str, text: str) -> str | None:
+    source_key = source.lower().replace("\\", "/")
+    text_key = _normalize_for_match(text)
+    if _is_readme_source(source_key):
+        return None
+    if "/backend/" in source_key or "### backend" in text_key or "backend package" in text_key:
+        return "Backend"
+    if "/frontend/" in source_key or "### frontend" in text_key or "frontend package" in text_key:
+        return "Frontend"
+    if "### qualidade" in text_key or "quality" in text_key:
+        return "Qualidade"
+    return None
+
+
+def _format_stack_answer(
+    contexts: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+    query: str = "",
+) -> str | None:
+    query_terms = _significant_terms(query)
+    frontend_only = "frontend" in query_terms or "front" in query_terms
+    backend_only = "backend" in query_terms or "back" in query_terms
+    declared: dict[str, set[str]] = {group: set() for group in STACK_GROUPS}
+    confirmed: dict[str, dict[str, set[str]]] = {group: {} for group in STACK_GROUPS}
+
+    for index, context in enumerate(contexts):
+        source = str(sources[index].get("source_doc", f"document_{index + 1}")) if index < len(sources) else f"document_{index + 1}"
+        is_readme = _is_readme_source(source)
+        context_group = _stack_group_for_context(source, context)
+        for group, technologies in STACK_GROUPS.items():
+            if frontend_only and group == "Backend":
+                continue
+            if backend_only and group == "Frontend":
+                continue
+            if context_group and context_group != group and not (group == "Qualidade" and any(_context_mentions_tech(context, tech) for tech in technologies)):
+                continue
+            for tech in technologies:
+                if _context_mentions_tech(context, tech):
+                    if is_readme:
+                        declared[group].add(tech)
+                    else:
+                        confirmed[group].setdefault(tech, set()).add(source)
+
+    has_declared = any(declared[group] for group in declared)
+    if not has_declared:
+        for group, tech_sources in confirmed.items():
+            declared[group].update(tech_sources)
+
+    lines = ["Stack do projeto:"]
+    wrote_group = False
+    for group, technologies in STACK_GROUPS.items():
+        techs = [tech for tech in technologies if tech in declared[group] or tech in confirmed[group]]
+        if not techs:
+            continue
+        wrote_group = True
+        lines.append(f"{group}:")
+        for tech in techs:
+            lines.append(f"- {tech}")
+    return "\n".join(lines) if wrote_group else None
 
 
 
@@ -1489,8 +2012,10 @@ def _extractive_synthesis_result(
 ) -> SynthesisResult:
     answer = _format_fine_tune_extract_answer(fine_tune_metadata) if fine_tune_metadata else None
     if answer is None and intent == "stack":
-        techs = _extract_technologies(contexts, query)
-        answer = ", ".join(techs) if techs else None
+        answer = _format_stack_answer(contexts, sources, query)
+        if answer is None:
+            techs = _extract_technologies(contexts, query)
+            answer = ", ".join(techs) if techs else None
     if answer is None and _query_needs_code_evidence(query, analyze_query(query)):
         answer = synthesize_source_grounded_answer(query, contexts, sources)
     return SynthesisResult(
@@ -1540,6 +2065,10 @@ def synthesize_chat_answer(
     if not _has_enough_evidence(query, contexts, sources):
         error = SynthesisError(code=SYNTHESIS_INSUFFICIENT_EVIDENCE, stage="precheck", retryable=False, provider=None)
         return SynthesisResult(answer=LOW_EVIDENCE_ANSWER, mode="extractive", error=error)
+    if intent == "stack":
+        stack_answer = _format_stack_answer(contexts, sources, query)
+        if stack_answer:
+            return SynthesisResult(answer=stack_answer, mode="extractive")
 
     policy = ChatProviderPolicy.from_env()
     if not policy.enabled:
@@ -1833,13 +2362,14 @@ def synthesize_source_grounded_answer(
     evidence_rows: list[tuple[float, int, str]] = []
     seen_sources: set[str] = set()
     has_code_sources = any(_is_code_evidence_source(str(item.get("source_doc", ""))) for item in sources)
+    prefer_project_docs = _query_prefers_project_documentation(query, analysis)
 
     for index, context in enumerate(contexts):
         source = sources[index].get("source_doc", f"document_{index + 1}") if index < len(sources) else f"document_{index + 1}"
         source = str(source)
         if source in seen_sources:
             continue
-        if _is_readme_source(source) and has_code_sources:
+        if _is_readme_source(source) and has_code_sources and not prefer_project_docs:
             continue
         if _is_maintenance_source(source, analysis):
             continue
@@ -2087,10 +2617,17 @@ class LocalRAGPipeline:
         results, deepening_trace = _deepen_code_evidence_results(query, results, self.nodes or [], self.top_k)
         if deepening_trace["enabled"]:
             metadata = {**metadata, "context_deepening": deepening_trace}
+        results, project_trace = _balance_project_evidence_results(query, results, self.nodes or [], self.top_k)
+        if project_trace["enabled"]:
+            metadata = {**metadata, "project_evidence": project_trace}
+        results, stack_trace = _balance_stack_evidence_results(query, results, self.nodes or [], self.top_k)
+        if stack_trace["enabled"]:
+            metadata = {**metadata, "stack_evidence": stack_trace}
         contexts = [_node_text(result) for result in results]
         logger.info("answer_query: retrieved %d contexts, %d results", len(contexts), len(results))
-        answer = synthesize_extractive_answer(query, contexts) if contexts else EMPTY_LOCAL_CONTEXT_ANSWER
         sources = self._source_rows(results)
+        stack_answer = _format_stack_answer(contexts, sources, query) if "stack" in analyze_query(query).intents else None
+        answer = stack_answer or (synthesize_extractive_answer(query, contexts) if contexts else EMPTY_LOCAL_CONTEXT_ANSWER)
 
         return {
             "question": query,
@@ -2125,6 +2662,12 @@ class LocalRAGPipeline:
         results, deepening_trace = _deepen_code_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
         if deepening_trace["enabled"]:
             metadata = {**metadata, "context_deepening": deepening_trace}
+        results, project_trace = _balance_project_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
+        if project_trace["enabled"]:
+            metadata = {**metadata, "project_evidence": project_trace}
+        results, stack_trace = _balance_stack_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
+        if stack_trace["enabled"]:
+            metadata = {**metadata, "stack_evidence": stack_trace}
         contexts = [_node_text(result) for result in results]
         sources = self._source_rows(results)
         citations = _make_citations(results)

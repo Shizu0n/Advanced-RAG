@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 import math
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -29,6 +30,8 @@ CURRENT_SOURCE_PATH = PROJECT_ROOT / "data" / "current_source.json"
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 RAGAS_METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
 LEXICAL_METRICS = ["lexical_faithfulness", "lexical_answer_relevancy", "lexical_context_recall", "lexical_context_precision"]
+LATENCY_METRICS = ["retrieval_ms", "synthesis_ms", "total_ms"]
+LATENCY_SUMMARY_METRICS = ["avg_retrieval_ms", "avg_synthesis_ms", "avg_total_ms"]
 REQUIRED_GOLDEN_FIELDS = {"question", "ground_truth", "reference_context", "source_doc"}
 
 
@@ -97,6 +100,31 @@ def _source_doc(node: Any) -> str:
         or metadata.get("source")
         or metadata.get("file_path")
         or getattr(node, "node_id", "unknown")
+    )
+
+
+def _display_source_doc(source: str) -> str:
+    path = Path(str(source))
+    if path.is_absolute():
+        try:
+            return path.relative_to(PROJECT_ROOT).as_posix()
+        except ValueError:
+            return path.name or str(source).replace("\\", "/")
+    return str(source).replace("\\", "/")
+
+
+def _is_test_question_source(source: str) -> bool:
+    source_key = str(source).lower().replace("\\", "/")
+    return any(
+        marker in source_key
+        for marker in (
+            ".spec.",
+            ".test.",
+            "/__tests__/",
+            "/tests/",
+            "test_",
+            "_test.",
+        )
     )
 
 
@@ -186,6 +214,8 @@ def _specificity_score(item: dict[str, str]) -> tuple[int, int]:
 def _question_source_group(node: Any) -> str:
     source = _source_doc(node)
     source_key = source.lower().replace("\\", "/")
+    if _is_test_question_source(source_key):
+        return "other"
     if source_key.endswith(("package.json", "requirements.txt", "pyproject.toml", "cargo.toml", "go.mod")):
         return "manifest"
     if _is_code_evidence_source(source):
@@ -201,8 +231,9 @@ def _select_question_source_nodes(nodes: Sequence[Any], limit: int) -> list[Any]
     if limit <= 0:
         return []
 
+    selectable_nodes = [node for node in nodes if not _is_test_question_source(_source_doc(node))] or list(nodes)
     grouped: dict[str, list[Any]] = {"code": [], "docs": [], "manifest": [], "readme": [], "other": []}
-    for node in nodes:
+    for node in selectable_nodes:
         grouped.setdefault(_question_source_group(node), []).append(node)
 
     selected: list[Any] = []
@@ -216,7 +247,7 @@ def _select_question_source_nodes(nodes: Sequence[Any], limit: int) -> list[Any]
             seen.add(key)
             break
 
-    for node in nodes:
+    for node in selectable_nodes:
         if len(selected) >= limit:
             break
         key = f"{_source_doc(node)}::{getattr(node, 'node_id', id(node))}"
@@ -295,10 +326,75 @@ def _realistic_user_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
     ] if context else []
 
 
+NOISY_QUESTION_TERMS = {
+    "modulefileextensions",
+    "rootdir",
+    "testregex",
+    "schemastore",
+    "schema url",
+    "schema https",
+    "json fields",
+    "what fields exist",
+}
+
+
+def _template_golden_item_for_node(node: Any) -> dict[str, str] | None:
+    source_doc = _source_doc(node)
+    display_source = _display_source_doc(source_doc)
+    context = _node_text(node).strip()
+    if not context:
+        return None
+    group = _question_source_group(node)
+    if group == "manifest":
+        question = f"What dependencies and tools does {display_source} declare for this project?"
+        ground_truth = "Identify the project dependencies and tooling declared in the manifest context."
+    elif group == "code":
+        question = f"What feature or runtime flow is implemented in {display_source}?"
+        ground_truth = "Describe the feature or runtime flow implemented by the referenced source file."
+    elif group in {"readme", "docs"}:
+        question = f"What setup, architecture, or usage guidance is documented in {display_source}?"
+        ground_truth = "Summarize the setup, architecture, or usage guidance from the referenced documentation."
+    else:
+        return None
+    return {
+        "question": question,
+        "ground_truth": ground_truth,
+        "reference_context": context[:3000],
+        "source_doc": source_doc,
+    }
+
+
+def _is_noisy_golden_question(item: dict[str, str]) -> bool:
+    question = item.get("question", "")
+    normalized = question.lower()
+    compact = re.sub(r"[^a-z0-9]+", "", normalized)
+    if any(term.replace(" ", "") in compact for term in NOISY_QUESTION_TERMS):
+        return True
+    if "reference context" in normalized and any(term in normalized for term in (" import ", " schema ", " transform")):
+        return True
+    identifiers = re.findall(r"\b[A-Za-z]+(?:[A-Z][A-Za-z0-9]+|_[A-Za-z0-9_]+)\b", question)
+    return len(identifiers) >= 2 and not any(term in normalized for term in ("dependency", "feature", "runtime", "architecture"))
+
+
+def _is_high_quality_golden_item(item: dict[str, str]) -> bool:
+    return bool(item.get("question", "").strip()) and not _is_noisy_golden_question(item)
+
+
+def _normalized_question_key(item: dict[str, str]) -> str:
+    return re.sub(r"\s+", " ", item.get("question", "").strip().lower())
+
+
 def filter_best_golden_items(candidates: Sequence[dict[str, str]], limit: int = 30) -> list[dict[str, str]]:
-    ranked = sorted(candidates, key=_specificity_score, reverse=True)
+    ranked = sorted((item for item in candidates if _is_high_quality_golden_item(item)), key=_specificity_score, reverse=True)
     filtered: list[dict[str, str]] = []
-    for item in ranked[:limit]:
+    seen_questions: set[str] = set()
+    for item in ranked:
+        if len(filtered) >= limit:
+            break
+        question_key = _normalized_question_key(item)
+        if question_key in seen_questions:
+            continue
+        seen_questions.add(question_key)
         entry: dict[str, str] = {
             "question": item["question"],
             "ground_truth": item["ground_truth"],
@@ -326,15 +422,28 @@ def generate_golden_dataset(
 
     candidates = _realistic_user_query_items([*composite_nodes, *(question_nodes or nodes)])
     for node in [*composite_nodes, *question_nodes]:
+        template_item = _template_golden_item_for_node(node)
+        if template_item:
+            candidates.append(template_item)
         item = generate_golden_item(node, providers)
         candidates.append(item)
     if source_slug:
         for item in candidates:
             item["source_slug"] = source_slug
 
-    realistic = candidates[:4]
+    realistic_target = 4 if final_limit >= 6 else min(4, max(1, final_limit // 2))
+    realistic = [item for item in candidates[:4] if _is_high_quality_golden_item(item)][:realistic_target]
     remaining = filter_best_golden_items(candidates[4:], limit=max(final_limit - len(realistic), 0))
-    dataset = (realistic + remaining)[:final_limit]
+    dataset: list[dict[str, str]] = []
+    seen_questions: set[str] = set()
+    for item in realistic + remaining:
+        question_key = _normalized_question_key(item)
+        if question_key in seen_questions:
+            continue
+        seen_questions.add(question_key)
+        dataset.append(item)
+        if len(dataset) >= final_limit:
+            break
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(dataset, indent=2, ensure_ascii=False), encoding="utf-8")
     return dataset
@@ -435,7 +544,9 @@ def evaluate_strategy(
 ) -> tuple[dict[str, float], list[dict[str, Any]]]:
     rows: list[dict[str, Any]] = []
     for item in dataset:
+        started = time.perf_counter()
         result = pipeline.chat_query(item["question"], strategy=strategy)
+        measured_total_ms = (time.perf_counter() - started) * 1000
         scores = offline_metric_scores(
             item["question"],
             result["answer"],
@@ -451,6 +562,7 @@ def evaluate_strategy(
                 "contexts": json.dumps(result["contexts"], ensure_ascii=False),
                 "source_doc": item["source_doc"],
                 "evaluation_backend": "offline_heuristic",
+                **_latency_values(result, measured_total_ms),
                 **scores,
             }
         )
@@ -509,6 +621,53 @@ def maybe_run_real_ragas(
         raise
 
 
+def _finite_latency_ms(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return max(number, 0.0)
+
+
+def _latency_values(result: dict[str, Any], measured_total_ms: float) -> dict[str, float]:
+    trace = result.get("trace") if isinstance(result, dict) else None
+    latency = trace.get("latency") if isinstance(trace, dict) else None
+    latency = latency if isinstance(latency, dict) else {}
+
+    measured_total_ms = max(float(measured_total_ms), 0.0)
+    retrieval_ms = _finite_latency_ms(latency.get("retrieval_ms"))
+    synthesis_ms = _finite_latency_ms(latency.get("synthesis_ms"))
+    total_ms = _finite_latency_ms(latency.get("total_ms")) or measured_total_ms
+
+    if retrieval_ms is None and synthesis_ms is None:
+        retrieval_ms = total_ms
+        synthesis_ms = 0.0
+    elif retrieval_ms is None:
+        retrieval_ms = max(total_ms - float(synthesis_ms), 0.0)
+    elif synthesis_ms is None:
+        synthesis_ms = max(total_ms - float(retrieval_ms), 0.0)
+
+    return {
+        "retrieval_ms": round(float(retrieval_ms), 3),
+        "synthesis_ms": round(float(synthesis_ms), 3),
+        "total_ms": round(max(total_ms, float(retrieval_ms) + float(synthesis_ms)), 3),
+    }
+
+
+def _latency_summary(rows: Sequence[dict[str, Any]]) -> dict[str, float]:
+    summary: dict[str, float] = {}
+    for detail_metric, summary_metric in zip(LATENCY_METRICS, LATENCY_SUMMARY_METRICS, strict=True):
+        values = [
+            float(row[detail_metric])
+            for row in rows
+            if detail_metric in row and math.isfinite(float(row[detail_metric]))
+        ]
+        summary[summary_metric] = round(sum(values) / max(len(values), 1), 3)
+    return summary
+
+
 def run_evaluation(
     golden_path: Path = GOLDEN_DATASET_PATH,
     pipeline: LocalRAGPipeline | None = None,
@@ -526,6 +685,7 @@ def run_evaluation(
         cloud_client = cloud_ragas.client_from_config(cloud_ragas.config_from_env())
     summaries: dict[str, dict[str, float]] = {}
     summary_backends: dict[str, str] = {}
+    latency_summaries: dict[str, dict[str, float]] = {}
     detail_rows: list[dict[str, Any]] = []
 
     rows_by_strategy: dict[str, list[dict[str, Any]]] = {}
@@ -537,6 +697,7 @@ def run_evaluation(
         rows_by_strategy[strategy] = rows
         summaries[strategy] = summary
         summary_backends[strategy] = "offline_heuristic"
+        latency_summaries[strategy] = _latency_summary(rows)
         detail_rows.extend(rows)
         logger.info("Strategy %s: %s (backend=%s)", strategy, summary, "offline_heuristic")
 
@@ -560,6 +721,13 @@ def run_evaluation(
     summary_frame = pd.DataFrame.from_dict(summaries, orient="index")
     summary_frame["summary_backend"] = pd.Series(summary_backends)
     summary_frame["evaluated_source"] = evaluated_source
+    for metric in LATENCY_SUMMARY_METRICS:
+        summary_frame[metric] = pd.Series(
+            {
+                strategy: values.get(metric)
+                for strategy, values in latency_summaries.items()
+            }
+        )
     summary_frame.to_csv(RAGAS_RESULTS_PATH, index_label="strategy")
     pd.DataFrame(detail_rows).to_csv(RAGAS_PER_QUESTION_PATH, index=False)
     print_markdown_report(summaries)

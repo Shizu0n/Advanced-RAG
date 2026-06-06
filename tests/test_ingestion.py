@@ -480,6 +480,30 @@ class CurrentSourceTests(unittest.TestCase):
             client = mock_chromadb.PersistentClient.return_value
             client.create_collection.assert_called_once_with(ingestion.CHROMA_COLLECTION_NAME)
 
+    def test_build_index_allows_chroma_value_error_for_missing_collection(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "test-repo"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "readme.md").write_text("# Hello\nThis is a test document with real content.", encoding="utf-8")
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_dir = Path(tmpdir) / "chroma_db"
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb") as mock_chromadb,
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_chromadb.PersistentClient.return_value.delete_collection.side_effect = ValueError(
+                    "Collection advanced_rag does not exist."
+                )
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(raw_dir=raw_dir)
+
+            client = mock_chromadb.PersistentClient.return_value
+            client.create_collection.assert_called_once_with(ingestion.CHROMA_COLLECTION_NAME)
+
 
 if __name__ == "__main__":
     unittest.main()

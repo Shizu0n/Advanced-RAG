@@ -528,7 +528,7 @@ def analyze_query(query: str) -> QueryAnalysis:
             "repo is about",
             "o que e",
         ),
-        "architecture": ("architecture", "arquitetura", "mvc", "layer", "layers", "camada", "camadas", "module", "modules", "modulo", "modulos", "estrutura", "fluxo", "controller", "controllers"),
+        "architecture": ("architecture", "arquitetura", "mvc", "layer", "layers", "camada", "camadas", "module", "modules", "modulo", "modulos", "estrutura", "fluxo", "controller", "controllers", "endpoint", "endpoints", "route", "routes"),
         "setup": ("setup", "install", "instalar", "executar", "rodar", "ambiente", "env", "script", "scripts", "deploy", "deployment", "docker", "compose", "build"),
         "security": ("security", "seguranca", "auth", "authentication", "jwt", "senha", "password", "bcrypt", "token"),
         "evaluation": ("evaluation", "avaliacao", "avaliar", "metric", "metrics", "metrica", "metricas", "test", "tests"),
@@ -549,6 +549,10 @@ def analyze_query(query: str) -> QueryAnalysis:
         rewrite_parts.append("auth authentication service guard token")
     if "indicacao" in normalized or "referencia" in normalized or "referral" in normalized:
         rewrite_parts.append("referral referralCode referrer register registration service")
+    if "profile" in normalized or "endpoint" in normalized:
+        rewrite_parts.append("users controller route @Get profile getProfile users service")
+    if "referrallink" in normalized or ("referral" in normalized and "link" in normalized):
+        rewrite_parts.append("referralLink generateReferralLink users service frontendUrl register ref")
     if "registro" in normalized or "cadastrar" in normalized or "cadastro" in normalized:
         rewrite_parts.append("register registration create user service")
     if "token" in normalized and ("attached" in normalized or "request" in normalized or "api" in normalized):
@@ -639,7 +643,7 @@ def _source_priority(source: str, text: str, analysis: QueryAnalysis) -> float:
         priority += 0.7
 
     if "stack" in analysis.intents:
-        asks_frontend = "frontend" in analysis.terms or "front" in analysis.terms
+        asks_frontend, _ = _stack_scope_flags(analysis)
         if source_key.endswith("readme.md") and ("stack e ferramentas" in text_key or "stack" in text_key):
             priority += 1.2
             if asks_frontend and "frontend" in text_key:
@@ -742,6 +746,8 @@ def _is_markdown_documentation_source(source: str) -> bool:
 def _query_needs_code_evidence(query: str, analysis: QueryAnalysis) -> bool:
     if _query_requests_source_code(query):
         return True
+    if _query_mixes_stack_with_behavior(query, analysis):
+        return True
     if "stack" in analysis.intents:
         return False
     if any(intent in analysis.intents for intent in ("architecture", "security")):
@@ -755,6 +761,8 @@ def _query_needs_code_evidence(query: str, analysis: QueryAnalysis) -> bool:
         "controller",
         "database",
         "entity",
+        "endpoint",
+        "endpoints",
         "flow",
         "frontend",
         "function",
@@ -767,11 +775,63 @@ def _query_needs_code_evidence(query: str, analysis: QueryAnalysis) -> bool:
         "referrer",
         "repository",
         "route",
+        "routes",
         "service",
         "services",
         "source",
     }
     return bool(analysis.terms & implementation_terms)
+
+
+STACK_BEHAVIOR_TERMS = {
+    "controller",
+    "controllers",
+    "endpoint",
+    "endpoints",
+    "flow",
+    "fluxo",
+    "function",
+    "generated",
+    "generate",
+    "generates",
+    "gerado",
+    "gera",
+    "gerada",
+    "implemented",
+    "implementation",
+    "referrallink",
+    "return",
+    "returned",
+    "retorna",
+    "route",
+    "routes",
+    "service",
+    "services",
+}
+STACK_BEHAVIOR_PHRASES = (
+    " how ",
+    " como ",
+    " funciona",
+    " works",
+    " generated",
+    " generate",
+    " endpoint",
+    " flow",
+    " fluxo",
+    " return",
+    " retorna",
+    " implemented",
+)
+
+
+def _query_mixes_stack_with_behavior(query: str, analysis: QueryAnalysis | None = None) -> bool:
+    analysis = analysis or analyze_query(query)
+    if "stack" not in analysis.intents:
+        return False
+    normalized = f" {_normalize_for_match(query)} "
+    if any(phrase in normalized for phrase in STACK_BEHAVIOR_PHRASES):
+        return True
+    return bool(analysis.terms & STACK_BEHAVIOR_TERMS)
 
 
 def _node_key(item: Any) -> str:
@@ -828,6 +888,8 @@ def _source_scope_score(source: str, analysis: QueryAnalysis) -> float:
         score += 2.4
     if "entity" in analysis.terms and source_key.endswith("/users/user.entity.ts"):
         score += 1.2
+    if {"endpoint", "endpoints", "profile", "route", "routes"} & analysis.terms and source_key.endswith("/users/users.controller.ts"):
+        score += 4.0
     if ("usersservice" in query_key or "getprofile" in query_key or {"profile", "referrallink"} & analysis.terms) and source_key.endswith("/users/users.service.ts"):
         score += 2.4
     if ("usersservice" in query_key or "getprofile" in query_key) and source_key.endswith("/auth/auth.service.ts"):
@@ -1223,78 +1285,83 @@ def _balance_stack_evidence_results(
     if "stack" not in analysis.intents or not candidate_nodes:
         return list(results), trace
 
-    selected = _dedupe_results(results)
-    selected_keys = {_node_key(result) for result in selected}
-    asks_frontend = "frontend" in analysis.terms or "front" in analysis.terms
-    asks_backend = "backend" in analysis.terms or "back" in analysis.terms
+    asks_frontend, asks_backend = _stack_scope_flags(analysis)
+    wanted_slots = _stack_evidence_slots_for_scope(asks_frontend=asks_frontend, asks_backend=asks_backend)
 
     def in_scope(source: str) -> bool:
         source_key = source.lower().replace("\\", "/")
-        if asks_frontend and "/backend/" in source_key:
+        frontend_only = asks_frontend and not asks_backend
+        backend_only = asks_backend and not asks_frontend
+        if frontend_only and (source_key.startswith("backend/") or "/backend/" in source_key):
             return False
-        if asks_backend and "/frontend/" in source_key:
+        if backend_only and (source_key.startswith("frontend/") or "/frontend/" in source_key):
             return False
         return True
 
-    candidates: list[LocalNodeWithScore] = []
+    best_by_slot: dict[str, LocalNodeWithScore] = {}
+    fallback_candidates: list[LocalNodeWithScore] = []
     for node in candidate_nodes:
-        if _node_key(node) in selected_keys:
-            continue
         source = _source_doc(node)
         if not in_scope(source):
             continue
-        source_key = source.lower().replace("\\", "/")
-        is_readme = _is_readme_source(source)
-        is_manifest = _is_dependency_manifest_source(source)
-        if not is_readme and not is_manifest:
+        if _is_test_source(source):
             continue
         text = _node_text(node)
+        slot = _stack_evidence_slot(source, text)
+        if not slot:
+            continue
         score = _score_local_node(node, analysis)
-        if is_readme and ("stack" in _normalize_for_match(text) or "ferramentas" in _normalize_for_match(text)):
+        if slot == "readme":
             score += 2.0
-        if is_manifest:
+        elif slot.endswith("_manifest"):
             score += 1.5
+        elif slot.endswith("_code"):
+            score += 1.0
+        source_key = source.lower().replace("\\", "/")
         if asks_frontend and "/frontend/" in source_key:
             score += 1.0
         if asks_backend and "/backend/" in source_key:
             score += 1.0
         if score <= 0:
             continue
-        candidates.append(LocalNodeWithScore(node=getattr(node, "node", node), score=score))
+        candidate = LocalNodeWithScore(node=getattr(node, "node", node), score=score)
+        fallback_candidates.append(candidate)
+        if slot in wanted_slots and (
+            slot not in best_by_slot or float(score) > float(_score(best_by_slot[slot]) or 0.0)
+        ):
+            best_by_slot[slot] = candidate
 
     def stack_rank(item: Any) -> tuple[int, float, str]:
         source = _source_doc(item)
-        if _is_readme_source(source):
-            group = 0
-        elif _is_dependency_manifest_source(source):
-            group = 1
-        elif _is_code_evidence_source(source):
-            group = 2
-        else:
-            group = 3
+        slot = _stack_evidence_slot(source, _node_text(item))
+        group = wanted_slots.index(slot) if slot in wanted_slots else len(wanted_slots)
         return (group, -float(_score(item) or 0.0), source)
 
+    original_sources = {_source_doc(item) for item in results}
+    selected: list[Any] = []
+    seen_sources: set[str] = set()
     added_sources: list[str] = []
-    for candidate in sorted(candidates, key=stack_rank):
-        source = _source_doc(candidate)
-        if source in {_source_doc(item) for item in selected}:
-            continue
-        if len(selected) >= top_k:
-            removable_index = next(
-                (
-                    index
-                    for index in range(len(selected) - 1, -1, -1)
-                    if not _is_readme_source(_source_doc(selected[index]))
-                    and not _is_dependency_manifest_source(_source_doc(selected[index]))
-                ),
-                len(selected) - 1,
-            )
-            selected.pop(removable_index)
-        selected.append(candidate)
-        added_sources.append(source)
 
-    if added_sources:
-        selected = sorted(selected, key=stack_rank)[:top_k]
+    def append_candidate(candidate: Any) -> None:
+        source = _source_doc(candidate)
+        if source in seen_sources or len(selected) >= top_k:
+            return
+        selected.append(candidate)
+        seen_sources.add(source)
+        if source not in original_sources:
+            added_sources.append(source)
+
+    for slot in wanted_slots:
+        candidate = best_by_slot.get(slot)
+        if candidate is not None:
+            append_candidate(candidate)
+    for item in _dedupe_results(results):
+        if in_scope(_source_doc(item)):
+            append_candidate(item)
+    for candidate in sorted(fallback_candidates, key=stack_rank):
+        append_candidate(candidate)
+
+    if added_sources or [_source_doc(item) for item in selected] != [_source_doc(item) for item in results[: len(selected)]]:
         trace.update(
             {
                 "enabled": True,
@@ -1303,6 +1370,64 @@ def _balance_stack_evidence_results(
             }
         )
     return selected, trace
+
+
+def _stack_scope_flags(analysis: QueryAnalysis) -> tuple[bool, bool]:
+    original_terms = _significant_terms(analysis.original_query)
+    asks_frontend = "frontend" in original_terms or "front" in original_terms
+    asks_backend = "backend" in original_terms or "back" in original_terms
+    return asks_frontend, asks_backend
+
+
+def _stack_evidence_slots_for_scope(*, asks_frontend: bool, asks_backend: bool) -> list[str]:
+    if asks_frontend and not asks_backend:
+        return ["readme", "frontend_manifest", "frontend_code"]
+    if asks_backend and not asks_frontend:
+        return ["readme", "backend_manifest", "backend_code"]
+    return ["readme", "backend_manifest", "frontend_manifest", "backend_code", "frontend_code"]
+
+
+def _stack_evidence_slot(source: str, text: str) -> str | None:
+    source_key = source.lower().replace("\\", "/")
+    text_key = _normalize_for_match(text)
+    if _is_readme_source(source_key):
+        if "stack" in text_key or "ferramentas" in text_key or _stack_text_mentions_known_tech(text):
+            return "readme"
+        return None
+    if _is_dependency_manifest_source(source_key):
+        if "/backend/" in source_key:
+            return "backend_manifest"
+        if "/frontend/" in source_key:
+            return "frontend_manifest"
+        return "backend_manifest" if "backend" in text_key else "frontend_manifest" if "frontend" in text_key else None
+    if not _is_code_evidence_source(source_key):
+        return None
+    if _is_dependency_manifest_source(source_key):
+        return None
+    group = _stack_group_from_source_or_text(source_key, text)
+    if group == "Backend" and _stack_code_confirms_group(text, "Backend"):
+        return "backend_code"
+    if group == "Frontend" and _stack_code_confirms_group(text, "Frontend"):
+        return "frontend_code"
+    return None
+
+
+def _stack_group_from_source_or_text(source: str, text: str) -> str | None:
+    source_key = source.lower().replace("\\", "/")
+    if source_key.startswith("backend/") or "/backend/" in source_key:
+        return "Backend"
+    if source_key.startswith("frontend/") or "/frontend/" in source_key:
+        return "Frontend"
+    return _stack_group_for_context(source, text)
+
+
+def _stack_text_mentions_known_tech(text: str) -> bool:
+    return any(_context_mentions_tech(text, tech) for technologies in STACK_GROUPS.values() for tech in technologies)
+
+
+def _stack_code_confirms_group(text: str, group: str) -> bool:
+    technologies = STACK_GROUPS.get(group, ())
+    return any(_context_mentions_tech(text, tech) for tech in technologies)
 
 
 def _local_retrieval_score(query: str, text: str, source: str) -> float:
@@ -1824,6 +1949,66 @@ def _has_enough_evidence(query: str, contexts: Sequence[str], sources: Sequence[
     return any(isinstance(source.get("score"), (int, float)) and source["score"] >= LOW_EVIDENCE_THRESHOLD for source in sources)
 
 
+FOLLOW_UP_PREFIXES = (
+    "and ",
+    "also ",
+    "what about",
+    "where else",
+    "e ",
+    "tambem ",
+    "também ",
+    "agora ",
+    "continue",
+    "continua",
+)
+FOLLOW_UP_REFERENCE_TERMS = {
+    "it",
+    "this",
+    "that",
+    "those",
+    "these",
+    "isso",
+    "essa",
+    "esse",
+    "desse",
+    "dessa",
+    "dele",
+    "dela",
+    "ele",
+    "ela",
+}
+
+
+def _is_obvious_followup(message: str) -> bool:
+    normalized = " ".join(message.lower().strip().split())
+    if not normalized:
+        return False
+    if any(normalized.startswith(prefix) for prefix in FOLLOW_UP_PREFIXES):
+        return True
+    terms = _significant_terms(normalized)
+    return len(terms) <= 6 and bool(terms & FOLLOW_UP_REFERENCE_TERMS)
+
+
+def _last_user_history_message(history: Sequence[dict[str, Any]]) -> str | None:
+    for item in reversed(history):
+        if not isinstance(item, dict) or item.get("role") != "user":
+            continue
+        content = str(item.get("content") or item.get("message") or "").strip()
+        if content:
+            return content
+    return None
+
+
+def _chat_retrieval_query(message: str, history: Sequence[dict[str, Any]]) -> tuple[str, str, int]:
+    current = message.strip()
+    if not history or not _is_obvious_followup(current):
+        return current, "current_message", 0
+    previous_user_message = _last_user_history_message(history)
+    if not previous_user_message:
+        return current, "current_message", 0
+    return f"{previous_user_message} {current}".strip(), "follow_up_with_last_user", 1
+
+
 def _make_citations(results: Sequence[Any]) -> list[dict[str, Any]]:
     citations: list[dict[str, Any]] = []
     for result in results:
@@ -1842,8 +2027,10 @@ def _extract_technologies(contexts: Sequence[str], query: str = "") -> list[str]
     combined = "\n".join(_context_for_synthesis(context) for context in contexts)
     normalized = _normalize_for_match(combined)
     query_terms = _significant_terms(query)
-    frontend_only = "frontend" in query_terms or "front" in query_terms
-    backend_only = "backend" in query_terms or "back" in query_terms
+    asks_frontend = "frontend" in query_terms or "front" in query_terms
+    asks_backend = "backend" in query_terms or "back" in query_terms
+    frontend_only = asks_frontend and not asks_backend
+    backend_only = asks_backend and not asks_frontend
     frontend_tech = {"React Router DOM", "React Router", "TypeScript", "React", "Vite", "Axios", "ESLint", "Jest", "Prettier"}
     backend_tech = {"NestJS", "Express", "TypeORM", "SQLite3", "SQLite", "JWT", "class-validator", "class-transformer", "bcrypt"}
     found: list[str] = []
@@ -1920,8 +2107,10 @@ def _format_stack_answer(
     query: str = "",
 ) -> str | None:
     query_terms = _significant_terms(query)
-    frontend_only = "frontend" in query_terms or "front" in query_terms
-    backend_only = "backend" in query_terms or "back" in query_terms
+    asks_frontend = "frontend" in query_terms or "front" in query_terms
+    asks_backend = "backend" in query_terms or "back" in query_terms
+    frontend_only = asks_frontend and not asks_backend
+    backend_only = asks_backend and not asks_frontend
     declared: dict[str, set[str]] = {group: set() for group in STACK_GROUPS}
     confirmed: dict[str, dict[str, set[str]]] = {group: {} for group in STACK_GROUPS}
 
@@ -1955,6 +2144,7 @@ def _format_stack_answer(
         if not techs:
             continue
         wrote_group = True
+        lines.append("")
         lines.append(f"{group}:")
         for tech in techs:
             lines.append(f"- {tech}")
@@ -1975,6 +2165,9 @@ class ChatLLMClient:
 
     def generate_text(self, prompt: str, temperature: float | None = None) -> str:
         return self.client.generate_text(prompt, temperature=temperature)
+
+    def provider_attempts(self) -> list[dict[str, Any]]:
+        return list(getattr(self.client, "last_attempts", []))
 
 
 def _get_chat_llm_client(policy: ChatProviderPolicy) -> Any:
@@ -2000,6 +2193,34 @@ def _provider_attempts(policy: ChatProviderPolicy, *, outcome: str, error_class:
     return attempts
 
 
+def _safe_provider_attempts(
+    client: Any,
+    policy: ChatProviderPolicy,
+    *,
+    fallback_outcome: str,
+    error_class: str | None = None,
+) -> list[dict[str, Any]]:
+    getter = getattr(client, "provider_attempts", None)
+    if callable(getter):
+        attempts = getter()
+        if attempts:
+            safe_attempts: list[dict[str, Any]] = []
+            for index, attempt in enumerate(attempts, start=1):
+                safe = {
+                    "provider": attempt.get("provider"),
+                    "model": attempt.get("model"),
+                    "attempt": attempt.get("attempt", index),
+                    "outcome": attempt.get("outcome", fallback_outcome),
+                }
+                if "status_code" in attempt:
+                    safe["status_code"] = attempt.get("status_code")
+                if "error_class" in attempt:
+                    safe["error_class"] = attempt.get("error_class")
+                safe_attempts.append(safe)
+            return safe_attempts
+    return _provider_attempts(policy, outcome=fallback_outcome, error_class=error_class)
+
+
 def _extractive_synthesis_result(
     query: str,
     contexts: Sequence[str],
@@ -2011,7 +2232,7 @@ def _extractive_synthesis_result(
     intent: str = "general",
 ) -> SynthesisResult:
     answer = _format_fine_tune_extract_answer(fine_tune_metadata) if fine_tune_metadata else None
-    if answer is None and intent == "stack":
+    if answer is None and intent == "stack" and not _query_mixes_stack_with_behavior(query):
         answer = _format_stack_answer(contexts, sources, query)
         if answer is None:
             techs = _extract_technologies(contexts, query)
@@ -2065,7 +2286,7 @@ def synthesize_chat_answer(
     if not _has_enough_evidence(query, contexts, sources):
         error = SynthesisError(code=SYNTHESIS_INSUFFICIENT_EVIDENCE, stage="precheck", retryable=False, provider=None)
         return SynthesisResult(answer=LOW_EVIDENCE_ANSWER, mode="extractive", error=error)
-    if intent == "stack":
+    if intent == "stack" and not _query_mixes_stack_with_behavior(query):
         stack_answer = _format_stack_answer(contexts, sources, query)
         if stack_answer:
             return SynthesisResult(answer=stack_answer, mode="extractive")
@@ -2102,14 +2323,13 @@ def synthesize_chat_answer(
             intent=intent,
         )
 
-    provider_attempts = _provider_attempts(policy, outcome="started")
-
     from synthesis import _build_prompt, _post_process_llm_response  # noqa: PLC0415
 
     prompt = _build_prompt(query, contexts, sources, intent=intent, fine_tune_metadata=fine_tune_metadata)
+    client = _get_chat_llm_client(policy)
 
     try:
-        raw_answer = _generate_text_with_timeout(_get_chat_llm_client(policy), prompt, policy)
+        raw_answer = _generate_text_with_timeout(client, prompt, policy)
     except TimeoutError:
         return _extractive_synthesis_result(
             query,
@@ -2117,7 +2337,12 @@ def synthesize_chat_answer(
             sources,
             _chat_cloud_error(SYNTHESIS_PROVIDER_TIMEOUT, retryable=True, stage="provider"),
             policy,
-            provider_attempts=_provider_attempts(policy, outcome="timeout", error_class="TimeoutError"),
+            provider_attempts=_safe_provider_attempts(
+                client,
+                policy,
+                fallback_outcome="timeout",
+                error_class="TimeoutError",
+            ),
             fine_tune_metadata=fine_tune_metadata,
             intent=intent,
         )
@@ -2128,7 +2353,12 @@ def synthesize_chat_answer(
             sources,
             _chat_cloud_error(SYNTHESIS_PROVIDER_EXHAUSTED, retryable=True, stage="provider"),
             policy,
-            provider_attempts=_provider_attempts(policy, outcome="error", error_class=type(exc).__name__),
+            provider_attempts=_safe_provider_attempts(
+                client,
+                policy,
+                fallback_outcome="error",
+                error_class=type(exc).__name__,
+            ),
             fine_tune_metadata=fine_tune_metadata,
             intent=intent,
         )
@@ -2141,7 +2371,7 @@ def synthesize_chat_answer(
             sources,
             _chat_cloud_error(SYNTHESIS_PROVIDER_EXHAUSTED, retryable=False, stage="provider"),
             policy,
-            provider_attempts=_provider_attempts(policy, outcome="empty_response"),
+            provider_attempts=_safe_provider_attempts(client, policy, fallback_outcome="empty_response"),
             fine_tune_metadata=fine_tune_metadata,
             intent=intent,
         )
@@ -2151,7 +2381,7 @@ def synthesize_chat_answer(
         provider_chain=policy.provider_chain(),
         provider_timeout_seconds=policy.provider_timeout_seconds,
         total_timeout_seconds=policy.total_timeout_seconds,
-        provider_attempts=_provider_attempts(policy, outcome="success"),
+        provider_attempts=_safe_provider_attempts(client, policy, fallback_outcome="success"),
     )
 
 
@@ -2566,6 +2796,12 @@ class LocalRAGPipeline:
         from retrieval import HybridRetriever
 
         logger.info("Vector index available, using HybridRetriever")
+        if os.getenv("ALLOW_MODEL_DOWNLOADS") == "1":
+            return HybridRetriever(
+                self.index,
+                self.nodes or [],
+                top_k=self.top_k,
+            )
         return HybridRetriever(
             self.index,
             self.nodes or [],
@@ -2626,8 +2862,18 @@ class LocalRAGPipeline:
         contexts = [_node_text(result) for result in results]
         logger.info("answer_query: retrieved %d contexts, %d results", len(contexts), len(results))
         sources = self._source_rows(results)
-        stack_answer = _format_stack_answer(contexts, sources, query) if "stack" in analyze_query(query).intents else None
-        answer = stack_answer or (synthesize_extractive_answer(query, contexts) if contexts else EMPTY_LOCAL_CONTEXT_ANSWER)
+        analysis = analyze_query(query)
+        stack_answer = (
+            _format_stack_answer(contexts, sources, query)
+            if "stack" in analysis.intents and not _query_mixes_stack_with_behavior(query, analysis)
+            else None
+        )
+        if stack_answer:
+            answer = stack_answer
+        elif contexts and _query_needs_code_evidence(query, analysis):
+            answer = synthesize_source_grounded_answer(query, contexts, sources) or synthesize_extractive_answer(query, contexts)
+        else:
+            answer = synthesize_extractive_answer(query, contexts) if contexts else EMPTY_LOCAL_CONTEXT_ANSWER
 
         return {
             "question": query,
@@ -2649,15 +2895,11 @@ class LocalRAGPipeline:
 
         self._ensure_ready()
         history = list(history or [])
-        history_tail = " ".join(
-            str(item.get("content") or item.get("message") or "")
-            for item in history[-3:]
-            if isinstance(item, dict)
-        )
-        retrieval_query = f"{history_tail} {message}".strip() if history_tail else message
+        retrieval_query, retrieval_query_mode, history_user_messages_used = _chat_retrieval_query(message, history)
         analysis = analyze_query(retrieval_query)
         intent = analysis.intents[0] if analysis.intents else "general"
 
+        retrieval_started = time.perf_counter()
         results, metadata = self.retriever.ablation_retrieve(retrieval_query, strategy)
         results, deepening_trace = _deepen_code_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
         if deepening_trace["enabled"]:
@@ -2674,15 +2916,26 @@ class LocalRAGPipeline:
         fine_tune_metadata = None
         if intent == "fine_tune":
             fine_tune_metadata = _extract_fine_tune_info(contexts, sources)
-        synthesis_result = synthesize_chat_answer(message, contexts, intent, sources, fine_tune_metadata=fine_tune_metadata)
+        retrieval_ms = (time.perf_counter() - retrieval_started) * 1000
+        synthesis_query = retrieval_query if retrieval_query_mode == "follow_up_with_last_user" else message
+        synthesis_started = time.perf_counter()
+        synthesis_result = synthesize_chat_answer(synthesis_query, contexts, intent, sources, fine_tune_metadata=fine_tune_metadata)
+        synthesis_ms = (time.perf_counter() - synthesis_started) * 1000
         trace = self._normalize_trace(metadata, results)
         trace.update(
             {
                 "history_items": len(history),
+                "history_user_messages_used": history_user_messages_used,
                 "intent": intent,
                 "intents": analysis.intents,
+                "retrieval_query_mode": retrieval_query_mode,
                 "evidence_score": round(_evidence_score(message, contexts), 3),
                 "synthesis": synthesis_result.to_trace(),
+                "latency": {
+                    "retrieval_ms": round(retrieval_ms, 3),
+                    "synthesis_ms": round(synthesis_ms, 3),
+                    "total_ms": round(retrieval_ms + synthesis_ms, 3),
+                },
             }
         )
 

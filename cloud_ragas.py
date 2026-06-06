@@ -125,6 +125,7 @@ class FreeTierCloudClient:
         self.budget = budget or CloudCallBudget(max_calls=max_calls)
         self.providers = tuple(providers or providers_from_env())
         self._provider_backoff: dict[str, float] = {}
+        self.last_attempts: list[dict[str, Any]] = []
         if not self.providers:
             raise RuntimeError("Set at least one supported free-tier cloud provider key.")
 
@@ -179,36 +180,76 @@ class FreeTierCloudClient:
     ) -> dict[str, Any]:
         errors: list[str] = []
         now = time.monotonic()
+        self.last_attempts = []
         for provider in providers:
             cache_payload = {"provider": provider.name, "model": provider.model, "payload": payload}
             cache_key = self._cache_key(method, provider.model, cache_payload)
             cached = self._read_cache(cache_key)
             if cached is not None:
                 logger.debug("Cache hit for %s/%s", provider.name, provider.model)
+                self._record_provider_attempt(provider, "cache_hit")
                 return cached
 
             backoff_until = self._provider_backoff.get(provider.name, 0.0)
             if now < backoff_until:
                 remaining = max(1, int(backoff_until - now))
                 logger.info("Provider %s cooling down for %ds, skipping", provider.name, remaining)
+                self._record_provider_attempt(provider, "cooldown")
                 errors.append(f"{provider.name}/{provider.model}: cooling down for {remaining}s")
                 continue
 
             logger.info("Trying provider %s/%s (budget: %d/%d)", provider.name, provider.model, self.budget.calls_made, self.budget.max_calls)
-            self.budget.consume()
+            try:
+                self.budget.consume()
+            except RuntimeError:
+                self._record_provider_attempt(provider, "budget_exceeded", error_class="RuntimeError")
+                raise
             url, request_payload, headers = self._provider_request(provider, payload)
-            response = self.post(url, json=request_payload, headers=headers, timeout=30)
-            if getattr(response, "status_code", 200) in QUOTA_STATUS_CODES:
-                logger.warning("Provider %s returned HTTP %s, skipping", provider.name, response.status_code)
-                self._provider_backoff[provider.name] = time.monotonic() + self._quota_cooldown_seconds(response)
-                errors.append(f"{provider.name}/{provider.model}: HTTP {response.status_code}")
-                continue
-            response.raise_for_status()
-            data = response.json()
+            response = None
+            try:
+                response = self.post(url, json=request_payload, headers=headers, timeout=30)
+                status_code = getattr(response, "status_code", 200)
+                if status_code in QUOTA_STATUS_CODES:
+                    logger.warning("Provider %s returned HTTP %s, skipping", provider.name, response.status_code)
+                    self._record_provider_attempt(provider, "quota_or_unavailable", status_code=status_code)
+                    self._provider_backoff[provider.name] = time.monotonic() + self._quota_cooldown_seconds(response)
+                    errors.append(f"{provider.name}/{provider.model}: HTTP {response.status_code}")
+                    continue
+                response.raise_for_status()
+                data = response.json()
+            except Exception as exc:
+                self._record_provider_attempt(
+                    provider,
+                    "error",
+                    status_code=getattr(response, "status_code", None),
+                    error_class=type(exc).__name__,
+                )
+                raise
             self._write_cache(cache_key, data)
+            self._record_provider_attempt(provider, "success", status_code=status_code)
             logger.info("Provider %s succeeded", provider.name)
             return data
         raise CloudProviderUnavailable("; ".join(errors) or "cloud providers unavailable")
+
+    def _record_provider_attempt(
+        self,
+        provider: CloudProvider,
+        outcome: str,
+        *,
+        status_code: int | None = None,
+        error_class: str | None = None,
+    ) -> None:
+        attempt: dict[str, Any] = {
+            "provider": provider.name,
+            "model": provider.model,
+            "attempt": len(self.last_attempts) + 1,
+            "outcome": outcome,
+        }
+        if status_code is not None:
+            attempt["status_code"] = status_code
+        if error_class:
+            attempt["error_class"] = error_class
+        self.last_attempts.append(attempt)
 
     def _quota_cooldown_seconds(self, response: Any) -> float:
         default = float(os.getenv("CLOUD_PROVIDER_COOLDOWN_SECONDS", str(DEFAULT_PROVIDER_COOLDOWN_SECONDS)))

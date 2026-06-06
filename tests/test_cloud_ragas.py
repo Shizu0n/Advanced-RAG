@@ -153,6 +153,65 @@ class CloudRagasTests(unittest.TestCase):
         self.assertEqual(sum("generativelanguage.googleapis.com" in call for call in calls), 1)
         self.assertEqual(sum("api.groq.com" in call for call in calls), 2)
 
+    def test_generate_text_records_only_actual_successful_provider_attempt(self):
+        post = Mock(
+            return_value=FakeResponse(
+                200,
+                {"candidates": [{"content": {"parts": [{"text": "ok"}]}}]},
+            )
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            client = cloud_ragas.FreeTierCloudClient(
+                cache_dir=Path(tmpdir),
+                post=post,
+                max_calls=5,
+                providers=[
+                    cloud_ragas.CloudProvider("gemini", "gemini-2.5-flash", "key"),
+                    cloud_ragas.CloudProvider("groq", "llama-3.3-70b-versatile", "groq-key"),
+                ],
+            )
+
+            self.assertEqual(client.generate_text("prompt"), "ok")
+
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(
+            client.last_attempts,
+            [
+                {
+                    "provider": "gemini",
+                    "model": "gemini-2.5-flash",
+                    "attempt": 1,
+                    "outcome": "success",
+                    "status_code": 200,
+                }
+            ],
+        )
+
+    def test_generate_text_records_quota_fallback_attempts(self):
+        def post(url, json, timeout, **kwargs):
+            if "generativelanguage.googleapis.com" in url:
+                return FakeResponse(429, {"error": {"message": "quota"}})
+            return FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})
+
+        with TemporaryDirectory() as tmpdir:
+            client = cloud_ragas.FreeTierCloudClient(
+                cache_dir=Path(tmpdir),
+                post=post,
+                max_calls=5,
+                providers=[
+                    cloud_ragas.CloudProvider("gemini", "gemini-2.5-flash", "key"),
+                    cloud_ragas.CloudProvider("groq", "llama-3.3-70b-versatile", "groq-key"),
+                ],
+            )
+
+            self.assertEqual(client.generate_text("prompt"), "ok")
+
+        self.assertEqual([attempt["provider"] for attempt in client.last_attempts], ["gemini", "groq"])
+        self.assertEqual([attempt["outcome"] for attempt in client.last_attempts], ["quota_or_unavailable", "success"])
+        self.assertEqual(client.last_attempts[0]["status_code"], 429)
+        self.assertEqual(client.last_attempts[1]["status_code"], 200)
+
     def test_provider_fallback_respects_backoff_when_all_providers_are_cooling_down(self):
         calls = []
 

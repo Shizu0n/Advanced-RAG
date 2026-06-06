@@ -34,6 +34,9 @@ RAW_DIR = PROJECT_ROOT / "data" / "raw"
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
 METRICS = ["faithfulness", "answer_relevancy", "context_recall", "context_precision"]
 LEXICAL_METRICS = ["lexical_faithfulness", "lexical_answer_relevancy", "lexical_context_recall", "lexical_context_precision"]
+LATENCY_METRICS = ["retrieval_ms", "synthesis_ms", "total_ms"]
+LATENCY_SUMMARY_METRICS = ["avg_retrieval_ms", "avg_synthesis_ms", "avg_total_ms"]
+LEXICAL_TO_RAGAS_METRIC = dict(zip(METRICS, LEXICAL_METRICS, strict=True))
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 CHAT_MESSAGES_KEY = "chat_messages"
 PREPARED_SOURCE_KEY = "prepared_source"
@@ -63,6 +66,8 @@ PER_QUESTION_COLUMNS = [
     "evaluation_backend",
     "summary_backend",
     *METRICS,
+    *LEXICAL_METRICS,
+    *LATENCY_METRICS,
 ]
 SENSITIVE_TRACE_KEYS = {"message", "retrieval_query"}
 ALLOWED_SYNTHESIS_KEYS = {
@@ -99,7 +104,7 @@ def _coerce_metric_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_eval_summary(path: Path = RAGAS_RESULTS_PATH) -> pd.DataFrame:
-    columns = ["strategy", *METRICS, *LEXICAL_METRICS, "summary_backend", "evaluated_source"]
+    columns = ["strategy", *METRICS, *LEXICAL_METRICS, "summary_backend", "evaluated_source", *LATENCY_SUMMARY_METRICS]
     frame = _read_csv(path, columns)
     if "strategy" not in frame.columns:
         frame.insert(0, "strategy", None)
@@ -107,6 +112,10 @@ def load_eval_summary(path: Path = RAGAS_RESULTS_PATH) -> pd.DataFrame:
         frame["summary_backend"] = "unknown"
     if "evaluated_source" not in frame.columns:
         frame["evaluated_source"] = ""
+    for metric in LATENCY_SUMMARY_METRICS:
+        if metric not in frame.columns:
+            frame[metric] = pd.NA
+        frame[metric] = pd.to_numeric(frame[metric], errors="coerce")
     frame = _coerce_metric_columns(frame)
     return frame[columns]
 
@@ -124,27 +133,77 @@ def best_strategy(summary: pd.DataFrame) -> str | None:
     if summary.empty or "strategy" not in summary.columns:
         return None
 
-    scored = summary[["strategy", *METRICS]].copy()
-    scored["mean_score"] = scored[METRICS].mean(axis=1, skipna=True)
+    rows: list[dict[str, Any]] = []
+    for _, row in summary.iterrows():
+        strategy = row.get("strategy")
+        metric_family, metric_columns = _metric_family_for_row(row)
+        if not strategy or not metric_columns:
+            continue
+        numeric = pd.to_numeric(row[metric_columns], errors="coerce")
+        mean_score = numeric.mean(skipna=True)
+        if pd.isna(mean_score):
+            continue
+        rows.append({"strategy": strategy, "mean_score": float(mean_score), "metric_family": metric_family})
+    scored = pd.DataFrame(rows)
     scored = scored.dropna(subset=["strategy", "mean_score"])
     if scored.empty:
         return None
     return str(scored.sort_values("mean_score", ascending=False).iloc[0]["strategy"])
 
 
+def _finite_row_metrics(row: pd.Series, metrics: list[str]) -> list[str]:
+    available = [metric for metric in metrics if metric in row.index]
+    if not available:
+        return []
+    values = pd.to_numeric(row[available], errors="coerce")
+    return [metric for metric in available if pd.notna(values.get(metric))]
+
+
+def _metric_family_for_row(row: pd.Series) -> tuple[str | None, list[str]]:
+    ragas_metrics = _finite_row_metrics(row, METRICS)
+    if ragas_metrics:
+        return "cloud_ragas", METRICS
+    lexical_metrics = _finite_row_metrics(row, LEXICAL_METRICS)
+    if lexical_metrics:
+        return "offline_lexical", LEXICAL_METRICS
+    return None, []
+
+
+def _empty_metric_card_values(strategy: str | None = None) -> dict[str, Any]:
+    return {
+        "strategy": strategy,
+        "metric_family": None,
+        "display_metrics": {metric: metric for metric in METRICS},
+        **{metric: None for metric in METRICS},
+    }
+
+
 def metric_card_values(summary: pd.DataFrame, strategy: str | None = None) -> dict[str, Any]:
     selected_strategy = strategy or best_strategy(summary)
-    values: dict[str, Any] = {"strategy": selected_strategy}
     if not selected_strategy:
-        return values | {metric: None for metric in METRICS}
+        return _empty_metric_card_values()
 
     rows = summary[summary["strategy"] == selected_strategy]
     if rows.empty:
-        return values | {metric: None for metric in METRICS}
+        return _empty_metric_card_values(selected_strategy)
 
     row = rows.iloc[0]
+    metric_family, metric_columns = _metric_family_for_row(row)
+    if not metric_family:
+        return _empty_metric_card_values(selected_strategy)
+
+    display_metrics = {metric: metric for metric in METRICS}
+    if metric_family == "offline_lexical":
+        display_metrics = dict(LEXICAL_TO_RAGAS_METRIC)
+
+    values: dict[str, Any] = {
+        "strategy": selected_strategy,
+        "metric_family": metric_family,
+        "display_metrics": display_metrics,
+    }
     for metric in METRICS:
-        value = row.get(metric)
+        source_metric = display_metrics[metric]
+        value = row.get(source_metric)
         values[metric] = None if pd.isna(value) else float(value)
     return values
 
@@ -372,8 +431,14 @@ def _clear_chroma_artifacts() -> None:
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     try:
         client.delete_collection("advanced_rag")
-    except chromadb.errors.NotFoundError:
-        pass
+    except Exception as exc:
+        not_found_error = getattr(getattr(chromadb, "errors", None), "NotFoundError", None)
+        missing_collection = isinstance(not_found_error, type) and isinstance(exc, not_found_error)
+        missing_collection = missing_collection or (
+            isinstance(exc, ValueError) and "does not exist" in str(exc).lower()
+        )
+        if not missing_collection:
+            raise
 
 
 def clear_source_cache(clear_raw: bool = True) -> None:
@@ -847,13 +912,17 @@ def _show_prepare_success(st, prepared: list[Path]) -> None:
 
 
 def _store_prepared_source(st, prepared: list[Path], source_input: str, source_type: str) -> None:
-    st.session_state["prepared_files"] = prepared
-    st.session_state[PREPARED_SOURCE_KEY] = {
+    prepared_source = {
         "source_slug": _prepared_source_slug(prepared),
         "source_input": source_input,
         "source_type": source_type,
         "indexed_at": None,
+        "file_count": len(prepared),
     }
+    st.session_state["prepared_files"] = prepared
+    st.session_state[PREPARED_SOURCE_KEY] = prepared_source
+    PREPARED_SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    PREPARED_SOURCE_PATH.write_text(json.dumps(prepared_source, indent=2), encoding="utf-8")
 
 
 def _clear_prepared_source(st) -> None:
@@ -1394,10 +1463,24 @@ def _render_trace_debug(st, trace: dict[str, Any] | None) -> None:
         st.json(normalized["metadata"])
 
 
-def _render_chat_message(st, message: dict[str, Any]) -> None:
+def _stream_text(text: str):
+    words = text.split(" ")
+    if not words:
+        yield ""
+        return
+    for index, word in enumerate(words):
+        yield word if index == 0 else f" {word}"
+
+
+def _render_chat_message(st, message: dict[str, Any], stream_content: bool = False) -> None:
     with st.chat_message(message.get("role", "assistant")):
-        st.write(message.get("content", ""))
-        if message.get("role") == "assistant":
+        role = message.get("role", "assistant")
+        content = message.get("content", "")
+        if role == "assistant" and stream_content and hasattr(st, "write_stream"):
+            st.write_stream(_stream_text(str(content)))
+        else:
+            st.write(content)
+        if role == "assistant":
             _render_citations(st, message.get("citations", []))
             _render_trace_debug(st, message.get("trace"))
 
@@ -1442,7 +1525,7 @@ def _render_query_tab(st) -> None:
         "trace": result.get("trace"),
     }
     messages.append(assistant_message)
-    _render_chat_message(st, assistant_message)
+    _render_chat_message(st, assistant_message, stream_content=True)
 
 
 def _render_eval_tab(st) -> None:
@@ -1553,12 +1636,15 @@ def _render_eval_tab(st) -> None:
 
     st.subheader("Evaluation summary")
     card_columns = st.columns(4)
+    display_metrics = cards.get("display_metrics", {metric: metric for metric in METRICS})
     for column, metric in zip(card_columns, METRICS, strict=True):
-        column.metric(metric, _format_metric(cards[metric]))
+        column.metric(display_metrics.get(metric, metric), _format_metric(cards[metric]))
 
     best = cards.get("strategy")
     if best:
-        st.success(f"Best strategy: {best}")
+        metric_family = cards.get("metric_family")
+        suffix = f" ({metric_family})" if metric_family else ""
+        st.success(f"Best strategy: {best}{suffix}")
     else:
         st.warning("No strategy scores available.")
 

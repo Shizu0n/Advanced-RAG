@@ -30,6 +30,16 @@ class StaticProvider:
         }
 
 
+class NoisyProvider:
+    name = "noisy"
+
+    def generate(self, node):
+        return {
+            "question": "What does the reference context explain about moduleFileExtensions rootDir testRegex transform?",
+            "ground_truth": "Raw Jest configuration fields are present.",
+        }
+
+
 class StaticPipeline:
     def __init__(self, nodes=None):
         self.nodes = list(nodes or [])
@@ -105,6 +115,46 @@ class GoldenDatasetTests(unittest.TestCase):
             self.assertIn(metric, summary)
             self.assertIn(metric, rows[0])
         self.assertNotIn("faithfulness", summary)
+        for metric in evaluation.LATENCY_METRICS:
+            self.assertIn(metric, rows[0])
+            self.assertGreaterEqual(rows[0][metric], 0.0)
+
+    def test_run_evaluation_writes_latency_columns_to_csv(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            summary_path = Path(tmpdir) / "summary.csv"
+            detail_path = Path(tmpdir) / "detail.csv"
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "What does the project do?",
+                            "ground_truth": "It evaluates RAG strategies.",
+                            "reference_context": "It evaluates RAG strategies.",
+                            "source_doc": "doc.md",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "STRATEGIES", ["semantic_only"]),
+                patch.object(evaluation, "EVAL_DIR", Path(tmpdir)),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.dict("os.environ", {}, clear=True),
+            ):
+                evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline())
+
+            summary = pd.read_csv(summary_path)
+            detail = pd.read_csv(detail_path)
+            for metric in evaluation.LATENCY_METRICS:
+                self.assertIn(metric, detail.columns)
+                self.assertGreaterEqual(detail.loc[0, metric], 0.0)
+            for metric in evaluation.LATENCY_SUMMARY_METRICS:
+                self.assertIn(metric, summary.columns)
+                self.assertGreaterEqual(summary.loc[0, metric], 0.0)
 
     def test_markdown_report_does_not_render_missing_ragas_metrics_as_zero(self):
         results = {
@@ -900,6 +950,81 @@ class SourceScopedEvalTests(unittest.TestCase):
         self.assertIn("README.md", context)
         self.assertIn("docs/deployment.md", context)
         self.assertIn("src/application/register_user.py", context)
+
+    def test_generate_pre_questions_filters_symbol_and_json_noise_questions(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+            config = TextNode(
+                id_="jest",
+                text='{"moduleFileExtensions":["js","json","ts"],"rootDir":"src","testRegex":".spec.ts$","transform":{}}',
+                metadata={"file_name": "backend/package.json"},
+            )
+            code = TextNode(
+                id_="auth",
+                text="AuthService.register validates referral codes and increments the referrer score.",
+                metadata={"file_name": "backend/src/auth/auth.service.ts"},
+            )
+            indexed_pipeline = StaticPipeline(nodes=[config, code])
+            current_source_path.write_text(json.dumps({"source_slug": "noise-repo"}), encoding="utf-8")
+
+            with (
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=indexed_pipeline),
+            ):
+                dataset = evaluation.generate_pre_questions(
+                    output_path=golden_path,
+                    providers=[NoisyProvider()],
+                    chunk_limit=2,
+                    final_limit=4,
+                )
+                golden_exists = golden_path.exists()
+
+        questions = " ".join(item["question"] for item in dataset)
+        self.assertNotIn("moduleFileExtensions", questions)
+        self.assertNotIn("rootDir", questions)
+        self.assertTrue(any("dependencies" in item["question"].lower() or "feature" in item["question"].lower() for item in dataset))
+        self.assertTrue(golden_exists)
+
+    def test_generate_pre_questions_deduplicates_template_questions(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+            manifest_a = TextNode(
+                id_="backend-package-a",
+                text='{"dependencies":{"@nestjs/core":"latest"}}',
+                metadata={"file_name": "backend/package.json"},
+            )
+            manifest_b = TextNode(
+                id_="backend-package-b",
+                text='{"devDependencies":{"typescript":"latest"}}',
+                metadata={"file_name": "backend/package.json"},
+            )
+            code = TextNode(
+                id_="auth-controller",
+                text="AuthController exposes login and registration routes.",
+                metadata={"file_name": "backend/src/auth/auth.controller.ts"},
+            )
+            indexed_pipeline = StaticPipeline(nodes=[manifest_a, manifest_b, code])
+            current_source_path.write_text(json.dumps({"source_slug": "dedupe-repo"}), encoding="utf-8")
+
+            with (
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=indexed_pipeline),
+            ):
+                dataset = evaluation.generate_pre_questions(
+                    output_path=golden_path,
+                    providers=[NoisyProvider()],
+                    chunk_limit=3,
+                    final_limit=6,
+                )
+
+        questions = [item["question"] for item in dataset]
+        self.assertEqual(len(questions), len(set(questions)))
+        self.assertTrue(any("backend/package.json" in question for question in questions))
+        self.assertTrue(any("backend/src/auth/auth.controller.ts" in question for question in questions))
 
     def test_run_evaluation_writes_evaluated_source_column_to_csv(self):
         with TemporaryDirectory() as tmpdir:

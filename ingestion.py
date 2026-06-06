@@ -303,6 +303,13 @@ def clear_indexed_source_artifacts() -> None:
         CURRENT_SOURCE_PATH.unlink()
 
 
+def _is_missing_chroma_collection_error(exc: Exception) -> bool:
+    not_found_error = getattr(getattr(chromadb, "errors", None), "NotFoundError", None)
+    if isinstance(not_found_error, type) and isinstance(exc, not_found_error):
+        return True
+    return isinstance(exc, ValueError) and "does not exist" in str(exc).lower()
+
+
 def build_index(
     source_files: Iterable[Path] | None = None,
     raw_dir: Path = RAW_DIR,
@@ -350,8 +357,9 @@ def build_index(
         chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         try:
             chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
-        except chromadb.errors.NotFoundError:
-            pass
+        except Exception as exc:
+            if not _is_missing_chroma_collection_error(exc):
+                raise
         chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
         vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
         storage_context = StorageContext.from_defaults(vector_store=vector_store)

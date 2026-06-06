@@ -28,6 +28,25 @@ class FakeRetriever:
         return nodes, {"strategy": strategy, "used_rerank": False}
 
 
+class RecordingRetriever:
+    def __init__(self):
+        self.queries = []
+
+    def ablation_retrieve(self, query, strategy):
+        self.queries.append(query)
+        nodes = [
+            NodeWithScore(
+                node=TextNode(
+                    id_="profile",
+                    text="UsersController exposes the profile endpoint and UsersService returns referralLink.",
+                    metadata={"file_name": "backend/src/users/users.controller.ts"},
+                ),
+                score=0.8,
+            )
+        ]
+        return nodes, {"strategy": strategy}
+
+
 class EmptyRetriever:
     def ablation_retrieve(self, query, strategy):
         return [], {"strategy": strategy}
@@ -1041,6 +1060,110 @@ npm install.
         self.assertIn("backend/package.json", citation_sources)
         self.assertIn("frontend/package.json", citation_sources)
 
+    def test_referralsystem_stack_query_includes_manifest_and_code_confirmation(self):
+        readme = pipeline_module.LocalTextNode(
+            text=(
+                "## Stack e Ferramentas\n\n"
+                "### Backend\n\n"
+                "- NestJS 11\n- TypeScript\n- TypeORM 0.3\n- SQLite3\n- JWT (`@nestjs/jwt`)\n\n"
+                "### Frontend\n\n"
+                "- React 19\n- TypeScript 5\n- Vite 7\n- React Router DOM 7\n- Axios"
+            ),
+            node_id="readme#stack",
+            metadata={"file_name": "README.md"},
+        )
+        backend_package = pipeline_module.LocalTextNode(
+            text="Package manifest for backend package backend: NestJS, TypeORM, SQLite3, JWT, TypeScript.",
+            node_id="backend-package#0",
+            metadata={"file_name": "backend/package.json"},
+        )
+        frontend_package = pipeline_module.LocalTextNode(
+            text="Package manifest for frontend package frontend: React, TypeScript, Vite, React Router DOM, Axios.",
+            node_id="frontend-package#0",
+            metadata={"file_name": "frontend/package.json"},
+        )
+        backend_code = pipeline_module.LocalTextNode(
+            text="import { Injectable } from '@nestjs/common'; import { JwtService } from '@nestjs/jwt'; export class AuthService {}",
+            node_id="auth-service#0",
+            metadata={"file_name": "backend/src/auth/auth.service.ts"},
+        )
+        frontend_code = pipeline_module.LocalTextNode(
+            text="import axios from 'axios'; export const api = axios.create({ baseURL: import.meta.env.VITE_API_URL });",
+            node_id="api#0",
+            metadata={"file_name": "frontend/src/services/api.ts"},
+        )
+        shallow = pipeline_module.LocalTextNode(
+            text="fetch JSON API request stack frontend backend setup environment variables",
+            node_id="shallow#0",
+            metadata={"file_name": "frontend/src/utils/cache.ts"},
+        )
+        pipeline = LocalRAGPipeline(nodes=[shallow, backend_code, frontend_code, backend_package, frontend_package, readme])
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "Qual é a stack completa do projeto? Cite evidências do README, "
+                "backend/package.json, frontend/package.json e código quando houver.",
+                strategy="hybrid_rerank",
+            )
+
+        for tech in ["NestJS", "TypeORM", "SQLite3", "JWT", "React", "Vite", "Axios"]:
+            self.assertIn(tech, result["answer"])
+        citation_sources = [citation["source_doc"] for citation in result["citations"]]
+        self.assertIn("README.md", citation_sources)
+        self.assertIn("backend/package.json", citation_sources)
+        self.assertIn("frontend/package.json", citation_sources)
+        self.assertIn("backend/src/auth/auth.service.ts", citation_sources)
+        self.assertIn("frontend/src/services/api.ts", citation_sources)
+
+    def test_mixed_stack_and_referral_flow_query_does_not_stop_at_stack_formatter(self):
+        nodes = [
+            pipeline_module.LocalTextNode(
+                text=(
+                    "## Stack e Ferramentas\n\n"
+                    "### Backend\n\n- NestJS\n- TypeScript\n- TypeORM\n- SQLite3\n- JWT\n\n"
+                    "### Frontend\n\n- React\n- TypeScript\n- Vite\n- Axios"
+                ),
+                node_id="readme#stack",
+                metadata={"file_name": "README.md"},
+            ),
+            pipeline_module.LocalTextNode(
+                text="Backend package manifest declares NestJS, TypeORM, SQLite3, JWT, and TypeScript.",
+                node_id="backend-package#0",
+                metadata={"file_name": "backend/package.json"},
+            ),
+            pipeline_module.LocalTextNode(
+                text="Frontend package manifest declares React, Vite, Axios, and TypeScript.",
+                node_id="frontend-package#0",
+                metadata={"file_name": "frontend/package.json"},
+            ),
+            pipeline_module.LocalTextNode(
+                text=(
+                    "export class UsersService { async getProfile(userId: string) { "
+                    "const referralLink = this.generateReferralLink(user.referralCode); "
+                    "return { referralCode: user.referralCode, referralLink }; } "
+                    "private generateReferralLink(referralCode: string) { "
+                    "return `${frontendUrl}/register?ref=${referralCode}`; } }"
+                ),
+                node_id="users-service#0",
+                metadata={"file_name": "backend/src/users/users.service.ts"},
+            ),
+        ]
+        pipeline = LocalRAGPipeline(nodes=nodes)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "what is the backend stack, frontend stack, and how is referralLink generated?",
+                strategy="hybrid_rerank",
+            )
+
+        self.assertIn("NestJS", result["answer"])
+        self.assertIn("React", result["answer"])
+        self.assertIn("generateReferralLink", result["answer"])
+        self.assertIn("referralLink", result["answer"])
+        self.assertNotEqual(result["answer"].strip().splitlines()[0], "Stack do projeto:")
+        citation_sources = [citation["source_doc"] for citation in result["citations"]]
+        self.assertIn("backend/src/users/users.service.ts", citation_sources)
+
     def test_stack_query_is_not_dominated_by_shallow_code_sources(self):
         readme = pipeline_module.LocalTextNode(
             text="## Stack e Ferramentas\n\n### Frontend\n\n- React 19\n- TypeScript 5\n- Vite 7\n- Axios",
@@ -1395,6 +1518,39 @@ npm install.
         self.assertEqual(result["trace"]["synthesis"]["mode"], "generative")
         self.assertEqual(result["trace"]["synthesis"]["code"], "success")
 
+    def test_chat_query_trace_uses_actual_provider_attempts_when_available(self):
+        fake_client = SimpleNamespace(
+            generate_text=Mock(return_value="Generative answer from documents."),
+            provider_attempts=Mock(
+                return_value=[
+                    {
+                        "provider": "gemini",
+                        "model": "gemini-2.5-flash",
+                        "attempt": 1,
+                        "outcome": "success",
+                        "ignored_raw_error": "prompt=secret token=abc123",
+                    }
+                ]
+            ),
+        )
+        pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=FakeRetriever())
+
+        with (
+            patch.dict(
+                "os.environ",
+                {"ALLOW_CLOUD_CHAT": "1", "GEMINI_API_KEY": "key", "GROQ_API_KEY": "groq"},
+                clear=True,
+            ),
+            patch.object(pipeline_module, "_get_chat_llm_client", return_value=fake_client),
+        ):
+            result = pipeline.chat_query("How are Python functions defined?", strategy="bm25_only")
+
+        attempts = result["trace"]["synthesis"]["provider_attempts"]
+        self.assertEqual([attempt["provider"] for attempt in attempts], ["gemini"])
+        self.assertEqual(attempts[0]["outcome"], "success")
+        self.assertNotIn("ignored_raw_error", attempts[0])
+        self.assertNotIn("abc123", str(result["trace"]))
+
     def test_build_prompt_marks_retrieved_documents_as_untrusted_data(self):
         prompt = synthesis_module._build_prompt(
             "What dataset was used?",
@@ -1621,6 +1777,99 @@ npm install.
         self.assertNotIn("message", result["trace"])
         self.assertNotIn("retrieval_query", result["trace"])
 
+    def test_chat_query_retrieval_ignores_assistant_history_for_new_topic(self):
+        retriever = RecordingRetriever()
+        pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
+        history = [
+            {"role": "user", "content": "Qual é a stack do projeto?"},
+            {"role": "assistant", "content": "Stack do projeto: React, Vite, NestJS, TypeORM."},
+        ]
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "Where is the user profile endpoint implemented?",
+                history=history,
+                strategy="bm25_only",
+            )
+
+        self.assertEqual(retriever.queries, ["Where is the user profile endpoint implemented?"])
+        self.assertEqual(result["trace"]["retrieval_query_mode"], "current_message")
+        self.assertEqual(result["trace"]["history_user_messages_used"], 0)
+        self.assertNotIn("stack", result["trace"]["intents"])
+        self.assertNotIn("Stack do projeto", str(result["trace"]))
+
+    def test_profile_endpoint_query_includes_controller_and_service_evidence(self):
+        nodes = [
+            pipeline_module.LocalTextNode(
+                text="Stack do projeto: React, Vite, NestJS, TypeORM.",
+                node_id="readme#stack",
+                metadata={"file_name": "README.md"},
+            ),
+            pipeline_module.LocalTextNode(
+                text=(
+                    "import { Controller, Get } from '@nestjs/common'; "
+                    "@Controller('user') export class UsersController { "
+                    "@Get('profile') async getProfile(user) { return this.usersService.getProfile(user.sub); } }"
+                ),
+                node_id="users-controller#0",
+                metadata={"file_name": "backend/src/users/users.controller.ts"},
+            ),
+            pipeline_module.LocalTextNode(
+                text=(
+                    "export class UsersService { async getProfile(userId: string) { "
+                    "const referralLink = this.generateReferralLink(user.referralCode); "
+                    "return { referralCode: user.referralCode, referralLink }; } "
+                    "private generateReferralLink(referralCode: string) { "
+                    "return `${frontendUrl}/register?ref=${referralCode}`; } }"
+                ),
+                node_id="users-service#0",
+                metadata={"file_name": "backend/src/users/users.service.ts"},
+            ),
+            pipeline_module.LocalTextNode(
+                text="async register(registerDto) { const { referralCode } = registerDto; }",
+                node_id="auth-service#0",
+                metadata={"file_name": "backend/src/auth/auth.service.ts"},
+            ),
+        ]
+        pipeline = LocalRAGPipeline(nodes=nodes)
+        history = [
+            {"role": "user", "content": "Qual é a stack do projeto?"},
+            {"role": "assistant", "content": "Stack do projeto: React, Vite, NestJS, TypeORM."},
+        ]
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "Where is the user profile endpoint implemented, and how is referralLink generated?",
+                history=history,
+                strategy="hybrid_rerank",
+            )
+
+        citation_sources = [citation["source_doc"] for citation in result["citations"]]
+        self.assertIn("backend/src/users/users.controller.ts", citation_sources)
+        self.assertIn("backend/src/users/users.service.ts", citation_sources)
+        self.assertIn("getProfile", result["answer"])
+        self.assertIn("referralLink", result["answer"])
+
+    def test_chat_query_followup_can_use_last_user_message_without_assistant_text(self):
+        retriever = RecordingRetriever()
+        pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
+        history = [
+            {"role": "user", "content": "Where is referralLink generated in the backend?"},
+            {"role": "assistant", "content": "It is generated by UsersService."},
+        ]
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("And where is it returned?", history=history, strategy="bm25_only")
+
+        self.assertEqual(
+            retriever.queries,
+            ["Where is referralLink generated in the backend? And where is it returned?"],
+        )
+        self.assertEqual(result["trace"]["retrieval_query_mode"], "follow_up_with_last_user")
+        self.assertEqual(result["trace"]["history_user_messages_used"], 1)
+        self.assertIn("referralLink", result["answer"])
+        self.assertNotIn("UsersService", str(result["trace"]))
+
     def test_chat_query_trace_includes_safe_provider_attempts_without_raw_error_text(self):
         fake_client = SimpleNamespace(generate_text=Mock(side_effect=RuntimeError("HTTP 429 prompt=What dataset was used? token=abc123")))
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=FakeRetriever())
@@ -1638,6 +1887,28 @@ npm install.
         self.assertNotIn("error", attempts[0])
         self.assertNotIn("prompt", str(result["trace"]))
         self.assertNotIn("abc123", str(result["trace"]))
+
+    def test_build_retriever_uses_real_cross_encoder_path_when_model_downloads_allowed(self):
+        with (
+            patch.dict("os.environ", {"ALLOW_MODEL_DOWNLOADS": "1"}, clear=True),
+            patch("retrieval.HybridRetriever") as hybrid_retriever,
+        ):
+            LocalRAGPipeline(index=object(), nodes=[])
+
+        kwargs = hybrid_retriever.call_args.kwargs
+        self.assertNotIn("cross_encoder", kwargs)
+        self.assertNotIn("cross_encoder_model", kwargs)
+
+    def test_build_retriever_uses_local_reranker_when_model_downloads_disabled(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch("retrieval.HybridRetriever") as hybrid_retriever,
+        ):
+            LocalRAGPipeline(index=object(), nodes=[])
+
+        kwargs = hybrid_retriever.call_args.kwargs
+        self.assertIsInstance(kwargs["cross_encoder"], pipeline_module.LocalLexicalCrossEncoder)
+        self.assertEqual(kwargs["cross_encoder_model"], "local_lexical")
 
 
 if __name__ == "__main__":

@@ -184,6 +184,13 @@ class FakeStreamlit:
         return [FakeContext() for _ in labels]
 
 
+class StreamingFakeStreamlit(FakeStreamlit):
+    def write_stream(self, stream):
+        rendered = "".join(str(chunk) for chunk in stream)
+        self.events.append(("write_stream", rendered))
+        return rendered
+
+
 class AppHelperTests(unittest.TestCase):
     def test_session_gate_override_takes_precedence_over_env_default(self):
         fake_st = FakeStreamlit()
@@ -224,7 +231,22 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(frame.loc[0, "strategy"], "semantic_only")
         self.assertEqual(frame.loc[0, "faithfulness"], 0.1)
         self.assertEqual(frame.loc[0, "summary_backend"], "cloud_free_tier_ragas")
-        self.assertEqual(list(frame.columns), ["strategy", *app.METRICS, *app.LEXICAL_METRICS, "summary_backend", "evaluated_source"])
+        self.assertEqual(list(frame.columns), ["strategy", *app.METRICS, *app.LEXICAL_METRICS, "summary_backend", "evaluated_source", *app.LATENCY_SUMMARY_METRICS])
+
+    def test_load_eval_summary_preserves_latency_summary_columns(self):
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ragas_results.csv"
+            path.write_text(
+                "strategy,faithfulness,answer_relevancy,context_recall,context_precision,summary_backend,avg_retrieval_ms,avg_synthesis_ms,avg_total_ms\n"
+                "semantic_only,0.1,0.2,0.3,0.4,cloud_free_tier_ragas,12.5,3.25,15.75\n",
+                encoding="utf-8",
+            )
+
+            frame = app.load_eval_summary(path)
+
+        self.assertEqual(frame.loc[0, "avg_retrieval_ms"], 12.5)
+        self.assertEqual(frame.loc[0, "avg_synthesis_ms"], 3.25)
+        self.assertEqual(frame.loc[0, "avg_total_ms"], 15.75)
 
     def test_grouped_bar_chart_separates_cloud_and_lexical_metrics(self):
         summary = pd.DataFrame(
@@ -283,6 +305,36 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertEqual(app.best_strategy(frame), "hybrid_rerank")
 
+    def test_best_strategy_uses_lexical_metrics_when_ragas_missing(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "strategy": "semantic_only",
+                    "faithfulness": pd.NA,
+                    "answer_relevancy": pd.NA,
+                    "context_recall": pd.NA,
+                    "context_precision": pd.NA,
+                    "lexical_faithfulness": 0.2,
+                    "lexical_answer_relevancy": 0.2,
+                    "lexical_context_recall": 0.2,
+                    "lexical_context_precision": 0.2,
+                },
+                {
+                    "strategy": "hybrid_rerank",
+                    "faithfulness": pd.NA,
+                    "answer_relevancy": pd.NA,
+                    "context_recall": pd.NA,
+                    "context_precision": pd.NA,
+                    "lexical_faithfulness": 0.7,
+                    "lexical_answer_relevancy": 0.8,
+                    "lexical_context_recall": 0.6,
+                    "lexical_context_precision": 0.5,
+                },
+            ]
+        )
+
+        self.assertEqual(app.best_strategy(frame), "hybrid_rerank")
+
     def test_metric_card_values_default_to_best_strategy(self):
         frame = pd.DataFrame(
             [
@@ -307,6 +359,70 @@ class AppHelperTests(unittest.TestCase):
 
         self.assertEqual(values["strategy"], "strong")
         self.assertEqual(values["context_precision"], 1.0)
+        self.assertEqual(values["metric_family"], "cloud_ragas")
+
+    def test_metric_card_values_maps_lexical_metrics_to_summary_cards(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "strategy": "bm25_only",
+                    "faithfulness": pd.NA,
+                    "answer_relevancy": pd.NA,
+                    "context_recall": pd.NA,
+                    "context_precision": pd.NA,
+                    "lexical_faithfulness": 0.61,
+                    "lexical_answer_relevancy": 0.72,
+                    "lexical_context_recall": 0.83,
+                    "lexical_context_precision": 0.94,
+                }
+            ]
+        )
+
+        values = app.metric_card_values(frame)
+
+        self.assertEqual(values["strategy"], "bm25_only")
+        self.assertEqual(values["metric_family"], "offline_lexical")
+        self.assertEqual(values["faithfulness"], 0.61)
+        self.assertEqual(values["answer_relevancy"], 0.72)
+        self.assertEqual(values["context_recall"], 0.83)
+        self.assertEqual(values["context_precision"], 0.94)
+        self.assertEqual(values["display_metrics"]["faithfulness"], "lexical_faithfulness")
+
+    def test_metric_card_values_prefers_cloud_metrics_for_selected_mixed_row(self):
+        frame = pd.DataFrame(
+            [
+                {
+                    "strategy": "cloud",
+                    "faithfulness": 0.4,
+                    "answer_relevancy": 0.5,
+                    "context_recall": 0.6,
+                    "context_precision": 0.7,
+                    "lexical_faithfulness": 0.9,
+                    "lexical_answer_relevancy": 0.9,
+                    "lexical_context_recall": 0.9,
+                    "lexical_context_precision": 0.9,
+                },
+                {
+                    "strategy": "offline",
+                    "faithfulness": pd.NA,
+                    "answer_relevancy": pd.NA,
+                    "context_recall": pd.NA,
+                    "context_precision": pd.NA,
+                    "lexical_faithfulness": 0.8,
+                    "lexical_answer_relevancy": 0.8,
+                    "lexical_context_recall": 0.8,
+                    "lexical_context_precision": 0.8,
+                },
+            ]
+        )
+
+        cloud_values = app.metric_card_values(frame, strategy="cloud")
+        offline_values = app.metric_card_values(frame, strategy="offline")
+
+        self.assertEqual(cloud_values["metric_family"], "cloud_ragas")
+        self.assertEqual(cloud_values["faithfulness"], 0.4)
+        self.assertEqual(offline_values["metric_family"], "offline_lexical")
+        self.assertEqual(offline_values["faithfulness"], 0.8)
 
     def test_filter_questions_below_threshold_keeps_any_low_metric(self):
         frame = pd.DataFrame(
@@ -593,6 +709,31 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(messages[1]["content"], "React e Vite.")
         query.assert_called_once_with("Qual e a stack?", history=[], strategy="hybrid_rerank")
 
+    def test_query_tab_streams_new_assistant_answer_before_citations_and_debug(self):
+        fake_st = StreamingFakeStreamlit(prompt="Qual e a stack?")
+        response = {
+            "answer": "React e Vite.",
+            "citations": [{"source_doc": "README.md", "score": 0.9, "snippet": "React 19 e Vite 7."}],
+            "trace": {"strategy": "hybrid_rerank"},
+        }
+
+        current = {"source_slug": "test-repo", "indexed_at": "2026-05-22T00:00:00+00:00"}
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.run_chat_query", return_value=response),
+        ):
+            mock_chroma.exists.return_value = True
+            app._render_query_tab(fake_st)
+
+        self.assertIn(("write_stream", "React e Vite."), fake_st.events)
+        stream_index = next(index for index, event in enumerate(fake_st.events) if event[0] == "write_stream")
+        citation_index = next(index for index, event in enumerate(fake_st.events) if event == ("caption", "1. README.md"))
+        debug_index = next(index for index, event in enumerate(fake_st.events) if event[0] == "expander" and event[1] == "Retrieval trace / debug")
+        self.assertLess(stream_index, citation_index)
+        self.assertLess(stream_index, debug_index)
+
     def test_query_tab_sends_existing_session_history_to_chat_query(self):
         existing = [{"role": "user", "content": "contexto anterior"}]
         fake_st = FakeStreamlit(prompt="continua", messages=existing)
@@ -848,6 +989,48 @@ class AppHelperTests(unittest.TestCase):
                 app.clear_source_cache()
 
             mock_chromadb.PersistentClient.assert_called_once_with(path=str(chroma_dir))
+            mock_client.delete_collection.assert_called_once_with("advanced_rag")
+            self.assertFalse(current_source.exists())
+
+    def test_clear_source_cache_ignores_value_error_for_missing_chroma_collection(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "data" / "raw"
+            chroma_dir = root / "chroma_db"
+            current_source = root / "data" / "current_source.json"
+            prepared_source = root / "data" / "prepared_source.json"
+            query_log = root / "data" / "query_log.jsonl"
+            golden_path = root / "data" / "eval" / "golden_dataset.json"
+            summary_path = root / "data" / "eval" / "ragas_results.csv"
+            detail_path = root / "data" / "eval" / "ragas_per_question.csv"
+            raw_dir.mkdir(parents=True)
+            chroma_dir.mkdir()
+            current_source.parent.mkdir(parents=True, exist_ok=True)
+            current_source.write_text('{"source_slug":"old"}', encoding="utf-8")
+            mock_client = MagicMock()
+            mock_client.delete_collection.side_effect = ValueError("Collection advanced_rag does not exist.")
+            mock_chromadb = MagicMock()
+            mock_chromadb.PersistentClient.return_value = mock_client
+
+            def rmtree_unless_chroma(path):
+                if Path(path) == chroma_dir:
+                    raise PermissionError("chroma file is locked")
+                shutil.rmtree(path)
+
+            with (
+                patch.object(app, "RAW_DIR", raw_dir),
+                patch.object(app, "CHROMA_DIR", chroma_dir),
+                patch.object(app, "CURRENT_SOURCE_PATH", current_source),
+                patch.object(app, "PREPARED_SOURCE_PATH", prepared_source),
+                patch.object(app, "QUERY_LOG_PATH", query_log),
+                patch.object(app, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(app, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(app, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.object(app.shutil, "rmtree", side_effect=rmtree_unless_chroma),
+                patch.dict("sys.modules", {"chromadb": mock_chromadb}),
+            ):
+                app.clear_source_cache()
+
             mock_client.delete_collection.assert_called_once_with("advanced_rag")
             self.assertFalse(current_source.exists())
 
@@ -1486,14 +1669,16 @@ class SourcesTabTests(unittest.TestCase):
         fake_st._text_input_value = "/tmp/new-project"
         prepared = [Path("data/raw/new-project/README.md")]
 
-        with (
-            patch("app.clear_source_cache") as clear_cache,
-            patch("app.reset_session_source_state") as reset_state,
-            patch("app.prepare_sources_for_app", return_value=prepared) as prepare,
-            patch("app._has_raw_source_files", return_value=True),
-            patch("app.load_current_source", return_value=None),
-        ):
-            app._render_sources_tab(fake_st)
+        with TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(app, "PREPARED_SOURCE_PATH", Path(tmpdir) / "prepared_source.json"),
+                patch("app.clear_source_cache") as clear_cache,
+                patch("app.reset_session_source_state") as reset_state,
+                patch("app.prepare_sources_for_app", return_value=prepared) as prepare,
+                patch("app._has_raw_source_files", return_value=True),
+                patch("app.load_current_source", return_value=None),
+            ):
+                app._render_sources_tab(fake_st)
 
         prepare.assert_called_once_with(
             ["/tmp/new-project"],
@@ -1504,6 +1689,26 @@ class SourcesTabTests(unittest.TestCase):
         clear_cache.assert_called_once_with(clear_raw=False)
         reset_state.assert_called_once_with(fake_st)
         self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_slug"], "new-project")
+
+    def test_store_prepared_source_persists_durable_metadata(self):
+        fake_st = FakeStreamlit()
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "data" / "raw"
+            prepared_path = Path(tmpdir) / "data" / "prepared_source.json"
+            prepared = [raw_dir / "new-project" / "README.md"]
+
+            with (
+                patch.object(app, "RAW_DIR", raw_dir),
+                patch.object(app, "PREPARED_SOURCE_PATH", prepared_path),
+            ):
+                app._store_prepared_source(fake_st, prepared, "https://github.com/acme/new-project", "github")
+
+            persisted = json.loads(prepared_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_slug"], "new-project")
+        self.assertEqual(persisted["source_slug"], "new-project")
+        self.assertEqual(persisted["source_type"], "github")
+        self.assertEqual(persisted["file_count"], 1)
 
     def test_prepare_sources_failure_preserves_active_source_cache(self):
         fake_st = FakeStreamlit()
@@ -1571,6 +1776,7 @@ class SourcesTabTests(unittest.TestCase):
         fake_st = FakeStreamlit()
         with (
             patch("app.load_current_source", return_value={"source_slug": "test-repo", "indexed_at": "2025-01-01"}),
+            patch("app.load_prepared_source", return_value=None),
             patch("app._has_chroma_index", return_value=True),
             patch("app.dataset_stats", return_value={"golden_questions": 5, "evaluated_rows": 20}),
             patch("app.last_eval_date", return_value="2025-01-15 10:00"),
@@ -1597,6 +1803,7 @@ class SourcesTabTests(unittest.TestCase):
         fake_st = FakeStreamlit()
         with (
             patch("app.load_current_source", return_value=None),
+            patch("app.load_prepared_source", return_value=None),
             patch("app.get_source_badge_state", return_value="grey"),
             patch("app.dataset_stats", return_value={"golden_questions": 0, "evaluated_rows": 0}),
             patch("app.last_eval_date", return_value="Not available"),
@@ -1692,13 +1899,15 @@ class QueryTabWarningTests(unittest.TestCase):
         fake_st._button_return = True
         prepared = [Path("data/raw/shizu0n-phi3-mini-sql-generator/README.md")]
 
-        with (
-            patch("app.prepare_sources_for_app", return_value=prepared),
-            patch("app._has_raw_source_files", return_value=True),
-            patch("app.load_current_source", return_value=None),
-            patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "0"}),
-        ):
-            app._render_sources_tab(fake_st)
+        with TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(app, "PREPARED_SOURCE_PATH", Path(tmpdir) / "prepared_source.json"),
+                patch("app.prepare_sources_for_app", return_value=prepared),
+                patch("app._has_raw_source_files", return_value=True),
+                patch("app.load_current_source", return_value=None),
+                patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "0"}),
+            ):
+                app._render_sources_tab(fake_st)
 
         infos = [event[1] for event in fake_st.events if event[0] == "info"]
         self.assertTrue(any("Prepared source: shizu0n-phi3-mini-sql-generator" in i for i in infos))
@@ -2129,14 +2338,16 @@ class QueryTabWarningTests(unittest.TestCase):
         fake_st._button_return = True
         prepared = [Path("data/raw/shizu0n-phi3-mini-sql-generator/README.md")]
 
-        with (
-            patch("app.prepare_sources_for_app", return_value=prepared),
-            patch("app._has_raw_source_files", return_value=True),
-            patch("app.load_current_source", return_value=None),
-            patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "0"}),
-        ):
-            app._render_sources_tab(fake_st)
-            self.assertIn(app.PREPARED_SOURCE_KEY, fake_st.session_state)
+        with TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(app, "PREPARED_SOURCE_PATH", Path(tmpdir) / "prepared_source.json"),
+                patch("app.prepare_sources_for_app", return_value=prepared),
+                patch("app._has_raw_source_files", return_value=True),
+                patch("app.load_current_source", return_value=None),
+                patch.dict("os.environ", {"ALLOW_INDEX_BUILD": "0"}),
+            ):
+                app._render_sources_tab(fake_st)
+                self.assertIn(app.PREPARED_SOURCE_KEY, fake_st.session_state)
 
         self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_slug"], "shizu0n-phi3-mini-sql-generator")
 

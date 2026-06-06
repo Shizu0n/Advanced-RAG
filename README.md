@@ -188,6 +188,14 @@ The app opens at `http://localhost:8501` with three tabs:
 - **Query** — run questions against the indexed source with trace visibility
 - **Evaluation** — compare retrieval strategies and inspect results
 
+### Streamlit Cloud Deployment
+
+The first public deployment target is Streamlit Cloud. Runtime artifacts are intentionally rebuildable and should not be committed: `data/raw/`, `chroma_db/`, and `data/eval/`.
+
+Configure Streamlit secrets with the same gates documented in `.env.example`. Keep cloud proof runs guarded with low `MAX_CLOUD_CALLS` and `MAX_REAL_RAGAS_ROWS`; the public app must still work through offline fallback when provider keys or quota are unavailable.
+
+See [`docs/designs/final-polish-backlog-plan.md`](docs/designs/final-polish-backlog-plan.md) for the deployment checklist, Railway fallback criteria, and final acceptance checklist.
+
 ### Python API
 
 ```python

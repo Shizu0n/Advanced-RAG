@@ -1,5 +1,7 @@
 import json
 import os
+import sys
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 from pathlib import Path
@@ -30,6 +32,8 @@ class IngestionTests(unittest.TestCase):
             (source_dir / "service.py").write_text("def ping():\n    return 'pong'\n", encoding="utf-8")
             (raw_dir / "repo" / "docs").mkdir(parents=True)
             (raw_dir / "repo" / "docs" / "notes.md").write_text("# repo notes", encoding="utf-8")
+            (raw_dir / "repo" / "docs" / "manual.pdf").write_bytes(b"%PDF-1.4 fixture")
+            (raw_dir / "repo" / "docs" / "brief.docx").write_bytes(b"docx fixture")
             (raw_dir / "repo" / "node_modules").mkdir(parents=True)
             (raw_dir / "repo" / "node_modules" / "ignored.js").write_text("console.log('ignore')", encoding="utf-8")
 
@@ -37,7 +41,120 @@ class IngestionTests(unittest.TestCase):
 
         relative_paths = sorted(path.relative_to(raw_dir).as_posix() for path in files)
 
-        self.assertEqual(relative_paths, ["repo/docs/notes.md", "repo/src/service.py"])
+        self.assertEqual(
+            relative_paths,
+            ["repo/docs/brief.docx", "repo/docs/manual.pdf", "repo/docs/notes.md", "repo/src/service.py"],
+        )
+
+    def test_safe_read_text_extracts_pdf_pages(self):
+        class FakePage:
+            def __init__(self, text):
+                self._text = text
+
+            def extract_text(self):
+                return self._text
+
+        class FakePdfReader:
+            def __init__(self, path):
+                self.path = path
+                self.pages = [FakePage("First page"), FakePage(""), FakePage("Second page")]
+
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "manual.pdf"
+            source.write_bytes(b"%PDF-1.4 fixture")
+            fake_module = SimpleNamespace(PdfReader=FakePdfReader)
+
+            with patch.dict(sys.modules, {"PyPDF2": fake_module}):
+                text = ingestion._safe_read_text(source)
+
+        self.assertEqual(text, "First page\n\nSecond page")
+
+    def test_safe_read_text_extracts_docx_paragraphs_and_tables(self):
+        fake_document = SimpleNamespace(
+            paragraphs=[SimpleNamespace(text="Intro paragraph"), SimpleNamespace(text="")],
+            tables=[
+                SimpleNamespace(
+                    rows=[
+                        SimpleNamespace(
+                            cells=[SimpleNamespace(text="Name"), SimpleNamespace(text="Value")]
+                        )
+                    ]
+                )
+            ],
+        )
+        fake_module = SimpleNamespace(Document=lambda path: fake_document)
+
+        with TemporaryDirectory() as tmpdir:
+            source = Path(tmpdir) / "brief.docx"
+            source.write_bytes(b"docx fixture")
+
+            with patch.dict(sys.modules, {"docx": fake_module}):
+                text = ingestion._safe_read_text(source)
+
+        self.assertEqual(text, "Intro paragraph\nName\tValue")
+
+    def test_run_chunking_ablation_writes_rows_without_rebuilding_index(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir()
+            source = raw_dir / "notes.md"
+            source.write_text(("Alpha beta gamma delta. " * 80).strip(), encoding="utf-8")
+            output_path = Path(tmpdir) / "chunking.csv"
+
+            rows = ingestion.run_chunking_ablation(
+                source_files=[source],
+                chunk_sizes=[128, 256],
+                chunk_overlap_tokens=16,
+                output_path=output_path,
+            )
+
+            self.assertEqual([row["chunk_size"] for row in rows], [128, 256])
+            self.assertTrue(all(row["file_count"] == 1 for row in rows))
+            self.assertTrue(all(row["chunk_count"] >= 1 for row in rows))
+            self.assertTrue(output_path.exists())
+
+    def test_embedding_model_comparison_skips_when_model_downloads_disabled(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir()
+            source = raw_dir / "notes.md"
+            source.write_text("Embedding comparison sample text.", encoding="utf-8")
+
+            rows = ingestion.run_embedding_model_comparison(
+                source_files=[source],
+                models=["model-a", "model-b"],
+                allow_model_downloads=False,
+            )
+
+        self.assertEqual([row["status"] for row in rows], ["skipped_model_downloads_disabled", "skipped_model_downloads_disabled"])
+        self.assertTrue(all(row["embedding_dim"] == 0 for row in rows))
+
+    def test_embedding_model_comparison_embeds_sample_when_allowed(self):
+        class FakeEmbedding:
+            def __init__(self, model_name):
+                self.model_name = model_name
+
+            def get_text_embedding_batch(self, samples):
+                return [[0.1, 0.2, 0.3] for _ in samples]
+
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir()
+            source = raw_dir / "notes.md"
+            source.write_text("Embedding comparison sample text.", encoding="utf-8")
+
+            with patch.object(ingestion, "HuggingFaceEmbedding", FakeEmbedding):
+                rows = ingestion.run_embedding_model_comparison(
+                    source_files=[source],
+                    models=["model-a"],
+                    sample_size=1,
+                    allow_model_downloads=True,
+                )
+
+        self.assertEqual(rows[0]["status"], "ok")
+        self.assertEqual(rows[0]["model"], "model-a")
+        self.assertEqual(rows[0]["sample_count"], 1)
+        self.assertEqual(rows[0]["embedding_dim"], 3)
 
     def test_load_or_download_sources_requires_network_opt_in_when_raw_empty(self):
         with TemporaryDirectory() as tmpdir:

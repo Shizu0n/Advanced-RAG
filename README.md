@@ -60,14 +60,14 @@ Core modules:
 
 Prepared sources are stored under `data/raw/`.
 
-- Local and GitHub sources are filtered by supported extensions such as `.py`, `.md`, `.ts`, `.js`, `.json`, `.yaml`, `.toml`, `.txt`, and `.rst`
+- Local and GitHub sources are filtered by supported extensions such as `.py`, `.md`, `.ts`, `.js`, `.json`, `.yaml`, `.toml`, `.txt`, `.rst`, `.pdf`, and `.docx`
 - Symlinks are rejected
 - Ignored directories such as `node_modules`, `.git`, and `__pycache__` are skipped
 - Hugging Face sources fetch the card `README.md` through the raw `/resolve/main/README.md` endpoint
 
 ### Indexing
 
-Source files are chunked with LlamaIndex `SentenceSplitter` using a 512-token chunk size and 50-token overlap. Embeddings are generated locally with `BAAI/bge-small-en-v1.5` and stored in ChromaDB.
+Source files are chunked with LlamaIndex `SentenceSplitter` using a 512-token chunk size and 64-token overlap. Embeddings are generated locally with `BAAI/bge-small-en-v1.5` and stored in ChromaDB.
 
 If no vector index exists, the product falls back to lexical-only retrieval.
 
@@ -86,6 +86,8 @@ Answer synthesis has two modes:
 
 - **Generative** — uses a configured free-tier provider when query-time cloud chat is allowed
 - **Extractive fallback** — uses retrieved context directly when cloud chat is disabled, unavailable, or fails
+
+Chat messages are persisted per indexed source in local SQLite at `data/chat_history.sqlite3`. Retrieval follow-up context uses prior user messages only, so persisted assistant answers are displayed in the UI without being fed back into retrieval.
 
 ### Evaluation
 
@@ -270,6 +272,25 @@ Outputs:
 - `data/eval/ragas_results.csv` — per-strategy summary metrics
 - `data/eval/ragas_per_question.csv` — per-question breakdown
 - `data/eval/golden_dataset.json` — generated evaluation dataset
+- `data/eval/chunking_ablation.csv` — chunk-count and chunk-size comparison for 256, 512, and 1024 token chunks
+- `data/eval/embedding_comparison.csv` — local embedding model timing/dimension comparison for `bge-small`, `bge-base`, and `e5-small`
+
+### Chunking and Embedding Experiments
+
+The Evaluation tab can run chunk-size ablation and embedding comparison from the current prepared source. The embedding comparison respects `ALLOW_MODEL_DOWNLOADS`; when disabled, rows are written with a skipped status instead of downloading models.
+
+```bash
+python - <<'PY'
+from pathlib import Path
+from ingestion import run_chunking_ablation, run_embedding_model_comparison
+
+run_chunking_ablation(output_path=Path("data/eval/chunking_ablation.csv"))
+run_embedding_model_comparison(
+    allow_model_downloads=False,
+    output_path=Path("data/eval/embedding_comparison.csv"),
+)
+PY
+```
 
 ### Evaluation Metrics
 

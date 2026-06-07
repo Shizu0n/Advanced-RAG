@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 from pathlib import Path
 from typing import Any, Iterable, cast
 
@@ -27,8 +28,11 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent
 EVAL_DIR = PROJECT_ROOT / "data" / "eval"
 QUERY_LOG_PATH = PROJECT_ROOT / "data" / "query_log.jsonl"
+CHAT_HISTORY_DB_PATH = PROJECT_ROOT / "data" / "chat_history.sqlite3"
 RAGAS_RESULTS_PATH = EVAL_DIR / "ragas_results.csv"
 RAGAS_PER_QUESTION_PATH = EVAL_DIR / "ragas_per_question.csv"
+CHUNKING_ABLATION_PATH = EVAL_DIR / "chunking_ablation.csv"
+EMBEDDING_COMPARISON_PATH = EVAL_DIR / "embedding_comparison.csv"
 GOLDEN_DATASET_PATH = EVAL_DIR / "golden_dataset.json"
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 CHROMA_DIR = PROJECT_ROOT / "chroma_db"
@@ -42,6 +46,7 @@ CHAT_MESSAGES_KEY = "chat_messages"
 PREPARED_SOURCE_KEY = "prepared_source"
 ACTIVE_CHAT_SOURCE_KEY = "active_chat_source_slug"
 UI_GATE_OVERRIDES_KEY = "ui_gate_overrides"
+MAX_PERSISTED_CHAT_MESSAGES = 100
 UI_TOGGLE_GATES = {
     "ALLOW_HF_FETCH": {"label": "Allow Hugging Face fetch", "default": False},
     "ALLOW_GITHUB_FETCH": {"label": "Allow GitHub fetch", "default": False},
@@ -127,6 +132,20 @@ def load_per_question(path: Path = RAGAS_PER_QUESTION_PATH) -> pd.DataFrame:
             frame[column] = pd.NA
     frame = _coerce_metric_columns(frame)
     return frame
+
+
+def load_chunking_ablation(path: Path = CHUNKING_ABLATION_PATH) -> pd.DataFrame:
+    return _read_csv(
+        path,
+        ["chunk_size", "chunk_overlap", "file_count", "chunk_count", "avg_chunk_chars", "max_chunk_chars"],
+    )
+
+
+def load_embedding_comparison(path: Path = EMBEDDING_COMPARISON_PATH) -> pd.DataFrame:
+    return _read_csv(
+        path,
+        ["model", "status", "sample_count", "embedding_dim", "embedding_ms", "error"],
+    )
 
 
 def best_strategy(summary: pd.DataFrame) -> str | None:
@@ -415,7 +434,13 @@ def _remove_path(path: Path) -> None:
 
 
 def clear_eval_artifacts() -> None:
-    for path in [GOLDEN_DATASET_PATH, RAGAS_RESULTS_PATH, RAGAS_PER_QUESTION_PATH]:
+    for path in [
+        GOLDEN_DATASET_PATH,
+        RAGAS_RESULTS_PATH,
+        RAGAS_PER_QUESTION_PATH,
+        CHUNKING_ABLATION_PATH,
+        EMBEDDING_COMPARISON_PATH,
+    ]:
         _remove_path(path)
 
 
@@ -443,7 +468,7 @@ def _clear_chroma_artifacts() -> None:
 
 def clear_source_cache(clear_raw: bool = True) -> None:
     _clear_chroma_artifacts()
-    for path in [CURRENT_SOURCE_PATH, PREPARED_SOURCE_PATH, QUERY_LOG_PATH]:
+    for path in [CURRENT_SOURCE_PATH, PREPARED_SOURCE_PATH, QUERY_LOG_PATH, CHAT_HISTORY_DB_PATH]:
         _remove_path(path)
     clear_eval_artifacts()
     if clear_raw:
@@ -508,6 +533,93 @@ def log_query(query: str, strategy: str, result: dict[str, Any], log_path: Path 
     logger.info("Query logged: hash=%s (strategy=%s)", entry["query_hash"][:12], strategy)
 
 
+def _chat_db_connection(path: Path = CHAT_HISTORY_DB_PATH) -> sqlite3.Connection:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS chat_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_slug TEXT NOT NULL,
+            role TEXT NOT NULL CHECK (role IN ('user', 'assistant')),
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_chat_messages_source_id ON chat_messages(source_slug, id)"
+    )
+    return connection
+
+
+def load_persisted_chat_messages(
+    source_slug: str,
+    db_path: Path = CHAT_HISTORY_DB_PATH,
+    limit: int = MAX_PERSISTED_CHAT_MESSAGES,
+) -> list[dict[str, str]]:
+    """Load persisted display history for a single indexed source."""
+
+    if not source_slug or not db_path.exists():
+        return []
+    connection = _chat_db_connection(db_path)
+    try:
+        rows = connection.execute(
+            """
+            SELECT role, content
+            FROM (
+                SELECT id, role, content
+                FROM chat_messages
+                WHERE source_slug = ?
+                ORDER BY id DESC
+                LIMIT ?
+            )
+            ORDER BY id ASC
+            """,
+            (source_slug, limit),
+        ).fetchall()
+    finally:
+        connection.close()
+    return [{"role": str(role), "content": str(content)} for role, content in rows]
+
+
+def append_persisted_chat_message(
+    source_slug: str,
+    message: dict[str, Any],
+    db_path: Path = CHAT_HISTORY_DB_PATH,
+) -> None:
+    role = str(message.get("role", ""))
+    content = str(message.get("content", ""))
+    if not source_slug or role not in {"user", "assistant"} or not content:
+        return
+    connection = _chat_db_connection(db_path)
+    try:
+        connection.execute(
+            """
+            INSERT INTO chat_messages(source_slug, role, content, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (source_slug, role, content, pd.Timestamp.utcnow().isoformat()),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def clear_persisted_chat_history(source_slug: str | None = None, db_path: Path = CHAT_HISTORY_DB_PATH) -> None:
+    if not db_path.exists():
+        return
+    connection = _chat_db_connection(db_path)
+    try:
+        if source_slug:
+            connection.execute("DELETE FROM chat_messages WHERE source_slug = ?", (source_slug,))
+        else:
+            connection.execute("DELETE FROM chat_messages")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 def _has_raw_source_files(raw_dir: Path = RAW_DIR) -> bool:
     """Return True if data/raw/ has any files (recursively)."""
     if not raw_dir.exists():
@@ -559,6 +671,22 @@ def run_evaluation_inline(use_real_ragas: bool = True) -> None:
     from evaluate import main as eval_main
 
     eval_main(use_real_ragas=use_real_ragas)
+
+
+def run_chunking_ablation_inline() -> list[dict[str, Any]]:
+    from ingestion import run_chunking_ablation
+
+    return run_chunking_ablation(raw_dir=RAW_DIR, output_path=CHUNKING_ABLATION_PATH)
+
+
+def run_embedding_comparison_inline() -> list[dict[str, Any]]:
+    from ingestion import run_embedding_model_comparison
+
+    return run_embedding_model_comparison(
+        raw_dir=RAW_DIR,
+        allow_model_downloads=_env_gate_default("ALLOW_MODEL_DOWNLOADS", default=False),
+        output_path=EMBEDDING_COMPARISON_PATH,
+    )
 
 
 def _run_with_timeout(fn, timeout_seconds: float) -> bool:
@@ -1407,13 +1535,23 @@ def _sync_chat_history_to_source(st, current_source: dict[str, Any] | None) -> N
     previous_slug = st.session_state.get(ACTIVE_CHAT_SOURCE_KEY)
     st.session_state[ACTIVE_CHAT_SOURCE_KEY] = source_slug
     if previous_slug is not None and previous_slug != source_slug:
-        st.session_state[CHAT_MESSAGES_KEY] = []
+        st.session_state[CHAT_MESSAGES_KEY] = load_persisted_chat_messages(str(source_slug))
+    elif CHAT_MESSAGES_KEY not in st.session_state:
+        st.session_state[CHAT_MESSAGES_KEY] = load_persisted_chat_messages(str(source_slug))
 
 
 def _chat_history(st) -> list[dict[str, Any]]:
     if CHAT_MESSAGES_KEY not in st.session_state:
         st.session_state[CHAT_MESSAGES_KEY] = []
     return st.session_state[CHAT_MESSAGES_KEY]
+
+
+def _retrieval_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {"role": "user", "content": str(message.get("content", ""))}
+        for message in messages
+        if message.get("role") == "user" and str(message.get("content", "")).strip()
+    ]
 
 
 def _citation_text(citation: dict[str, Any], index: int) -> str:
@@ -1481,8 +1619,10 @@ def _render_chat_message(st, message: dict[str, Any], stream_content: bool = Fal
         else:
             st.write(content)
         if role == "assistant":
-            _render_citations(st, message.get("citations", []))
-            _render_trace_debug(st, message.get("trace"))
+            if "citations" in message:
+                _render_citations(st, message.get("citations", []))
+            if "trace" in message:
+                _render_trace_debug(st, message.get("trace"))
 
 
 def _render_query_tab(st) -> None:
@@ -1505,9 +1645,11 @@ def _render_query_tab(st) -> None:
     if not prompt or not prompt.strip():
         return
 
+    source_slug = str(current_source.get("source_slug", "")) if current_source else ""
     user_message = {"role": "user", "content": prompt.strip()}
-    history = list(messages)
+    history = _retrieval_history(messages)
     messages.append(user_message)
+    append_persisted_chat_message(source_slug, user_message)
     _render_chat_message(st, user_message)
 
     try:
@@ -1525,6 +1667,7 @@ def _render_query_tab(st) -> None:
         "trace": result.get("trace"),
     }
     messages.append(assistant_message)
+    append_persisted_chat_message(source_slug, assistant_message)
     _render_chat_message(st, assistant_message, stream_content=True)
 
 
@@ -1631,8 +1774,46 @@ def _render_eval_tab(st) -> None:
                 except Exception as exc:
                     _show_eval_failure(st, exc)
 
+    if st.button("Run chunking ablation"):
+        if not _eval_should_allow_run(st):
+            _render_eval_run_blocked(st)
+        else:
+            with st.spinner("Running chunk-size ablation..."):
+                try:
+                    rows = _with_session_gate_env(
+                        st,
+                        ["ALLOW_DOCS_DOWNLOAD"],
+                        run_chunking_ablation_inline,
+                    )
+                    st.success(f"Chunking ablation completed for {len(rows)} chunk sizes.")
+                    st.rerun()
+                except Exception as exc:
+                    _show_eval_failure(st, exc)
+
+    if st.button("Run embedding comparison"):
+        if not _eval_should_allow_run(st):
+            _render_eval_run_blocked(st)
+        else:
+            with st.spinner("Running embedding model comparison..."):
+                try:
+                    rows = _with_session_gate_env(
+                        st,
+                        ["ALLOW_DOCS_DOWNLOAD", "ALLOW_MODEL_DOWNLOADS"],
+                        run_embedding_comparison_inline,
+                    )
+                    st.success(f"Embedding comparison completed for {len(rows)} models.")
+                    st.rerun()
+                except Exception as exc:
+                    _show_eval_failure(st, exc)
+
     st.subheader("Generated pre-questions")
     st.dataframe(load_golden_questions(), use_container_width=True)
+
+    st.subheader("Chunking ablation")
+    st.dataframe(load_chunking_ablation(), use_container_width=True)
+
+    st.subheader("Embedding comparison")
+    st.dataframe(load_embedding_comparison(), use_container_width=True)
 
     st.subheader("Evaluation summary")
     card_columns = st.columns(4)

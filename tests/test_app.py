@@ -685,6 +685,27 @@ class AppHelperTests(unittest.TestCase):
             allow_index_build=False,
         )
 
+    def test_run_chunking_ablation_inline_writes_eval_artifact(self):
+        with patch("ingestion.run_chunking_ablation", return_value=[{"chunk_size": 512}]) as runner:
+            rows = app.run_chunking_ablation_inline()
+
+        self.assertEqual(rows, [{"chunk_size": 512}])
+        runner.assert_called_once_with(raw_dir=app.RAW_DIR, output_path=app.CHUNKING_ABLATION_PATH)
+
+    def test_run_embedding_comparison_inline_uses_model_download_gate(self):
+        with (
+            patch("ingestion.run_embedding_model_comparison", return_value=[{"model": "bge"}]) as runner,
+            patch.dict(os.environ, {"ALLOW_MODEL_DOWNLOADS": "1"}, clear=True),
+        ):
+            rows = app.run_embedding_comparison_inline()
+
+        self.assertEqual(rows, [{"model": "bge"}])
+        runner.assert_called_once_with(
+            raw_dir=app.RAW_DIR,
+            allow_model_downloads=True,
+            output_path=app.EMBEDDING_COMPARISON_PATH,
+        )
+
     def test_query_tab_persists_chat_messages_in_session_state(self):
         fake_st = FakeStreamlit(prompt="Qual e a stack?")
         response = {
@@ -698,6 +719,8 @@ class AppHelperTests(unittest.TestCase):
             patch("app._current_source_for_ui", return_value=current),
             patch("app.load_current_source", return_value=current),
             patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.load_persisted_chat_messages", return_value=[]),
+            patch("app.append_persisted_chat_message"),
             patch("app.run_chat_query", return_value=response) as query,
         ):
             mock_chroma.exists.return_value = True
@@ -722,6 +745,8 @@ class AppHelperTests(unittest.TestCase):
             patch("app._current_source_for_ui", return_value=current),
             patch("app.load_current_source", return_value=current),
             patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.load_persisted_chat_messages", return_value=[]),
+            patch("app.append_persisted_chat_message"),
             patch("app.run_chat_query", return_value=response),
         ):
             mock_chroma.exists.return_value = True
@@ -743,6 +768,7 @@ class AppHelperTests(unittest.TestCase):
             patch("app._current_source_for_ui", return_value=current),
             patch("app.load_current_source", return_value=current),
             patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.append_persisted_chat_message"),
             patch("app.run_chat_query", return_value={"answer": "ok", "citations": [], "trace": {}}) as query,
         ):
             mock_chroma.exists.return_value = True
@@ -750,6 +776,75 @@ class AppHelperTests(unittest.TestCase):
 
         query.assert_called_once_with("continua", history=[{"role": "user", "content": "contexto anterior"}], strategy="hybrid_rerank")
         self.assertEqual(len(fake_st.session_state[app.CHAT_MESSAGES_KEY]), 3)
+
+    def test_persisted_chat_messages_round_trip_by_source(self):
+        with TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "chat.sqlite3"
+            app.append_persisted_chat_message(
+                "source-a",
+                {"role": "user", "content": "first question"},
+                db_path=db_path,
+            )
+            app.append_persisted_chat_message(
+                "source-a",
+                {"role": "assistant", "content": "first answer", "trace": {"ignored": True}},
+                db_path=db_path,
+            )
+            app.append_persisted_chat_message(
+                "source-b",
+                {"role": "user", "content": "other source"},
+                db_path=db_path,
+            )
+
+            messages = app.load_persisted_chat_messages("source-a", db_path=db_path)
+
+        self.assertEqual(
+            messages,
+            [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "first answer"},
+            ],
+        )
+
+    def test_query_tab_loads_persisted_history_for_indexed_source(self):
+        fake_st = FakeStreamlit()
+        current = {"source_slug": "test-repo", "indexed_at": "2026-05-22T00:00:00+00:00"}
+
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.load_persisted_chat_messages", return_value=[{"role": "user", "content": "persisted"}]) as load_messages,
+        ):
+            mock_chroma.exists.return_value = True
+            app._render_query_tab(fake_st)
+
+        load_messages.assert_called_once_with("test-repo")
+        self.assertEqual(fake_st.session_state[app.CHAT_MESSAGES_KEY], [{"role": "user", "content": "persisted"}])
+
+    def test_query_tab_excludes_assistant_messages_from_retrieval_history(self):
+        existing = [
+            {"role": "user", "content": "original question"},
+            {"role": "assistant", "content": "assistant answer must not become retrieval context"},
+        ]
+        fake_st = FakeStreamlit(prompt="follow up", messages=existing)
+
+        current = {"source_slug": "test-repo", "indexed_at": "2026-05-22T00:00:00+00:00"}
+        with (
+            patch("app._current_source_for_ui", return_value=current),
+            patch("app.load_current_source", return_value=current),
+            patch("app.CHROMA_DIR") as mock_chroma,
+            patch("app.append_persisted_chat_message"),
+            patch("app.run_chat_query", return_value={"answer": "ok", "citations": [], "trace": {}}) as query,
+        ):
+            mock_chroma.exists.return_value = True
+            app._render_query_tab(fake_st)
+
+        query.assert_called_once_with(
+            "follow up",
+            history=[{"role": "user", "content": "original question"}],
+            strategy="hybrid_rerank",
+        )
 
     def test_assistant_message_renders_citations_and_keeps_debug_separate(self):
         fake_st = FakeStreamlit()
@@ -774,6 +869,17 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(json_payloads[0], {"mode": "unknown", "code": "unavailable"})
         self.assertEqual(json_payloads[1], {})
         self.assertNotIn("q", json.dumps(json_payloads, ensure_ascii=False))
+
+    def test_persisted_assistant_message_without_metadata_does_not_claim_missing_citations(self):
+        fake_st = FakeStreamlit()
+        message = {"role": "assistant", "content": "Resposta restaurada."}
+
+        app._render_chat_message(fake_st, message)
+
+        captions = [event[1] for event in fake_st.events if event[0] == "caption"]
+        expanders = [event[1] for event in fake_st.events if event[0] == "expander"]
+        self.assertNotIn("No citations returned.", captions)
+        self.assertNotIn("Retrieval trace / debug", expanders)
 
     def test_prepare_sources_for_app_uses_explicit_github_opt_in(self):
         with patch("source_loader.prepare_sources", return_value=[Path("data/raw/repo/a.py")]) as prepare:
@@ -1455,6 +1561,8 @@ class EvalTabTests(unittest.TestCase):
         self.assertIn("Generate pre-questions", buttons)
         self.assertIn("Run fast evaluation", buttons)
         self.assertIn("Run Cloud RAGAS", buttons)
+        self.assertIn("Run chunking ablation", buttons)
+        self.assertIn("Run embedding comparison", buttons)
 
 
 class SourceBadgeTests(unittest.TestCase):

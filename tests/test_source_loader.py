@@ -22,6 +22,8 @@ class SourceLoaderTests(unittest.TestCase):
             (repo_dir / "docs").mkdir()
             (repo_dir / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
             (repo_dir / "docs" / "guide.md").write_text("# Guide\n", encoding="utf-8")
+            (repo_dir / "docs" / "manual.pdf").write_bytes(b"%PDF-1.4 fixture")
+            (repo_dir / "docs" / "brief.docx").write_bytes(b"docx fixture")
             (repo_dir / "src" / "image.png").write_bytes(b"not text")
 
             files = source_loader.prepare_sources([repo_dir], raw_dir=raw_dir)
@@ -32,7 +34,12 @@ class SourceLoaderTests(unittest.TestCase):
             self.assertRegex(target_root, r"^sample-repo-[0-9a-f]{12}$")
             self.assertEqual(
                 relative_paths,
-                [f"{target_root}/docs/guide.md", f"{target_root}/src/app.py"],
+                [
+                    f"{target_root}/docs/brief.docx",
+                    f"{target_root}/docs/guide.md",
+                    f"{target_root}/docs/manual.pdf",
+                    f"{target_root}/src/app.py",
+                ],
             )
             self.assertEqual((raw_dir / target_root / "src" / "app.py").read_text(encoding="utf-8"), "print('ok')\n")
 

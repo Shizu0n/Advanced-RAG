@@ -490,6 +490,8 @@ def _is_code_like_sentence(sentence: str) -> bool:
     if re.match(r"^(?:[$#]\s*)?(?:def|class|import|from|return|const|let|var|function|if|for|while|try|except|print|console\.log|npm|pip|git|python|bash|sh|node)\b", normalized_sentence):
         return True
     words = [word.lower() for word in re.findall(r"[A-Za-z_][\w.-]*", normalized_sentence)]
+    if "\t" in normalized_sentence and words and not re.search(r"[{}();<>]=?|=>", normalized_sentence):
+        return False
     prose_word_count = sum(1 for word in words if word in _CODE_LIKE_PROSE_WORDS)
     if prose_word_count > 1:
         return False

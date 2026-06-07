@@ -33,12 +33,19 @@ PAGE_LIMIT = 50
 CHUNK_SIZE_TOKENS = 512
 CHUNK_OVERLAP_TOKENS = 64
 EMBED_MODEL = os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+CHUNK_ABLATION_SIZES = [256, 512, 1024]
+EMBEDDING_COMPARISON_MODELS = [
+    "BAAI/bge-small-en-v1.5",
+    "BAAI/bge-base-en-v1.5",
+    "intfloat/e5-small-v2",
+]
 SOURCE_EXTENSIONS = {
     ".c",
     ".cfg",
     ".cs",
     ".cpp",
     ".cxx",
+    ".docx",
     ".go",
     ".h",
     ".hpp",
@@ -50,6 +57,7 @@ SOURCE_EXTENSIONS = {
     ".kt",
     ".md",
     ".mjs",
+    ".pdf",
     ".py",
     ".pyi",
     ".rb",
@@ -135,7 +143,47 @@ def _safe_filename(url: str) -> str:
     return f"{filename or 'python_tutorial_index'}.txt"
 
 
+def _extract_pdf_text(path: Path) -> str:
+    try:
+        from PyPDF2 import PdfReader
+    except ImportError as exc:
+        raise RuntimeError(
+            "PDF ingestion requires PyPDF2. Install the project requirements before indexing .pdf sources."
+        ) from exc
+
+    reader = PdfReader(str(path))
+    page_text = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if text.strip():
+            page_text.append(text.strip())
+    return "\n\n".join(page_text)
+
+
+def _extract_docx_text(path: Path) -> str:
+    try:
+        from docx import Document as DocxDocument
+    except ImportError as exc:
+        raise RuntimeError(
+            "DOCX ingestion requires python-docx. Install the project requirements before indexing .docx sources."
+        ) from exc
+
+    document = DocxDocument(str(path))
+    text_parts = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+    for table in document.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+            if cells:
+                text_parts.append("\t".join(cells))
+    return "\n".join(text_parts)
+
+
 def _safe_read_text(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        return _extract_pdf_text(path)
+    if suffix == ".docx":
+        return _extract_docx_text(path)
     try:
         return path.read_text(encoding="utf-8")
     except UnicodeDecodeError:
@@ -310,6 +358,141 @@ def _is_missing_chroma_collection_error(exc: Exception) -> bool:
     return isinstance(exc, ValueError) and "does not exist" in str(exc).lower()
 
 
+def _documents_from_source_files(files: Iterable[Path]) -> list[Document]:
+    documents: list[Document] = []
+    for path in files:
+        text = _safe_read_text(path).strip()
+        if not re.search(r"\w", text):
+            continue
+        documents.append(
+            Document(
+                text=text,
+                metadata={
+                    "file_name": path.as_posix(),
+                    "source": "repo_source",
+                },
+            )
+        )
+    return documents
+
+
+def _split_documents(
+    documents: Iterable[Document],
+    chunk_size_tokens: int = CHUNK_SIZE_TOKENS,
+    chunk_overlap_tokens: int = CHUNK_OVERLAP_TOKENS,
+) -> list:
+    splitter = SentenceSplitter(chunk_size=chunk_size_tokens, chunk_overlap=chunk_overlap_tokens)
+    return splitter.get_nodes_from_documents(list(documents))
+
+
+def run_chunking_ablation(
+    source_files: Iterable[Path] | None = None,
+    raw_dir: Path = RAW_DIR,
+    chunk_sizes: Iterable[int] = CHUNK_ABLATION_SIZES,
+    chunk_overlap_tokens: int = CHUNK_OVERLAP_TOKENS,
+    output_path: Path | None = None,
+) -> list[dict[str, float | int | str]]:
+    """Compare chunk counts for multiple chunk sizes without rebuilding Chroma."""
+
+    files = list(source_files) if source_files is not None else load_or_download_sources(raw_dir=raw_dir)
+    documents = _documents_from_source_files(files)
+    if not documents:
+        raise RuntimeError("No readable text documents were found in the provided source files.")
+
+    rows: list[dict[str, float | int | str]] = []
+    for chunk_size in chunk_sizes:
+        nodes = _split_documents(
+            documents,
+            chunk_size_tokens=int(chunk_size),
+            chunk_overlap_tokens=min(int(chunk_overlap_tokens), max(int(chunk_size) - 1, 0)),
+        )
+        lengths = [len(node.get_content()) for node in nodes]
+        rows.append(
+            {
+                "chunk_size": int(chunk_size),
+                "chunk_overlap": int(min(chunk_overlap_tokens, max(int(chunk_size) - 1, 0))),
+                "file_count": len(documents),
+                "chunk_count": len(nodes),
+                "avg_chunk_chars": round(sum(lengths) / len(lengths), 3) if lengths else 0.0,
+                "max_chunk_chars": max(lengths) if lengths else 0,
+            }
+        )
+
+    if output_path is not None:
+        import pandas as pd
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(output_path, index=False)
+    return rows
+
+
+def run_embedding_model_comparison(
+    source_files: Iterable[Path] | None = None,
+    raw_dir: Path = RAW_DIR,
+    models: Iterable[str] = EMBEDDING_COMPARISON_MODELS,
+    sample_size: int = 8,
+    allow_model_downloads: bool | None = None,
+    output_path: Path | None = None,
+) -> list[dict[str, float | int | str]]:
+    """Compare local embedding models on a small chunk sample without changing the active index."""
+
+    files = list(source_files) if source_files is not None else load_or_download_sources(raw_dir=raw_dir)
+    documents = _documents_from_source_files(files)
+    if not documents:
+        raise RuntimeError("No readable text documents were found in the provided source files.")
+    nodes = _split_documents(documents)
+    samples = [node.get_content() for node in nodes[: max(int(sample_size), 1)]]
+    downloads_allowed = allow_model_downloads if allow_model_downloads is not None else os.getenv("ALLOW_MODEL_DOWNLOADS") == "1"
+
+    rows: list[dict[str, float | int | str]] = []
+    for model_name in models:
+        started = time.perf_counter()
+        if not downloads_allowed:
+            rows.append(
+                {
+                    "model": str(model_name),
+                    "status": "skipped_model_downloads_disabled",
+                    "sample_count": len(samples),
+                    "embedding_dim": 0,
+                    "embedding_ms": 0.0,
+                    "error": "",
+                }
+            )
+            continue
+        try:
+            embed_model = HuggingFaceEmbedding(model_name=str(model_name))
+            embeddings = embed_model.get_text_embedding_batch(samples)
+            first_embedding = embeddings[0] if embeddings else []
+            rows.append(
+                {
+                    "model": str(model_name),
+                    "status": "ok",
+                    "sample_count": len(samples),
+                    "embedding_dim": len(first_embedding),
+                    "embedding_ms": round((time.perf_counter() - started) * 1000, 3),
+                    "error": "",
+                }
+            )
+        except Exception as exc:
+            rows.append(
+                {
+                    "model": str(model_name),
+                    "status": "error",
+                    "sample_count": len(samples),
+                    "embedding_dim": 0,
+                    "embedding_ms": round((time.perf_counter() - started) * 1000, 3),
+                    "error": str(exc)[:200],
+                }
+            )
+
+    if output_path is not None:
+        import pandas as pd
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(rows).to_csv(output_path, index=False)
+    return rows
+
+
 def build_index(
     source_files: Iterable[Path] | None = None,
     raw_dir: Path = RAW_DIR,
@@ -331,26 +514,12 @@ def build_index(
         raise RuntimeError("No source documents found in data/raw and download produced no files.")
     logger.info("Building index from %d source files", len(files))
 
-    documents = []
-    for path in files:
-        text = _safe_read_text(path).strip()
-        if not re.search(r"\w", text):
-            continue
-        documents.append(
-            Document(
-                text=text,
-                metadata={
-                    "file_name": path.as_posix(),
-                    "source": "repo_source",
-                },
-            )
-        )
+    documents = _documents_from_source_files(files)
 
     if not documents:
         raise RuntimeError("No readable text documents were found in the provided source files.")
 
-    splitter = SentenceSplitter(chunk_size=CHUNK_SIZE_TOKENS, chunk_overlap=CHUNK_OVERLAP_TOKENS)
-    nodes = splitter.get_nodes_from_documents(documents)
+    nodes = _split_documents(documents)
 
     try:
         CHROMA_DIR.mkdir(parents=True, exist_ok=True)

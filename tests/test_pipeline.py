@@ -333,6 +333,19 @@ npm install.
         self.assertIn("streamlit run app.py", answer)
         self.assertIn("The UI opens in the browser.", answer)
 
+    def test_extractive_answer_preserves_tabular_document_rows(self):
+        answer = pipeline_module.synthesize_extractive_answer(
+            "Who is the escalation owner?",
+            [
+                "QA DOCX fixture confirms lunar onboarding policy is retrievable from Word documents.\n"
+                "Escalation owner\tDocumentation QA"
+            ],
+            max_sentences=2,
+        )
+
+        self.assertIn("Escalation owner", answer)
+        self.assertIn("Documentation QA", answer)
+
     def test_extractive_answer_preserves_fenced_command_for_command_question(self):
         answer = pipeline_module.synthesize_extractive_answer(
             "What command runs the app?",

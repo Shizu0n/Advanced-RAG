@@ -40,6 +40,19 @@ class NoisyProvider:
         }
 
 
+class FakeCloudClient:
+    def __init__(self, response=None, error=None):
+        self.response = response or {}
+        self.error = error
+        self.prompts = []
+
+    def generate_json(self, prompt):
+        self.prompts.append(prompt)
+        if self.error:
+            raise self.error
+        return self.response
+
+
 class StaticPipeline:
     def __init__(self, nodes=None):
         self.nodes = list(nodes or [])
@@ -271,19 +284,19 @@ class GoldenDatasetTests(unittest.TestCase):
             {
                 "question": "What is Python?",
                 "ground_truth": "short",
-                "reference_context": "ctx",
+                "reference_context": "short",
                 "source_doc": "a",
             },
             {
                 "question": "How does Python manage default argument values in function definitions and calls?",
                 "ground_truth": "specific",
-                "reference_context": "ctx",
+                "reference_context": "specific",
                 "source_doc": "b",
             },
             {
                 "question": "Explain decorators with arguments and wrapper function behavior in Python.",
                 "ground_truth": "specific",
-                "reference_context": "ctx",
+                "reference_context": "specific",
                 "source_doc": "c",
             },
         ]
@@ -555,6 +568,157 @@ class GoldenDatasetTests(unittest.TestCase):
         self.assertTrue(any("architecture" in question for question in questions))
         self.assertTrue(any("troubleshoot" in question for question in questions))
 
+    def test_generate_golden_dataset_uses_resume_questions_for_resume_pdf(self):
+        node = TextNode(
+            id_="resume",
+            text=(
+                "Paulo Shizuo Vasconcelos Tatibana. Habilidades tecnicas: TypeScript, Python, Streamlit. "
+                "Experiencia profissional em desenvolvimento de software. Projetos com RAG e automacao. "
+                "Formacao academica e certificacoes relevantes."
+            ),
+            metadata={"file_name": "Paulo_Shizuo___Curriculo.pdf"},
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "golden_dataset.json"
+            dataset = evaluation.generate_golden_dataset(
+                [node],
+                output_path=output_path,
+                providers=[StaticProvider()],
+                chunk_limit=1,
+                final_limit=6,
+            )
+
+        questions = [item["question"].lower() for item in dataset[:4]]
+        joined = " ".join(questions)
+        self.assertIn("technical skills", joined)
+        self.assertIn("professional experience", joined)
+        self.assertIn("education or certifications", joined)
+        self.assertNotIn("what stack and tools does this project use", joined)
+        self.assertNotIn("how do i set up and run this project", joined)
+        self.assertNotIn("what is the architecture of this project", joined)
+        ground_truths = [item["ground_truth"] for item in dataset]
+        self.assertTrue(any("TypeScript" in ground_truth and "Python" in ground_truth for ground_truth in ground_truths))
+        self.assertFalse(any(evaluation._is_instruction_like_ground_truth(item["ground_truth"]) for item in dataset))
+
+    def test_generate_golden_dataset_uses_factual_ground_truths_for_generic_documents(self):
+        node = TextNode(
+            id_="report",
+            text=(
+                "Quarterly Operations Report\n"
+                "Owner: Platform Team\n"
+                "Decision: Move indexing jobs to a background worker.\n"
+                "Outcome: Query latency stayed below 50 ms and failures became easier to retry.\n"
+            ),
+            metadata={"file_name": "operations-report.pdf"},
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "golden_dataset.json"
+            dataset = evaluation.generate_golden_dataset(
+                [node],
+                output_path=output_path,
+                providers=[StaticProvider()],
+                chunk_limit=1,
+                final_limit=4,
+            )
+
+        self.assertTrue(dataset)
+        joined_ground_truth = " ".join(item["ground_truth"] for item in dataset)
+        self.assertIn("Platform Team", joined_ground_truth)
+        self.assertFalse(any(evaluation._is_instruction_like_ground_truth(item["ground_truth"]) for item in dataset))
+
+    def test_offline_question_provider_preserves_accented_topic_terms(self):
+        node = TextNode(
+            id_="resume",
+            text="Habilidades técnicas incluem TypeScript, Python, arquitetura RAG e avaliação de sistemas.",
+        )
+
+        generated = evaluation.OfflineExtractiveQuestionProvider().generate(node)
+
+        self.assertIn("técnicas", generated["question"])
+        self.assertNotIn("Habilidades cnicas", generated["question"])
+
+    def test_ground_truth_validation_rejects_instruction_placeholders(self):
+        context = "Habilidades Técnicas: Java, TypeScript, Python, React, Spring Boot."
+
+        item = evaluation._validated_golden_item(
+            "What technical skills are listed?",
+            "Identify the technical skills stated in the resume context.",
+            context,
+            "resume.pdf",
+        )
+
+        self.assertIsNone(item)
+
+    def test_ground_truth_validation_accepts_context_supported_facts(self):
+        context = "Habilidades Técnicas: Java, TypeScript, Python, React, Spring Boot."
+
+        item = evaluation._validated_golden_item(
+            "What technical skills are listed?",
+            "Java, TypeScript, Python, React, Spring Boot.",
+            context,
+            "resume.pdf",
+        )
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["ground_truth"], "Java, TypeScript, Python, React, Spring Boot.")
+
+    def test_cloud_refinement_accepts_valid_context_supported_ground_truth(self):
+        original = {
+            "question": "What skills are listed?",
+            "ground_truth": "Java and Python.",
+            "reference_context": "Habilidades Técnicas: Java, TypeScript, Python, React, Spring Boot.",
+            "source_doc": "resume.pdf",
+        }
+        provider = evaluation.CloudQuestionProvider(
+            cloud_client=FakeCloudClient(
+                {
+                    "question": "What technical skills are listed in the resume?",
+                    "ground_truth": "Java, TypeScript, Python, React, and Spring Boot.",
+                }
+            )
+        )
+
+        refined = evaluation._maybe_refine_golden_item_with_cloud(original, provider)
+
+        self.assertEqual(refined["question"], "What technical skills are listed in the resume?")
+        self.assertEqual(refined["ground_truth"], "Java, TypeScript, Python, React, and Spring Boot.")
+
+    def test_cloud_refinement_rejects_instruction_like_ground_truth(self):
+        original = {
+            "question": "What skills are listed?",
+            "ground_truth": "Java and Python.",
+            "reference_context": "Habilidades Técnicas: Java, TypeScript, Python, React, Spring Boot.",
+            "source_doc": "resume.pdf",
+        }
+        provider = evaluation.CloudQuestionProvider(
+            cloud_client=FakeCloudClient(
+                {
+                    "question": "What technical skills are listed in the resume?",
+                    "ground_truth": "Identify the technical skills stated in the resume context.",
+                }
+            )
+        )
+
+        refined = evaluation._maybe_refine_golden_item_with_cloud(original, provider)
+
+        self.assertEqual(refined, original)
+
+    def test_cloud_refinement_falls_back_to_offline_candidate_on_error(self):
+        original = {
+            "question": "What skills are listed?",
+            "ground_truth": "Java and Python.",
+            "reference_context": "Habilidades Técnicas: Java, TypeScript, Python, React, Spring Boot.",
+            "source_doc": "resume.pdf",
+        }
+        provider = evaluation.CloudQuestionProvider(cloud_client=FakeCloudClient(error=RuntimeError("rate limited")))
+
+        refined = evaluation._maybe_refine_golden_item_with_cloud(original, provider)
+
+        self.assertEqual(refined, original)
+
     def test_run_evaluation_reports_progress_for_each_strategy(self):
         with TemporaryDirectory() as tmpdir:
             golden_path = Path(tmpdir) / "golden_dataset.json"
@@ -691,6 +855,12 @@ class GoldenDatasetTests(unittest.TestCase):
             self.assertEqual(backends["semantic_only"], "cloud_free_tier_ragas")
             self.assertEqual(backends["bm25_only"], "offline_heuristic")
             self.assertEqual(backends["hybrid_rerank"], "cloud_free_tier_ragas")
+            statuses = dict(zip(summary["strategy"], summary["cloud_status"]))
+            errors = dict(zip(summary["strategy"], summary["cloud_error"].fillna("")))
+            self.assertEqual(statuses["semantic_only"], "succeeded")
+            self.assertEqual(statuses["bm25_only"], "fallback_offline")
+            self.assertIn("cooling down", errors["bm25_only"])
+            self.assertEqual(statuses["hybrid_rerank"], "succeeded")
 
     def test_run_evaluation_reuses_one_cloud_client_across_strategies(self):
         with TemporaryDirectory() as tmpdir:

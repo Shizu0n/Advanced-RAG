@@ -10,6 +10,7 @@ import math
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
@@ -132,6 +133,133 @@ def _sentences(text: str) -> list[str]:
     return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if len(part.strip()) > 20]
 
 
+QUESTION_STOPWORDS = {
+    "about",
+    "above",
+    "after",
+    "before",
+    "context",
+    "does",
+    "explain",
+    "from",
+    "reference",
+    "section",
+    "this",
+    "what",
+    "with",
+    "para",
+    "pela",
+    "pelo",
+    "como",
+    "esta",
+    "este",
+    "sobre",
+    "contexto",
+}
+
+INSTRUCTION_GROUND_TRUTH_PREFIXES = (
+    "identify ",
+    "summarize ",
+    "describe ",
+    "use the ",
+    "use this ",
+    "list the ",
+    "explain ",
+    "extract ",
+    "find ",
+    "determine ",
+    "identifique ",
+    "resuma ",
+    "descreva ",
+    "use o ",
+    "use a ",
+    "liste ",
+    "explique ",
+    "extraia ",
+    "encontre ",
+    "determine ",
+)
+
+
+def _ascii_fold(text: str) -> str:
+    return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+
+
+def _topic_keywords(text: str, limit: int = 8) -> list[str]:
+    words = re.findall(r"\b[^\W\d_][\w-]{3,}\b", text, flags=re.UNICODE)
+    keywords: list[str] = []
+    seen: set[str] = set()
+    for word in words:
+        folded = _ascii_fold(word)
+        if folded in QUESTION_STOPWORDS or folded in seen:
+            continue
+        seen.add(folded)
+        keywords.append(word)
+        if len(keywords) >= limit:
+            break
+    return keywords
+
+
+def _content_terms(text: str) -> set[str]:
+    return {
+        _ascii_fold(word)
+        for word in re.findall(r"\b[^\W\d_][\w-]{2,}\b", text, flags=re.UNICODE)
+        if _ascii_fold(word) not in QUESTION_STOPWORDS
+    }
+
+
+def _is_instruction_like_ground_truth(ground_truth: str) -> bool:
+    normalized = _ascii_fold(ground_truth).strip()
+    return any(normalized.startswith(prefix) for prefix in INSTRUCTION_GROUND_TRUTH_PREFIXES)
+
+
+def _context_support_score(ground_truth: str, reference_context: str) -> float:
+    if not ground_truth.strip() or not reference_context.strip():
+        return 0.0
+    if _ascii_fold(ground_truth) in _ascii_fold(reference_context):
+        return 1.0
+    answer_terms = _content_terms(ground_truth)
+    context_terms = _content_terms(reference_context)
+    if not answer_terms or not context_terms:
+        answer_numbers = set(re.findall(r"\d{2,4}", ground_truth))
+        context_numbers = set(re.findall(r"\d{2,4}", reference_context))
+        return 1.0 if answer_numbers and answer_numbers <= context_numbers else 0.0
+    return len(answer_terms & context_terms) / len(answer_terms)
+
+
+def _is_supported_ground_truth(ground_truth: str, reference_context: str) -> bool:
+    if _is_instruction_like_ground_truth(ground_truth):
+        return False
+    answer_numbers = set(re.findall(r"\d{2,4}", ground_truth))
+    context_numbers = set(re.findall(r"\d{2,4}", reference_context))
+    if answer_numbers and answer_numbers <= context_numbers:
+        return True
+    if len(ground_truth.strip()) <= 12:
+        return _ascii_fold(ground_truth) in _ascii_fold(reference_context)
+    return _context_support_score(ground_truth, reference_context) >= 0.25
+
+
+def _validated_golden_item(
+    question: str,
+    ground_truth: str,
+    reference_context: str,
+    source_doc: str,
+) -> dict[str, str] | None:
+    question = question.strip()
+    ground_truth = ground_truth.strip()
+    reference_context = reference_context.strip()
+    if not question or not ground_truth or not reference_context:
+        return None
+    if not _is_supported_ground_truth(ground_truth, reference_context):
+        return None
+    return {
+        "question": question,
+        "ground_truth": ground_truth,
+        "reference_context": reference_context,
+        "source_doc": source_doc,
+    }
+
+
 @dataclass
 class OfflineExtractiveQuestionProvider:
     name: str = "offline_extractive"
@@ -140,7 +268,7 @@ class OfflineExtractiveQuestionProvider:
         text = _node_text(node)
         sentences = _sentences(text)
         answer = max(sentences or [text.strip()], key=len)[:700]
-        keywords = [word for word in re.findall(r"[A-Za-z][A-Za-z0-9_]{4,}", answer)[:8]]
+        keywords = _topic_keywords(answer)
         topic = " ".join(keywords[:4]) or "this Python documentation section"
         return {
             "question": f"What does the reference context explain about {topic}?",
@@ -175,6 +303,22 @@ class CloudQuestionProvider:
         data = client.generate_json(prompt)
         return {"question": data["question"], "ground_truth": data["ground_truth"]}
 
+    def refine(self, item: dict[str, str]) -> dict[str, str]:
+        if not self.enabled:
+            raise RuntimeError("Cloud RAGAS disabled; set USE_CLOUD_FREE_TIER_RAGAS=1 and ALLOW_CLOUD_FREE_TIER=1.")
+
+        client = self.cloud_client or cloud_ragas.client_from_config(cloud_ragas.config_from_env())
+        prompt = (
+            "Improve this RAG evaluation item if needed. Return strict JSON with keys "
+            "question and ground_truth. The ground_truth must be a factual answer, not an "
+            "instruction. Use only facts present in the context.\n\n"
+            f"Question candidate:\n{item['question']}\n\n"
+            f"Ground truth candidate:\n{item['ground_truth']}\n\n"
+            f"Context:\n{item['reference_context'][:6000]}"
+        )
+        data = client.generate_json(prompt)
+        return {"question": data["question"], "ground_truth": data["ground_truth"]}
+
 
 def default_question_providers(
     cloud_client: cloud_ragas.FreeTierCloudClient | None = None,
@@ -205,6 +349,38 @@ def generate_golden_item(node: Any, providers: Sequence[QuestionProvider]) -> di
     raise RuntimeError("; ".join(errors))
 
 
+def _cloud_refinement_provider(providers: Sequence[QuestionProvider]) -> CloudQuestionProvider | None:
+    for provider in providers:
+        if isinstance(provider, CloudQuestionProvider) and provider.enabled:
+            return provider
+    return None
+
+
+def _maybe_refine_golden_item_with_cloud(
+    item: dict[str, str],
+    provider: CloudQuestionProvider | None,
+) -> dict[str, str]:
+    if provider is None:
+        return item
+    try:
+        refined = provider.refine(item)
+    except Exception:
+        return item
+    validated = _validated_golden_item(
+        refined.get("question", ""),
+        refined.get("ground_truth", ""),
+        item["reference_context"],
+        item["source_doc"],
+    )
+    if not validated:
+        return item
+    for optional_key in ("source_slug", "provider"):
+        if optional_key in item:
+            validated[optional_key] = item[optional_key]
+    validated["provider"] = provider.name
+    return validated
+
+
 def _specificity_score(item: dict[str, str]) -> tuple[int, int]:
     question = item["question"]
     terms = re.findall(r"[A-Za-z][A-Za-z0-9_]{3,}", question.lower())
@@ -220,10 +396,12 @@ def _question_source_group(node: Any) -> str:
         return "manifest"
     if _is_code_evidence_source(source):
         return "code"
-    if _is_readme_source(source):
+    if _is_readme_source(source) or Path(source_key).name == "readme":
         return "readme"
     if Path(source_key).suffix.lower() in {".md", ".rst", ".txt"}:
         return "docs"
+    if Path(source_key).suffix.lower() in {".pdf", ".docx", ".doc"}:
+        return "document"
     return "other"
 
 
@@ -232,13 +410,13 @@ def _select_question_source_nodes(nodes: Sequence[Any], limit: int) -> list[Any]
         return []
 
     selectable_nodes = [node for node in nodes if not _is_test_question_source(_source_doc(node))] or list(nodes)
-    grouped: dict[str, list[Any]] = {"code": [], "docs": [], "manifest": [], "readme": [], "other": []}
+    grouped: dict[str, list[Any]] = {"code": [], "docs": [], "manifest": [], "readme": [], "document": [], "other": []}
     for node in selectable_nodes:
         grouped.setdefault(_question_source_group(node), []).append(node)
 
     selected: list[Any] = []
     seen: set[str] = set()
-    for group in ("code", "docs", "manifest", "readme", "other"):
+    for group in ("code", "docs", "manifest", "readme", "document", "other"):
         for node in grouped.get(group, []):
             key = f"{_source_doc(node)}::{getattr(node, 'node_id', id(node))}"
             if key in seen:
@@ -270,7 +448,7 @@ class CompositeQuestionNode:
 
 
 def _build_composite_question_nodes(nodes: Sequence[Any]) -> list[Any]:
-    grouped: dict[str, list[Any]] = {"readme": [], "manifest": [], "code": [], "docs": [], "other": []}
+    grouped: dict[str, list[Any]] = {"readme": [], "manifest": [], "code": [], "docs": [], "document": [], "other": []}
     for node in nodes:
         grouped.setdefault(_question_source_group(node), []).append(node)
 
@@ -295,35 +473,372 @@ def _build_composite_question_nodes(nodes: Sequence[Any]) -> list[Any]:
     return composites
 
 
-def _realistic_user_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
-    context = "\n\n".join(_node_text(node)[:1000] for node in list(nodes)[:3]).strip()
+def _combined_question_context(nodes: Sequence[Any]) -> str:
+    return "\n\n".join(_node_text(node)[:1000] for node in list(nodes)[:3]).strip()
+
+
+def _context_lines(text: str) -> list[str]:
+    heading_patterns = (
+        "Perfil Profissional",
+        "Professional Profile",
+        "Formação Acadêmica",
+        "Formacao Academica",
+        "Education",
+        "Projetos e Experiência Prática",
+        "Projetos e Experiencia Pratica",
+        "Projects",
+        "Habilidades Técnicas",
+        "Habilidades Tecnicas",
+        "Technical Skills",
+        "Skills",
+        "Idiomas",
+        "Languages",
+        "Certificações",
+        "Certificacoes",
+        "Certifications",
+    )
+    prepared = text.replace("\r\n", "\n").replace("\r", "\n")
+    prepared = re.sub(r"\s*[•]\s*", "\n•", prepared)
+    for heading in heading_patterns:
+        prepared = re.sub(rf"(?<!\n)({re.escape(heading)})", r"\n\1", prepared, flags=re.IGNORECASE)
+    lines: list[str] = []
+    for raw_line in prepared.splitlines():
+        line = re.sub(r"\s+", " ", raw_line.strip(" \t-*•")).strip()
+        if line:
+            lines.append(line)
+    if lines:
+        return lines
+    return [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+
+
+def _line_has_any(line: str, markers: Sequence[str]) -> bool:
+    folded = _ascii_fold(line)
+    return any(marker in folded for marker in markers)
+
+
+def _join_answer_lines(lines: Sequence[str], limit: int = 900) -> str:
+    answer = " ".join(line.strip() for line in lines if line.strip())
+    answer = re.sub(r"\s+", " ", answer).strip()
+    return answer[:limit].rstrip(" ,;")
+
+
+def _section_lines(
+    context: str,
+    start_markers: Sequence[str],
+    stop_markers: Sequence[str],
+    limit: int = 8,
+) -> list[str]:
+    lines = _context_lines(context)
+    selected: list[str] = []
+    collecting = False
+    for line in lines:
+        if not collecting and _line_has_any(line, start_markers):
+            collecting = True
+            if ":" in line:
+                remainder = line.split(":", 1)[1].strip()
+                if remainder:
+                    selected.append(remainder)
+            continue
+        if not collecting:
+            continue
+        if selected and _line_has_any(line, stop_markers):
+            break
+        selected.append(line)
+        if len(selected) >= limit:
+            break
+    if selected:
+        return selected
+
+    folded = _ascii_fold(context)
+    starts = [
+        (folded.find(marker), marker)
+        for marker in start_markers
+        if folded.find(marker) >= 0
+    ]
+    if not starts:
+        return []
+    start_index, marker = min(starts, key=lambda item: item[0])
+    content_start = start_index + len(marker)
+    stop_indexes = [
+        folded.find(stop_marker, content_start)
+        for stop_marker in stop_markers
+        if folded.find(stop_marker, content_start) >= 0
+    ]
+    content_end = min(stop_indexes) if stop_indexes else len(context)
+    snippet = context[content_start:content_end]
+    snippet_lines = [
+        re.sub(r"\s+", " ", part.strip(" \t-*•")).strip()
+        for part in re.split(r"\n+|(?<=[.!?])\s+", snippet)
+        if part.strip(" \t-*•")
+    ]
+    return snippet_lines[:limit]
+
+
+def _lines_with_markers(context: str, markers: Sequence[str], limit: int = 8) -> list[str]:
+    selected = [line for line in _context_lines(context) if _line_has_any(line, markers)]
+    return selected[:limit]
+
+
+def _colon_fact_lines(context: str, markers: Sequence[str] | None = None, limit: int = 8) -> list[str]:
+    selected: list[str] = []
+    for line in _context_lines(context):
+        if ":" not in line:
+            continue
+        if markers and not _line_has_any(line, markers):
+            continue
+        key, value = line.split(":", 1)
+        if len(value.strip()) < 2:
+            continue
+        selected.append(f"{key.strip()}: {value.strip()}")
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _salient_sentences(context: str, markers: Sequence[str] | None = None, limit: int = 3) -> list[str]:
+    sentences = _sentences(context) or _context_lines(context)
+    selected: list[str] = []
+    for sentence in sentences:
+        if markers and not _line_has_any(sentence, markers):
+            continue
+        selected.append(sentence)
+        if len(selected) >= limit:
+            break
+    if selected:
+        return selected
+    return sentences[:limit]
+
+
+def _answer_from_section(
+    context: str,
+    start_markers: Sequence[str],
+    stop_markers: Sequence[str],
+    fallback_markers: Sequence[str] | None = None,
+    limit: int = 8,
+) -> str:
+    lines = _section_lines(context, start_markers, stop_markers, limit=limit)
+    if not lines and fallback_markers:
+        lines = _colon_fact_lines(context, fallback_markers, limit=limit)
+    if not lines and fallback_markers:
+        lines = _lines_with_markers(context, fallback_markers, limit=limit)
+    return _join_answer_lines(lines)
+
+
+RESUME_STOP_MARKERS = (
+    "perfil profissional",
+    "professional profile",
+    "formacao academica",
+    "educacao",
+    "education",
+    "projetos",
+    "experiencia pratica",
+    "experience",
+    "habilidades tecnicas",
+    "technical skills",
+    "skills",
+    "idiomas",
+    "languages",
+    "certificacoes",
+    "certifications",
+)
+
+
+def _resume_skills_answer(context: str) -> str:
+    return _answer_from_section(
+        context,
+        ("habilidades tecnicas", "technical skills", "skills"),
+        ("idiomas", "languages", "educacao", "education", "certificacoes", "certifications"),
+        fallback_markers=("linguagens", "frontend", "backend", "banco", "devops", "metodologias", "languages", "database", "tools"),
+    )
+
+
+def _resume_experience_answer(context: str) -> str:
+    return _answer_from_section(
+        context,
+        ("perfil profissional", "professional profile", "experiencia profissional", "professional experience"),
+        ("formacao academica", "education", "projetos", "projects", "habilidades"),
+        fallback_markers=("experiencia", "experience", "desenvolvedor", "developer", "apis", "arquitetura"),
+        limit=4,
+    )
+
+
+def _resume_projects_answer(context: str) -> str:
+    return _answer_from_section(
+        context,
+        ("projetos", "experiencia pratica", "projects", "practical experience"),
+        ("habilidades tecnicas", "technical skills", "skills", "idiomas", "languages"),
+        fallback_markers=("github.com", "system", "sistema", "project", "projeto"),
+        limit=10,
+    )
+
+
+def _resume_education_answer(context: str) -> str:
+    return _answer_from_section(
+        context,
+        ("formacao academica", "educacao", "education"),
+        ("projetos", "experience", "habilidades", "skills"),
+        fallback_markers=("bacharelado", "universidade", "university", "graduation", "2027", "certificacao", "certification"),
+        limit=5,
+    )
+
+
+def _document_topics_answer(context: str) -> str:
+    heading_like = [
+        line
+        for line in _context_lines(context)
+        if len(line.split()) <= 8 and not line.endswith(".") and not line.endswith(",")
+    ][:5]
+    return _join_answer_lines(heading_like or _salient_sentences(context, limit=3))
+
+
+def _document_key_facts_answer(context: str) -> str:
+    return _join_answer_lines(_colon_fact_lines(context, limit=6) or _salient_sentences(context, limit=3))
+
+
+def _document_responsibilities_answer(context: str) -> str:
+    markers = (
+        "implementou",
+        "desenvolveu",
+        "projetou",
+        "estruturou",
+        "responsavel",
+        "responsibility",
+        "implemented",
+        "developed",
+        "designed",
+        "built",
+        "outcome",
+        "decision",
+    )
+    return _join_answer_lines(_lines_with_markers(context, markers, limit=5) or _salient_sentences(context, limit=2))
+
+
+def _project_stack_answer(context: str) -> str:
+    markers = (
+        "stack",
+        "tools",
+        "dependencies",
+        "devdependencies",
+        "framework",
+        "frontend",
+        "backend",
+        "python",
+        "streamlit",
+        "chromadb",
+        "react",
+        "node",
+        "typescript",
+        "java",
+        "spring",
+    )
+    return _join_answer_lines(_colon_fact_lines(context, markers, limit=8) or _lines_with_markers(context, markers, limit=8))
+
+
+def _project_setup_answer(context: str) -> str:
+    markers = ("setup", "install", "run", "pip ", "python ", "streamlit", "npm", "docker", "requirements")
+    return _join_answer_lines(_lines_with_markers(context, markers, limit=8))
+
+
+def _project_architecture_answer(context: str) -> str:
+    markers = ("architecture", "arquitetura", "layer", "camada", "module", "component", "service", "repository")
+    return _join_answer_lines(_lines_with_markers(context, markers, limit=8))
+
+
+def _project_troubleshooting_answer(context: str) -> str:
+    markers = ("troubleshoot", "error", "erro", "runtime", "setup", "install", "failed", "falha", "warning")
+    return _join_answer_lines(_lines_with_markers(context, markers, limit=6))
+
+
+def _source_set_is_project_like(nodes: Sequence[Any]) -> bool:
+    groups = {_question_source_group(node) for node in nodes}
+    return bool(groups & {"code", "manifest", "readme"})
+
+
+def _source_set_is_resume_like(nodes: Sequence[Any]) -> bool:
+    source_text = " ".join(_source_doc(node) for node in nodes)
+    body_text = " ".join(_node_text(node)[:1500] for node in list(nodes)[:4])
+    folded = _ascii_fold(f"{source_text} {body_text}")
+    resume_markers = {
+        "curriculo",
+        "resume",
+        "curriculum",
+        "experiencia",
+        "habilidades",
+        "formacao",
+        "educacao",
+        "certificacoes",
+        "professional experience",
+        "technical skills",
+    }
+    return any(marker in folded for marker in resume_markers)
+
+
+def _resume_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
+    context = _combined_question_context(nodes)
     source_doc = _source_doc(nodes[0]) if nodes else "unknown"
+    candidates = [
+        (
+            "What technical skills are listed in this resume?",
+            _resume_skills_answer(context),
+        ),
+        (
+            "What professional experience is described in this resume?",
+            _resume_experience_answer(context),
+        ),
+        (
+            "What projects or achievements are highlighted in this resume?",
+            _resume_projects_answer(context),
+        ),
+        (
+            "What education or certifications are included in this resume?",
+            _resume_education_answer(context),
+        ),
+    ]
     return [
-        {
-            "question": "What stack and tools does this project use?",
-            "ground_truth": "List the stack declared in project documentation and confirm it with package manifests or source evidence when available.",
-            "reference_context": context,
-            "source_doc": source_doc,
-        },
-        {
-            "question": "How do I set up and run this project?",
-            "ground_truth": "Use the setup and run instructions documented in the retrieved project context.",
-            "reference_context": context,
-            "source_doc": source_doc,
-        },
-        {
-            "question": "What is the architecture of this project?",
-            "ground_truth": "Describe the project architecture using only the retrieved project context.",
-            "reference_context": context,
-            "source_doc": source_doc,
-        },
-        {
-            "question": "How should I troubleshoot common setup or runtime problems?",
-            "ground_truth": "Use the troubleshooting, setup, and runtime evidence documented in the retrieved project context.",
-            "reference_context": context,
-            "source_doc": source_doc,
-        },
-    ] if context else []
+        item
+        for question, answer in candidates
+        if (item := _validated_golden_item(question, answer, context, source_doc))
+    ]
+
+
+def _document_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
+    context = _combined_question_context(nodes)
+    source_doc = _source_doc(nodes[0]) if nodes else "unknown"
+    candidates = [
+        ("What are the main topics covered in this document?", _document_topics_answer(context)),
+        ("What key facts or entities are described in this document?", _document_key_facts_answer(context)),
+        (
+            "What responsibilities, decisions, or outcomes are mentioned in this document?",
+            _document_responsibilities_answer(context),
+        ),
+        ("What details would a reader need to understand this document?", _join_answer_lines(_salient_sentences(context, limit=3))),
+    ]
+    return [
+        item
+        for question, answer in candidates
+        if (item := _validated_golden_item(question, answer, context, source_doc))
+    ]
+
+
+def _realistic_user_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
+    if not nodes:
+        return []
+    if not _source_set_is_project_like(nodes):
+        return _resume_query_items(nodes) if _source_set_is_resume_like(nodes) else _document_query_items(nodes)
+
+    context = _combined_question_context(nodes)
+    source_doc = _source_doc(nodes[0]) if nodes else "unknown"
+    candidates = [
+        ("What stack and tools does this project use?", _project_stack_answer(context)),
+        ("How do I set up and run this project?", _project_setup_answer(context)),
+        ("What is the architecture of this project?", _project_architecture_answer(context)),
+        ("How should I troubleshoot common setup or runtime problems?", _project_troubleshooting_answer(context)),
+    ]
+    return [
+        item
+        for question, answer in candidates
+        if (item := _validated_golden_item(question, answer, context, source_doc))
+    ]
 
 
 NOISY_QUESTION_TERMS = {
@@ -347,21 +862,20 @@ def _template_golden_item_for_node(node: Any) -> dict[str, str] | None:
     group = _question_source_group(node)
     if group == "manifest":
         question = f"What dependencies and tools does {display_source} declare for this project?"
-        ground_truth = "Identify the project dependencies and tooling declared in the manifest context."
+        ground_truth = _project_stack_answer(context) or _join_answer_lines(_context_lines(context)[:6])
     elif group == "code":
         question = f"What feature or runtime flow is implemented in {display_source}?"
-        ground_truth = "Describe the feature or runtime flow implemented by the referenced source file."
+        ground_truth = _join_answer_lines(_salient_sentences(context, ("class", "def ", "function", "return", "implements", "exposes"), limit=3))
     elif group in {"readme", "docs"}:
         question = f"What setup, architecture, or usage guidance is documented in {display_source}?"
-        ground_truth = "Summarize the setup, architecture, or usage guidance from the referenced documentation."
+        ground_truth = (
+            _project_setup_answer(context)
+            or _project_architecture_answer(context)
+            or _join_answer_lines(_salient_sentences(context, limit=3))
+        )
     else:
         return None
-    return {
-        "question": question,
-        "ground_truth": ground_truth,
-        "reference_context": context[:3000],
-        "source_doc": source_doc,
-    }
+    return _validated_golden_item(question, ground_truth, context[:3000], source_doc)
 
 
 def _is_noisy_golden_question(item: dict[str, str]) -> bool:
@@ -377,7 +891,11 @@ def _is_noisy_golden_question(item: dict[str, str]) -> bool:
 
 
 def _is_high_quality_golden_item(item: dict[str, str]) -> bool:
-    return bool(item.get("question", "").strip()) and not _is_noisy_golden_question(item)
+    return (
+        bool(item.get("question", "").strip())
+        and not _is_noisy_golden_question(item)
+        and _is_supported_ground_truth(item.get("ground_truth", ""), item.get("reference_context", ""))
+    )
 
 
 def _normalized_question_key(item: dict[str, str]) -> str:
@@ -419,6 +937,7 @@ def generate_golden_dataset(
     source_slug = current_source.get("source_slug", "") if current_source else ""
     question_nodes = _select_question_source_nodes(nodes, chunk_limit)
     composite_nodes = _build_composite_question_nodes(question_nodes or nodes)
+    cloud_refinement_provider = _cloud_refinement_provider(providers)
 
     candidates = _realistic_user_query_items([*composite_nodes, *(question_nodes or nodes)])
     for node in [*composite_nodes, *question_nodes]:
@@ -427,6 +946,10 @@ def generate_golden_dataset(
             candidates.append(template_item)
         item = generate_golden_item(node, providers)
         candidates.append(item)
+    candidates = [
+        _maybe_refine_golden_item_with_cloud(item, cloud_refinement_provider)
+        for item in candidates
+    ]
     if source_slug:
         for item in candidates:
             item["source_slug"] = source_slug
@@ -621,6 +1144,44 @@ def maybe_run_real_ragas(
         raise
 
 
+def maybe_run_real_ragas_with_status(
+    rows: Sequence[dict[str, Any]],
+    cloud_client: cloud_ragas.FreeTierCloudClient | None = None,
+    enabled: bool | None = None,
+) -> tuple[dict[str, float] | None, str]:
+    if enabled is False or not _real_ragas_enabled():
+        return None, "Cloud RAGAS was not enabled for this evaluation run."
+
+    config = cloud_ragas.config_from_env() if cloud_client is None else None
+    client = cloud_client or cloud_ragas.client_from_config(config)
+    try:
+        budget = getattr(client, "budget", None)
+        sampled_rows = list(rows)[: _max_real_ragas_rows()]
+        scores = cloud_ragas.run_ragas(
+            sampled_rows,
+            cache_dir=config.cache_dir if config else getattr(client, "cache_dir", cloud_ragas.DEFAULT_CACHE_DIR),
+            max_calls=config.max_calls if config else getattr(budget, "max_calls", 120),
+            cloud_client=client,
+        )
+        if not scores:
+            return None, "Cloud RAGAS returned no scores, so offline metrics were retained."
+        return scores, ""
+    except (
+        cloud_ragas.CloudProviderUnavailable,
+        requests.exceptions.RequestException,
+    ) as exc:
+        if _strict_cloud_ragas_enabled():
+            raise
+        return None, f"{type(exc).__name__}: {exc}"
+    except RuntimeError as exc:
+        if _strict_cloud_ragas_enabled():
+            raise
+        message = str(exc)
+        if "MAX_CLOUD_CALLS" in message or "cloud providers unavailable" in message or "Gemini embedding models unavailable" in message:
+            return None, message
+        raise
+
+
 def _finite_latency_ms(value: Any) -> float | None:
     try:
         number = float(value)
@@ -685,6 +1246,8 @@ def run_evaluation(
         cloud_client = cloud_ragas.client_from_config(cloud_ragas.config_from_env())
     summaries: dict[str, dict[str, float]] = {}
     summary_backends: dict[str, str] = {}
+    cloud_statuses: dict[str, str] = {}
+    cloud_errors: dict[str, str] = {}
     latency_summaries: dict[str, dict[str, float]] = {}
     detail_rows: list[dict[str, Any]] = []
 
@@ -697,6 +1260,8 @@ def run_evaluation(
         rows_by_strategy[strategy] = rows
         summaries[strategy] = summary
         summary_backends[strategy] = "offline_heuristic"
+        cloud_statuses[strategy] = "not_requested"
+        cloud_errors[strategy] = ""
         latency_summaries[strategy] = _latency_summary(rows)
         detail_rows.extend(rows)
         logger.info("Strategy %s: %s (backend=%s)", strategy, summary, "offline_heuristic")
@@ -705,10 +1270,15 @@ def run_evaluation(
         for index, strategy in enumerate(STRATEGIES):
             if progress_callback:
                 progress_callback(index / max(len(STRATEGIES), 1), f"Cloud RAGAS: {strategy}...")
-            real_scores = maybe_run_real_ragas(rows_by_strategy.get(strategy, []), cloud_client=cloud_client, enabled=True)
+            real_scores, cloud_error = maybe_run_real_ragas_with_status(rows_by_strategy.get(strategy, []), cloud_client=cloud_client, enabled=True)
             if real_scores:
                 summaries[strategy] = real_scores
                 summary_backends[strategy] = "cloud_free_tier_ragas"
+                cloud_statuses[strategy] = "succeeded"
+                cloud_errors[strategy] = ""
+            else:
+                cloud_statuses[strategy] = "fallback_offline"
+                cloud_errors[strategy] = cloud_error or "Cloud RAGAS did not return scores for this strategy."
 
     for row in detail_rows:
         row["summary_backend"] = summary_backends.get(row["strategy"], "offline_heuristic")
@@ -720,6 +1290,8 @@ def run_evaluation(
     evaluated_source = current_source.get("source_slug", "") if current_source else ""
     summary_frame = pd.DataFrame.from_dict(summaries, orient="index")
     summary_frame["summary_backend"] = pd.Series(summary_backends)
+    summary_frame["cloud_status"] = pd.Series(cloud_statuses)
+    summary_frame["cloud_error"] = pd.Series(cloud_errors)
     summary_frame["evaluated_source"] = evaluated_source
     for metric in LATENCY_SUMMARY_METRICS:
         summary_frame[metric] = pd.Series(

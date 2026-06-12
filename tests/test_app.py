@@ -231,7 +231,7 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(frame.loc[0, "strategy"], "semantic_only")
         self.assertEqual(frame.loc[0, "faithfulness"], 0.1)
         self.assertEqual(frame.loc[0, "summary_backend"], "cloud_free_tier_ragas")
-        self.assertEqual(list(frame.columns), ["strategy", *app.METRICS, *app.LEXICAL_METRICS, "summary_backend", "evaluated_source", *app.LATENCY_SUMMARY_METRICS])
+        self.assertEqual(list(frame.columns), ["strategy", *app.METRICS, *app.LEXICAL_METRICS, "summary_backend", *app.CLOUD_STATUS_COLUMNS, "evaluated_source", *app.LATENCY_SUMMARY_METRICS])
 
     def test_load_eval_summary_preserves_latency_summary_columns(self):
         with TemporaryDirectory() as tmpdir:
@@ -271,6 +271,55 @@ class AppHelperTests(unittest.TestCase):
         titles = [axis.get_title() for axis in fig.axes]
         self.assertIn("Cloud RAGAS metrics", titles)
         self.assertIn("Offline lexical metrics", titles)
+
+    def test_grouped_bar_chart_hides_empty_cloud_strategy_slots(self):
+        summary = pd.DataFrame(
+            [
+                {
+                    "strategy": "semantic_only",
+                    "faithfulness": 1.0,
+                    "answer_relevancy": -0.03,
+                    "context_recall": 0.0,
+                    "context_precision": 0.33,
+                    "summary_backend": "cloud_free_tier_ragas",
+                },
+                {
+                    "strategy": "bm25_only",
+                    "faithfulness": pd.NA,
+                    "answer_relevancy": pd.NA,
+                    "context_recall": pd.NA,
+                    "context_precision": pd.NA,
+                    "lexical_faithfulness": 0.7,
+                    "lexical_answer_relevancy": 0.2,
+                    "lexical_context_recall": 0.4,
+                    "lexical_context_precision": 0.1,
+                    "summary_backend": "offline_heuristic",
+                },
+            ]
+        )
+
+        fig = app.build_grouped_bar_chart(summary)
+
+        cloud_labels = [label.get_text() for label in fig.axes[0].get_xticklabels()]
+        self.assertEqual(cloud_labels, ["semantic_only"])
+        self.assertLess(fig.axes[0].get_ylim()[0], 0)
+
+    def test_cloud_ragas_status_message_summarizes_fallbacks(self):
+        summary = pd.DataFrame(
+            [
+                {"strategy": "semantic_only", "summary_backend": "cloud_free_tier_ragas", "cloud_status": "succeeded", "cloud_error": ""},
+                {"strategy": "bm25_only", "summary_backend": "offline_heuristic", "cloud_status": "fallback_offline", "cloud_error": "429"},
+                {"strategy": "hybrid_no_rerank", "summary_backend": "offline_heuristic", "cloud_status": "fallback_offline", "cloud_error": "timeout"},
+                {"strategy": "hybrid_rerank", "summary_backend": "offline_heuristic", "cloud_status": "fallback_offline", "cloud_error": "budget"},
+            ]
+        )
+
+        message = app.cloud_ragas_status_message(summary)
+        rows = app.cloud_ragas_status_rows(summary)
+
+        self.assertEqual(message, "Cloud RAGAS succeeded for 1/4 strategies; 3/4 fell back to offline.")
+        self.assertEqual(rows["strategy"].tolist(), ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"])
+        self.assertIn("cloud_error", rows.columns)
 
     def test_load_per_question_handles_empty_csv_file(self):
         with TemporaryDirectory() as tmpdir:

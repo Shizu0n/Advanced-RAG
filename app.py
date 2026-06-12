@@ -41,6 +41,7 @@ LEXICAL_METRICS = ["lexical_faithfulness", "lexical_answer_relevancy", "lexical_
 LATENCY_METRICS = ["retrieval_ms", "synthesis_ms", "total_ms"]
 LATENCY_SUMMARY_METRICS = ["avg_retrieval_ms", "avg_synthesis_ms", "avg_total_ms"]
 LEXICAL_TO_RAGAS_METRIC = dict(zip(METRICS, LEXICAL_METRICS, strict=True))
+CLOUD_STATUS_COLUMNS = ["cloud_status", "cloud_error"]
 STRATEGIES = ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"]
 CHAT_MESSAGES_KEY = "chat_messages"
 PREPARED_SOURCE_KEY = "prepared_source"
@@ -109,12 +110,33 @@ def _coerce_metric_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_eval_summary(path: Path = RAGAS_RESULTS_PATH) -> pd.DataFrame:
-    columns = ["strategy", *METRICS, *LEXICAL_METRICS, "summary_backend", "evaluated_source", *LATENCY_SUMMARY_METRICS]
+    columns = ["strategy", *METRICS, *LEXICAL_METRICS, "summary_backend", *CLOUD_STATUS_COLUMNS, "evaluated_source", *LATENCY_SUMMARY_METRICS]
     frame = _read_csv(path, columns)
     if "strategy" not in frame.columns:
         frame.insert(0, "strategy", None)
     if "summary_backend" not in frame.columns:
         frame["summary_backend"] = "unknown"
+    has_cloud_backend = frame["summary_backend"].astype(str).eq("cloud_free_tier_ragas").any()
+    if "cloud_status" not in frame.columns:
+        frame["cloud_status"] = frame["summary_backend"].astype(str).map(
+            lambda backend: "succeeded"
+            if backend == "cloud_free_tier_ragas"
+            else ("fallback_offline" if has_cloud_backend else "not_requested")
+        )
+    else:
+        inferred_status = frame["summary_backend"].astype(str).map(
+            lambda backend: "succeeded"
+            if backend == "cloud_free_tier_ragas"
+            else ("fallback_offline" if has_cloud_backend else "not_requested")
+        )
+        frame["cloud_status"] = frame["cloud_status"].fillna(inferred_status)
+    if "cloud_error" not in frame.columns:
+        frame["cloud_error"] = ""
+    frame["cloud_error"] = frame["cloud_error"].fillna("").astype(str)
+    frame.loc[
+        frame["cloud_status"].astype(str).eq("fallback_offline") & frame["cloud_error"].eq(""),
+        "cloud_error",
+    ] = "Cloud status was not recorded for this result; offline metrics were retained."
     if "evaluated_source" not in frame.columns:
         frame["evaluated_source"] = ""
     for metric in LATENCY_SUMMARY_METRICS:
@@ -248,6 +270,33 @@ def eval_backend_counts(summary: pd.DataFrame, per_question: pd.DataFrame) -> di
     if "evaluation_backend" in per_question.columns:
         question_counts = {str(k): v for k, v in per_question["evaluation_backend"].dropna().astype(str).value_counts().items()}
     return {"summary_backends": summary_counts, "question_backends": question_counts}
+
+
+def cloud_ragas_status_message(summary: pd.DataFrame) -> str | None:
+    if summary.empty or "cloud_status" not in summary.columns:
+        return None
+    statuses = summary["cloud_status"].fillna("").astype(str)
+    attempted = statuses.isin({"succeeded", "fallback_offline"})
+    if not attempted.any():
+        return None
+    total = len(summary)
+    succeeded = int(statuses.eq("succeeded").sum())
+    fallback = int(statuses.eq("fallback_offline").sum())
+    return f"Cloud RAGAS succeeded for {succeeded}/{total} strategies; {fallback}/{total} fell back to offline."
+
+
+def cloud_ragas_status_rows(summary: pd.DataFrame) -> pd.DataFrame:
+    columns = ["strategy", "summary_backend", "cloud_status", "cloud_error"]
+    if summary.empty:
+        return _empty_frame(columns)
+    frame = summary.copy()
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = ""
+    statuses = frame["cloud_status"].fillna("").astype(str)
+    frame = frame[statuses.isin({"succeeded", "fallback_offline"})].copy()
+    frame["cloud_error"] = frame["cloud_error"].fillna("")
+    return frame[columns]
 
 
 def _score_rows(value: Any) -> list[dict[str, Any]]:
@@ -722,10 +771,13 @@ def build_grouped_bar_chart(summary: pd.DataFrame):
         ax.axis("off")
         return fig
 
-    ragas_metrics = [metric for metric in METRICS if metric in summary.columns and summary[metric].notna().any()]
-    lexical_metrics = [metric for metric in LEXICAL_METRICS if metric in summary.columns and summary[metric].notna().any()]
-    metric_groups = [("Cloud RAGAS metrics", ragas_metrics), ("Offline lexical metrics", lexical_metrics)]
-    metric_groups = [(title, metrics) for title, metrics in metric_groups if metrics]
+    ragas_metrics = [metric for metric in METRICS if metric in summary.columns and pd.to_numeric(summary[metric], errors="coerce").notna().any()]
+    lexical_metrics = [metric for metric in LEXICAL_METRICS if metric in summary.columns and pd.to_numeric(summary[metric], errors="coerce").notna().any()]
+    metric_groups = [
+        ("Cloud RAGAS metrics", ragas_metrics, _rows_with_any_metric(summary, ragas_metrics)),
+        ("Offline lexical metrics", lexical_metrics, _rows_with_any_metric(summary, lexical_metrics)),
+    ]
+    metric_groups = [(title, metrics, rows) for title, metrics, rows in metric_groups if metrics and not rows.empty]
     if not metric_groups:
         fig, ax = plt.subplots(figsize=(9, 4.5))
         ax.text(0.5, 0.5, "No finite evaluation metrics", ha="center", va="center")
@@ -735,16 +787,40 @@ def build_grouped_bar_chart(summary: pd.DataFrame):
     fig, axes = plt.subplots(len(metric_groups), 1, figsize=(9, 4.5 * len(metric_groups)))
     if len(metric_groups) == 1:
         axes = [axes]
-    indexed = summary.set_index("strategy")
-    for ax, (title, metrics) in zip(axes, metric_groups):
+    for ax, (title, metrics, rows) in zip(axes, metric_groups):
+        indexed = rows.set_index("strategy")
         indexed[metrics].plot(kind="bar", ax=ax)
         ax.set_title(title)
         ax.set_xlabel("Strategy")
         ax.set_ylabel("Score")
-        ax.set_ylim(0, 1)
+        lower, upper = _metric_axis_bounds(indexed[metrics])
+        ax.set_ylim(lower, upper)
+        ax.axhline(0, color="#555555", linewidth=0.8)
         ax.legend(loc="best")
     fig.tight_layout()
     return fig
+
+
+def _rows_with_any_metric(summary: pd.DataFrame, metrics: list[str]) -> pd.DataFrame:
+    if not metrics:
+        return summary.iloc[0:0].copy()
+    metric_values = summary[metrics].apply(pd.to_numeric, errors="coerce")
+    return summary[metric_values.notna().any(axis=1)].copy()
+
+
+def _metric_axis_bounds(values: pd.DataFrame) -> tuple[float, float]:
+    numeric = values.apply(pd.to_numeric, errors="coerce").stack().dropna()
+    if numeric.empty:
+        return 0.0, 1.0
+    minimum = float(numeric.min())
+    maximum = float(numeric.max())
+    lower = min(0.0, minimum)
+    upper = max(1.0, maximum)
+    if lower < 0:
+        lower -= max(0.05, abs(lower) * 0.1)
+    if upper > 1:
+        upper += max(0.05, abs(upper) * 0.1)
+    return lower, upper
 
 
 def _format_metric(value: float | None) -> str:
@@ -1831,6 +1907,13 @@ def _render_eval_tab(st) -> None:
 
     st.write("Evaluation backend")
     st.json(backends)
+
+    cloud_status_message = cloud_ragas_status_message(summary)
+    if cloud_status_message:
+        st.info(cloud_status_message)
+        status_rows = cloud_ragas_status_rows(summary)
+        if not status_rows.empty:
+            st.dataframe(status_rows, use_container_width=True)
 
     st.pyplot(build_grouped_bar_chart(summary))
 

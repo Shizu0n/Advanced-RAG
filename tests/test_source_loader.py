@@ -43,6 +43,36 @@ class SourceLoaderTests(unittest.TestCase):
             )
             self.assertEqual((raw_dir / target_root / "src" / "app.py").read_text(encoding="utf-8"), "print('ok')\n")
 
+    def test_prepare_uploaded_files_copies_supported_browser_uploads(self):
+        class Uploaded:
+            name = "Resume Fixture.PDF"
+
+            def getbuffer(self):
+                return b"%PDF fixture"
+
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+
+            files = source_loader.prepare_uploaded_files([Uploaded()], raw_dir=raw_dir, clear_existing=True)
+
+            self.assertEqual(len(files), 1)
+            self.assertEqual(files[0].name, "Resume-Fixture.PDF")
+            self.assertEqual(files[0].read_bytes(), b"%PDF fixture")
+            prepared = json.loads((Path(tmpdir) / "prepared_source.json").read_text(encoding="utf-8"))
+            self.assertEqual(prepared["source_type"], "upload")
+            self.assertEqual(prepared["source_slug"], "uploaded-files")
+
+    def test_prepare_uploaded_files_rejects_unsupported_uploads(self):
+        class Uploaded:
+            name = "payload.exe"
+
+            def getbuffer(self):
+                return b"binary"
+
+        with TemporaryDirectory() as tmpdir:
+            with self.assertRaisesRegex(ValueError, "Unsupported uploaded file"):
+                source_loader.prepare_uploaded_files([Uploaded()], raw_dir=Path(tmpdir) / "raw")
+
     def test_prepare_sources_ignores_generated_and_private_directories(self):
         with TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)

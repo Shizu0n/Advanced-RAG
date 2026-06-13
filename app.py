@@ -49,6 +49,8 @@ PREPARED_SOURCE_KEY = "prepared_source"
 ACTIVE_CHAT_SOURCE_KEY = "active_chat_source_slug"
 UI_GATE_OVERRIDES_KEY = "ui_gate_overrides"
 WORKSPACE_PAGE_KEY = "workspace_page"
+SOURCE_TYPE_KEY = "source_type"
+DEFAULT_SOURCE_TYPE = "Upload files"
 MAX_PERSISTED_CHAT_MESSAGES = 100
 UI_TOGGLE_GATES = {
     "ALLOW_HF_FETCH": {"label": "Allow Hugging Face fetch", "default": False},
@@ -1111,14 +1113,9 @@ def clear_eval_artifacts() -> None:
 
 
 def _clear_chroma_artifacts() -> None:
-    try:
-        _remove_path(CHROMA_DIR)
-        return
-    except PermissionError:
-        pass
-
     import chromadb
 
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
     client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     try:
         client.delete_collection("advanced_rag")
@@ -1143,11 +1140,13 @@ def clear_source_cache(clear_raw: bool = True) -> None:
             _remove_path(path)
 
 
-def reset_session_source_state(st) -> None:
+def reset_session_source_state(st, reset_source_type: bool = False) -> None:
     st.session_state.pop(PREPARED_SOURCE_KEY, None)
     st.session_state.pop("prepared_files", None)
     st.session_state.pop(CHAT_MESSAGES_KEY, None)
     st.session_state.pop(ACTIVE_CHAT_SOURCE_KEY, None)
+    if reset_source_type:
+        st.session_state[SOURCE_TYPE_KEY] = DEFAULT_SOURCE_TYPE
 
 
 def load_current_source(path: Path = CURRENT_SOURCE_PATH) -> dict[str, Any] | None:
@@ -1476,6 +1475,18 @@ def prepare_sources_for_app(
     )
 
 
+def prepare_uploaded_files_for_app(uploaded_files: list[Any], clear_existing: bool = False) -> list[Path]:
+    from source_loader import prepare_uploaded_files
+
+    if not uploaded_files:
+        return []
+    return prepare_uploaded_files(
+        uploaded_files,
+        raw_dir=RAW_DIR,
+        clear_existing=clear_existing,
+    )
+
+
 def _prepared_source_state(st) -> dict[str, Any] | None:
     value = st.session_state.get(PREPARED_SOURCE_KEY)
     return value if isinstance(value, dict) else None
@@ -1753,7 +1764,13 @@ def _clear_prepared_source(st) -> None:
 
 
 def _prepared_source_type(source_type: str) -> str:
-    return "huggingface" if source_type == "HuggingFace model/dataset" else "github" if source_type == "GitHub repo" else "local"
+    if source_type == "HuggingFace model/dataset":
+        return "huggingface"
+    if source_type == "GitHub repo":
+        return "github"
+    if source_type == "Upload files":
+        return "upload"
+    return "local"
 
 
 def _render_prepared_files(st, prepared: list[Path]) -> None:
@@ -2183,17 +2200,31 @@ def _render_sources_tab(st) -> None:
 
     if st.button("Clear active source cache"):
         clear_source_cache()
-        reset_session_source_state(st)
+        reset_session_source_state(st, reset_source_type=True)
         st.success("Active source cache cleared.")
         st.rerun()
 
     source_type = st.radio(
         "Source type",
-        ["Local directory", "GitHub repo", "HuggingFace model/dataset"],
+        [DEFAULT_SOURCE_TYPE, "Local directory", "GitHub repo", "HuggingFace model/dataset"],
+        key=SOURCE_TYPE_KEY,
     )
 
     # Adaptive input field
-    if source_type == "Local directory":
+    uploaded_files: list[Any] = []
+    source_text = ""
+    if source_type == DEFAULT_SOURCE_TYPE:
+        from source_loader import SOURCE_EXTENSIONS
+
+        allowed_types = sorted(ext.lstrip(".") for ext in SOURCE_EXTENSIONS)
+        uploaded_files = st.file_uploader(
+            "Upload source files",
+            type=allowed_types,
+            accept_multiple_files=True,
+            help="Use this for public deployments. Browser uploads are copied into the app session before indexing.",
+        )
+    elif source_type == "Local directory":
+        st.caption("Local paths only work when Streamlit runs on the same machine as the files. Use uploads for public deployments.")
         source_text = st.text_input("Local path", placeholder="C:\\path\\to\\project")
     elif source_type == "GitHub repo":
         source_text = st.text_input("GitHub URL", placeholder="https://github.com/user/repo")
@@ -2205,12 +2236,19 @@ def _render_sources_tab(st) -> None:
 
     # Prepare sources
     if st.button("Prepare sources"):
-        if not source_text or not source_text.strip():
+        if source_type == DEFAULT_SOURCE_TYPE and not uploaded_files:
+            st.warning("No uploaded files were provided.")
+        elif source_type != DEFAULT_SOURCE_TYPE and (not source_text or not source_text.strip()):
             st.warning("No sources were provided.")
         else:
-            sources = [source_text.strip()]
+            sources = [source_text.strip()] if source_text else []
             try:
-                if source_type == "HuggingFace model/dataset":
+                if source_type == DEFAULT_SOURCE_TYPE:
+                    prepared = prepare_uploaded_files_for_app(
+                        uploaded_files,
+                        clear_existing=True,
+                    )
+                elif source_type == "HuggingFace model/dataset":
                     prepared = prepare_sources_for_app(
                         sources,
                         allow_github_fetch=False,
@@ -2237,7 +2275,8 @@ def _render_sources_tab(st) -> None:
                 clear_source_cache(clear_raw=False)
                 reset_session_source_state(st)
                 st.success(f"Prepared {len(prepared)} files under data/raw.")
-                _store_prepared_source(st, prepared, sources[0], _prepared_source_type(source_type))
+                source_input = sources[0] if sources else f"uploaded:{', '.join(str(getattr(file, 'name', 'file')) for file in uploaded_files)}"
+                _store_prepared_source(st, prepared, source_input, _prepared_source_type(source_type))
                 st.dataframe(
                     pd.DataFrame({"file": [path.as_posix() for path in prepared]}),
                     use_container_width=True,
@@ -2430,6 +2469,20 @@ def _render_query_tab(st) -> None:
         _render_chat_message(st, assistant_message, stream_content=True)
 
 
+def _cloud_ragas_provider_names() -> list[str]:
+    import cloud_ragas
+
+    return [provider.name for provider in cloud_ragas.providers_from_env()]
+
+
+def _show_cloud_ragas_provider_missing(st) -> None:
+    st.info(
+        "Cloud RAGAS needs at least one configured provider key in the hosted environment: "
+        "GEMINI_API_KEY, GROQ_API_KEY, or GITHUB_MODELS_TOKEN plus GITHUB_MODELS_MODEL. "
+        "Fast offline evaluation remains available without provider keys."
+    )
+
+
 def _render_eval_tab(st) -> None:
     current_source = _source_ui_state(st)
     indexed_source = _indexed_source_for_eval(st)
@@ -2493,6 +2546,8 @@ def _render_eval_tab(st) -> None:
     if st.button("Run Cloud RAGAS"):
         if not _eval_should_allow_run(st):
             _render_eval_run_blocked(st)
+        elif not _cloud_ragas_provider_names():
+            _show_cloud_ragas_provider_missing(st)
         else:
             cloud_ragas_timeout_seconds = float(os.getenv("CLOUD_RAGAS_TIMEOUT_SECONDS", "300"))
             spinner_msg = (

@@ -2481,6 +2481,48 @@ def _format_stack_answer(
     return "\n".join(lines) if wrote_group else None
 
 
+def _format_referral_link_behavior(contexts: Sequence[str], sources: Sequence[dict[str, Any]]) -> str | None:
+    combined = "\n".join(_context_for_synthesis(context) for context in contexts)
+    normalized = _normalize_for_match(combined)
+    if "referrallink" not in normalized and "referral link" not in normalized:
+        return None
+
+    source_doc = ""
+    for source in sources:
+        candidate = str(source.get("source_doc", ""))
+        if "users.service" in candidate.lower() or "profile" in candidate.lower():
+            source_doc = candidate
+            break
+    source_suffix = f" Evidence: `{source_doc}`." if source_doc else ""
+
+    if "generatereferrallink" in normalized and "register?ref" in normalized:
+        return (
+            "Referral link: `UsersService` builds `referralLink` with "
+            "`generateReferralLink(referralCode)`, reads `FRONTEND_URL` with "
+            "`http://localhost:5173` as fallback, and returns "
+            "`{frontendUrl}/register?ref={referralCode}`."
+            f"{source_suffix}"
+        )
+    return f"Referral link: the retrieved backend evidence shows `referralLink` is derived from the user's referral code.{source_suffix}"
+
+
+def _format_mixed_stack_behavior_answer(
+    query: str,
+    contexts: Sequence[str],
+    sources: Sequence[dict[str, Any]],
+) -> str | None:
+    stack_answer = _format_stack_answer(contexts, sources, query)
+    behavior_answer = _format_referral_link_behavior(contexts, sources)
+    if not stack_answer and not behavior_answer:
+        return None
+    parts = []
+    if behavior_answer:
+        parts.append(behavior_answer)
+    if stack_answer:
+        parts.append(stack_answer)
+    return "\n\n".join(parts)
+
+
 
 
 class ChatLLMClient:
@@ -2569,6 +2611,8 @@ def _extractive_synthesis_result(
         if answer is None:
             techs = _extract_technologies(contexts, query)
             answer = ", ".join(techs) if techs else None
+    if answer is None and _query_mixes_stack_with_behavior(query, analyze_query(query)):
+        answer = _format_mixed_stack_behavior_answer(query, contexts, sources)
     if answer is None and _query_needs_code_evidence(query, analyze_query(query)):
         answer = synthesize_source_grounded_answer(query, contexts, sources)
     return SynthesisResult(

@@ -263,7 +263,7 @@ class CurrentSourceTests(unittest.TestCase):
             finally:
                 os.chdir(old_cwd)
 
-    def test_build_index_failure_clears_stale_indexed_source_artifacts(self):
+    def test_build_index_failure_clears_stale_indexed_source_metadata_and_collection(self):
         with TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw" / "new-source"
             raw_dir.mkdir(parents=True)
@@ -277,13 +277,15 @@ class CurrentSourceTests(unittest.TestCase):
                 patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
                 patch.object(ingestion, "CHROMA_DIR", chroma_dir),
                 patch.object(ingestion, "HuggingFaceEmbedding", side_effect=RuntimeError("embedding failed")),
-                patch.object(ingestion, "chromadb"),
+                patch.object(ingestion, "chromadb") as mock_chromadb,
             ):
                 with self.assertRaisesRegex(RuntimeError, "embedding failed"):
                     ingestion.build_index(raw_dir=raw_dir)
 
             self.assertFalse(source_path.exists())
-            self.assertFalse(chroma_dir.exists())
+            self.assertTrue(chroma_dir.exists())
+            self.assertEqual(mock_chromadb.PersistentClient.return_value.delete_collection.call_count, 2)
+            mock_chromadb.PersistentClient.return_value.delete_collection.assert_any_call(ingestion.CHROMA_COLLECTION_NAME)
 
     def test_build_index_writes_current_source_json(self):
         with TemporaryDirectory() as tmpdir:

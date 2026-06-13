@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import re
 import os
-import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -346,7 +345,13 @@ def _raw_dir_for_metadata(raw_dir: Path, metadata: dict | None, files: list[Path
 
 def clear_indexed_source_artifacts() -> None:
     if CHROMA_DIR.exists():
-        shutil.rmtree(CHROMA_DIR)
+        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        try:
+            client.delete_collection(CHROMA_COLLECTION_NAME)
+        except Exception as exc:
+            if not _is_missing_chroma_collection_error(exc):
+                raise
     if CURRENT_SOURCE_PATH.exists():
         CURRENT_SOURCE_PATH.unlink()
 

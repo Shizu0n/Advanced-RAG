@@ -844,6 +844,46 @@ npm install.
         self.assertIn("incrementReferrerScore", result["answer"])
         self.assertNotIn("import { ReferralCodeUtil", result["answer"])
 
+    def test_mixed_stack_behavior_query_returns_synthesized_answer_not_raw_evidence_header(self):
+        results = [
+            NodeWithScore(
+                node=TextNode(
+                    id_="readme",
+                    text="Backend modular em NestJS com TypeORM/SQLite e frontend em React + TypeScript.",
+                    metadata={"file_name": "README.md"},
+                ),
+                score=1.0,
+            ),
+            NodeWithScore(
+                node=TextNode(
+                    id_="users-service",
+                    text=(
+                        "const referralLink = this.generateReferralLink(user.referralCode);\n"
+                        "private generateReferralLink(referralCode: string): string {\n"
+                        "const frontendUrl = this.configService.get<string>('FRONTEND_URL') || 'http://localhost:5173';\n"
+                        "return `${frontendUrl}/register?ref=${referralCode}`;\n"
+                        "}\n"
+                    ),
+                    metadata={"file_name": "backend/src/users/users.service.ts"},
+                ),
+                score=1.0,
+            ),
+        ]
+        retriever = SimpleNamespace(ablation_retrieve=lambda query, strategy: (results, {"strategy": strategy}))
+        pipeline = LocalRAGPipeline(nodes=[], retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "what is the backend stack, frontend stack, and how is referralLink generated?",
+                strategy="bm25_only",
+            )
+
+        self.assertNotIn("Evidence from retrieved source files", result["answer"])
+        self.assertIn("Backend", result["answer"])
+        self.assertIn("Frontend", result["answer"])
+        self.assertIn("generateReferralLink", result["answer"])
+        self.assertIn("/register?ref=", result["answer"])
+
     def test_database_question_prioritizes_database_module_over_maintenance_script(self):
         retriever = SimpleNamespace(
             ablation_retrieve=lambda query, strategy: (

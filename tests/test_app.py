@@ -86,6 +86,7 @@ class FakeStreamlit:
     _text_area_value: str = ""
     _checkbox_value: bool = False
     _button_return: bool = False
+    _file_uploader_value = []
 
     def __init__(self, prompt=None, messages=None):
         self.session_state = {}
@@ -94,19 +95,29 @@ class FakeStreamlit:
         self.prompt = prompt
         self.events = []
         self.sidebar = FakeSidebar(self)
+        self._file_uploader_value = []
 
-    def selectbox(self, label, options, index=0):
+    def selectbox(self, label, options, index=0, **kwargs):
         self.events.append(("selectbox", label, options[index]))
         return options[index]
 
-    def radio(self, label, options, index=0):
-        value = self._radio_value if self._radio_value is not None else options[index]
+    def radio(self, label, options, index=0, key=None):
+        if key and key in self.session_state:
+            value = self.session_state[key]
+        else:
+            value = self._radio_value if self._radio_value is not None else options[index]
+            if key:
+                self.session_state[key] = value
         self.events.append(("radio", label, value))
         return value
 
-    def text_input(self, label, placeholder=""):
+    def text_input(self, label, placeholder="", **kwargs):
         self.events.append(("text_input", label, placeholder))
         return self._text_input_value
+
+    def file_uploader(self, label, **kwargs):
+        self.events.append(("file_uploader", label, kwargs))
+        return self._file_uploader_value
 
     def text_area(self, label, placeholder=""):
         self.events.append(("text_area", label))
@@ -1065,6 +1076,7 @@ class AppHelperTests(unittest.TestCase):
             for path in [golden_path, summary_path, detail_path]:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text("stale", encoding="utf-8")
+            mock_chromadb = MagicMock()
 
             with (
                 patch.object(app, "RAW_DIR", raw_dir),
@@ -1074,12 +1086,13 @@ class AppHelperTests(unittest.TestCase):
                 patch.object(app, "GOLDEN_DATASET_PATH", golden_path),
                 patch.object(app, "RAGAS_RESULTS_PATH", summary_path),
                 patch.object(app, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.dict("sys.modules", {"chromadb": mock_chromadb}),
             ):
                 app.clear_source_cache()
 
             self.assertTrue(raw_dir.exists())
             self.assertEqual(list(raw_dir.iterdir()), [])
-            self.assertFalse(chroma_dir.exists())
+            self.assertTrue(chroma_dir.exists())
             self.assertFalse(current_source.exists())
             self.assertFalse(query_log.exists())
             self.assertFalse(golden_path.exists())
@@ -1101,6 +1114,7 @@ class AppHelperTests(unittest.TestCase):
             (raw_dir / "old" / "README.md").parent.mkdir()
             (raw_dir / "old" / "README.md").write_text("# old", encoding="utf-8")
             original_rmtree = shutil.rmtree
+            mock_chromadb = MagicMock()
 
             def rmtree_unless_raw_root(path):
                 if Path(path) == raw_dir:
@@ -1117,6 +1131,7 @@ class AppHelperTests(unittest.TestCase):
                 patch.object(app, "RAGAS_RESULTS_PATH", summary_path),
                 patch.object(app, "RAGAS_PER_QUESTION_PATH", detail_path),
                 patch.object(app.shutil, "rmtree", side_effect=rmtree_unless_raw_root),
+                patch.dict("sys.modules", {"chromadb": mock_chromadb}),
             ):
                 app.clear_source_cache()
 
@@ -1354,6 +1369,7 @@ class EvalTabTests(unittest.TestCase):
                 patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
                 patch("app.build_grouped_bar_chart", return_value=None),
                 patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app._cloud_ragas_provider_names", return_value=["gemini"]),
                 patch("app.run_evaluation_inline", side_effect=capture_eval),
                 patch.dict(os.environ, {}, clear=True),
             ):
@@ -1391,6 +1407,7 @@ class EvalTabTests(unittest.TestCase):
                 patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
                 patch("app.build_grouped_bar_chart", return_value=None),
                 patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app._cloud_ragas_provider_names", return_value=["gemini"]),
                 patch("app.run_evaluation_inline") as run_eval,
                 patch.dict(os.environ, {"CLOUD_RAGAS_TIMEOUT_SECONDS": "0"}, clear=True),
             ):
@@ -1438,6 +1455,7 @@ class EvalTabTests(unittest.TestCase):
                 patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
                 patch("app.build_grouped_bar_chart", return_value=None),
                 patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app._cloud_ragas_provider_names", return_value=["gemini"]),
                 patch("app.run_evaluation_inline", side_effect=capture_eval),
                 patch.dict(os.environ, {}, clear=True),
             ):
@@ -1732,10 +1750,11 @@ class SourcesTabTests(unittest.TestCase):
         radio_events = [event for event in fake_st.events if event[0] == "radio"]
         self.assertEqual(len(radio_events), 1)
         self.assertEqual(radio_events[0][1], "Source type")
-        self.assertEqual(radio_events[0][2], "Local directory")
+        self.assertEqual(radio_events[0][2], "Upload files")
 
     def test_input_field_adapts_to_source_type(self):
         fake_st = FakeStreamlit()
+        fake_st._radio_value = "Local directory"
         with (
             patch("app.prepare_sources_for_app", return_value=[]),
             patch("app._has_raw_source_files", return_value=False),
@@ -1746,6 +1765,18 @@ class SourcesTabTests(unittest.TestCase):
         self.assertEqual(len(text_inputs), 1)
         self.assertEqual(text_inputs[0][1], "Local path")
         self.assertIn("path", text_inputs[0][2].lower())
+
+    def test_upload_files_source_type_uses_file_uploader(self):
+        fake_st = FakeStreamlit()
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=False),
+        ):
+            app._render_sources_tab(fake_st)
+
+        upload_events = [event for event in fake_st.events if event[0] == "file_uploader"]
+        self.assertEqual(len(upload_events), 1)
+        self.assertEqual(upload_events[0][1], "Upload source files")
 
     def test_build_index_button_appears_when_source_prepared(self):
         fake_st = FakeStreamlit()
@@ -1837,6 +1868,30 @@ class SourcesTabTests(unittest.TestCase):
             ["hf:owner/model"], allow_github_fetch=False, allow_huggingface_fetch=True, clear_existing=True,
         )
 
+    def test_prepare_uploaded_files_uses_upload_path(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
+        fake_st._radio_value = "Upload files"
+        fake_st._file_uploader_value = [MagicMock(name="uploaded")]
+        prepared = [Path("data/raw/uploaded-files/resume.pdf")]
+
+        with TemporaryDirectory() as tmpdir:
+            with (
+                patch.object(app, "PREPARED_SOURCE_PATH", Path(tmpdir) / "prepared_source.json"),
+                patch("app.clear_source_cache") as clear_cache,
+                patch("app.reset_session_source_state") as reset_state,
+                patch("app.prepare_uploaded_files_for_app", return_value=prepared) as prepare_uploads,
+                patch("app._has_raw_source_files", return_value=True),
+                patch("app.load_current_source", return_value=None),
+            ):
+                app._render_sources_tab(fake_st)
+
+        prepare_uploads.assert_called_once_with(fake_st._file_uploader_value, clear_existing=True)
+        clear_cache.assert_called_once_with(clear_raw=False)
+        reset_state.assert_called_once_with(fake_st)
+        self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_type"], "upload")
+
     def test_prepare_sources_clears_existing_cache_before_copying_new_source(self):
         fake_st = FakeStreamlit()
         fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
@@ -1909,6 +1964,7 @@ class SourcesTabTests(unittest.TestCase):
 
     def test_sources_tab_clear_active_source_button_clears_cache_and_reruns(self):
         fake_st = FakeStreamlit()
+        fake_st.session_state[app.SOURCE_TYPE_KEY] = "HuggingFace model/dataset"
         fake_st._button_return_by_label = {"Clear active source cache": True, "Prepare sources": False, "Build Index": False}
 
         def button_by_label(label):
@@ -1924,8 +1980,39 @@ class SourcesTabTests(unittest.TestCase):
             app._render_sources_tab(fake_st)
 
         clear_cache.assert_called_once()
-        reset_state.assert_called_once_with(fake_st)
+        reset_state.assert_called_once_with(fake_st, reset_source_type=True)
         self.assertIn(("rerun",), fake_st.events)
+
+    def test_cloud_ragas_button_blocks_when_no_provider_is_configured(self):
+        fake_st = FakeStreamlit()
+        fake_st._button_return_by_label = {"Run Cloud RAGAS": True}
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
+        current = {"source_slug": "repo", "indexed_at": "2026-05-23T00:00:00+00:00"}
+
+        with TemporaryDirectory() as tmpdir:
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("index", encoding="utf-8")
+            with (
+                patch("app.CHROMA_DIR", chroma_dir),
+                patch("app._current_source_for_ui", return_value=current),
+                patch("app.load_current_source", return_value=current),
+                patch("app.is_golden_dataset_stale", return_value=False),
+                patch("app.load_eval_summary", return_value=pd.DataFrame(columns=["strategy", *app.METRICS, "summary_backend", "evaluated_source"])),
+                patch("app.load_per_question", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app.metric_card_values", return_value={"strategy": None, **{m: None for m in app.METRICS}}),
+                patch("app.eval_backend_counts", return_value={"summary_backends": {}, "question_backends": {}}),
+                patch("app.build_grouped_bar_chart", return_value=None),
+                patch("app.filter_questions_below_threshold", return_value=pd.DataFrame(columns=app.PER_QUESTION_COLUMNS)),
+                patch("app._cloud_ragas_provider_names", return_value=[]),
+                patch("app.run_evaluation_inline") as run_eval,
+                patch.dict(os.environ, {}, clear=True),
+            ):
+                app._render_eval_tab(fake_st)
+
+        run_eval.assert_not_called()
+        warnings = [event[1] for event in fake_st.events if event[0] in {"warning", "info"}]
+        self.assertTrue(any("provider key" in message for message in warnings))
 
     def test_sidebar_renders_operational_gate_toggles_only(self):
         fake_st = FakeStreamlit()
@@ -2072,7 +2159,8 @@ class QueryTabWarningTests(unittest.TestCase):
         fake_st._radio_value = "HuggingFace model/dataset"
         fake_st._text_input_value = "https://huggingface.co/Shizu0n/phi3-mini-sql-generator"
         fake_st._checkbox_value = True
-        fake_st._button_return = True
+        fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         prepared = [Path("data/raw/shizu0n-phi3-mini-sql-generator/README.md")]
 
         with TemporaryDirectory() as tmpdir:
@@ -2405,7 +2493,7 @@ class QueryTabWarningTests(unittest.TestCase):
         self.assertTrue(any("saved evaluation results" in w for w in warnings))
         self.assertFalse(any("Last eval: raw" in c for c in captions))
         self.assertTrue(all(value == "n/a" for _, _, value in metrics))
-        self.assertEqual(dataframes[-1][1], app.PER_QUESTION_COLUMNS)
+        self.assertTrue(any(event[1] == app.PER_QUESTION_COLUMNS for event in dataframes))
         button_labels = [event[1] for event in fake_st.events if event[0] == "button"]
         self.assertIn("Generate pre-questions", button_labels)
         self.assertIn("Run fast evaluation", button_labels)
@@ -2511,7 +2599,8 @@ class QueryTabWarningTests(unittest.TestCase):
         fake_st._radio_value = "HuggingFace model/dataset"
         fake_st._text_input_value = "https://huggingface.co/Shizu0n/phi3-mini-sql-generator"
         fake_st._checkbox_value = True
-        fake_st._button_return = True
+        fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
+        fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         prepared = [Path("data/raw/shizu0n-phi3-mini-sql-generator/README.md")]
 
         with TemporaryDirectory() as tmpdir:

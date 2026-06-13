@@ -10,15 +10,17 @@ The project is offline-first by default. External fetches, model downloads, and 
 
 ## Supported Sources
 
-The product currently supports three source types:
+The product currently supports four source types:
 
+- **Uploaded files** - browser-uploaded source files for hosted deployments
 - **Local paths** — local directories or supported files from the device filesystem
 - **GitHub repositories** — public repository URLs from `github.com`
 - **Hugging Face model or dataset cards** — `hf:owner/model` shorthand or `https://huggingface.co/...` URLs
 
 Notes:
 
-- Local and GitHub sources ingest supported repository files into `data/raw/`
+- Uploaded, local, and GitHub sources ingest supported files into `data/raw/`
+- Local paths only work when Streamlit runs on the same machine as the files. On Streamlit Cloud, use uploaded files or a public GitHub/Hugging Face source instead.
 - Hugging Face sources ingest the source card `README.md` for the selected model or dataset
 
 ## System Architecture
@@ -60,6 +62,7 @@ Core modules:
 
 Prepared sources are stored under `data/raw/`.
 
+- Uploaded files are copied from the browser session into `data/raw/uploaded-files/` before indexing
 - Local and GitHub sources are filtered by supported extensions such as `.py`, `.md`, `.ts`, `.js`, `.json`, `.yaml`, `.toml`, `.txt`, `.rst`, `.pdf`, and `.docx`
 - Symlinks are rejected
 - Ignored directories such as `node_modules`, `.git`, and `__pycache__` are skipped
@@ -186,7 +189,7 @@ streamlit run app.py
 
 The app opens at `http://localhost:8501` with three tabs:
 
-- **Sources** — prepare local paths, GitHub repositories, or Hugging Face cards
+- **Sources** — prepare uploaded files, local paths, GitHub repositories, or Hugging Face cards
 - **Query** — run questions against the indexed source with trace visibility
 - **Evaluation** — compare retrieval strategies and inspect results
 
@@ -195,6 +198,8 @@ The app opens at `http://localhost:8501` with three tabs:
 The first public deployment target is Streamlit Cloud. Runtime artifacts are intentionally rebuildable and should not be committed: `data/raw/`, `chroma_db/`, and `data/eval/`.
 
 Configure Streamlit secrets with the same gates documented in `.env.example`. Keep cloud proof runs guarded with low `MAX_CLOUD_CALLS` and `MAX_REAL_RAGAS_ROWS`; the public app must still work through offline fallback when provider keys or quota are unavailable.
+
+Public deployments cannot read a visitor's `C:\...` or `/Users/...` filesystem path. The local path source type is for local Streamlit runs or server-local paths only. For public usage, use the default upload flow or a public GitHub/Hugging Face source.
 
 See [`docs/designs/final-polish-backlog-plan.md`](docs/designs/final-polish-backlog-plan.md) for the deployment checklist, Railway fallback criteria, and final acceptance checklist.
 

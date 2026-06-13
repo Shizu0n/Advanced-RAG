@@ -189,6 +189,66 @@ def _copy_source_tree(source_dir: Path, raw_dir: Path, target_name: str) -> list
     return sorted(copied_files)
 
 
+def _uploaded_file_name(uploaded: object) -> str:
+    raw_name = str(getattr(uploaded, "name", "uploaded-file")).replace("\\", "/")
+    name = Path(raw_name).name
+    path = Path(name)
+    stem = _slug(path.stem)
+    suffix = path.suffix
+    return f"{stem}{suffix}" if suffix else stem
+
+
+def _uploaded_file_bytes(uploaded: object) -> bytes:
+    if hasattr(uploaded, "getbuffer"):
+        return bytes(uploaded.getbuffer())
+    if hasattr(uploaded, "read"):
+        data = uploaded.read()
+        return data if isinstance(data, bytes) else bytes(data)
+    raise TypeError(f"Uploaded file {getattr(uploaded, 'name', '<unknown>')} does not expose bytes.")
+
+
+def prepare_uploaded_files(
+    uploaded_files: list[object] | tuple[object, ...],
+    raw_dir: Path | str = PROJECT_ROOT / "data" / "raw",
+    clear_existing: bool = False,
+) -> list[Path]:
+    """Persist browser-uploaded files into raw_dir for hosted Streamlit ingestion."""
+
+    raw_dir = Path(raw_dir)
+    prepared_source_path = prepared_source_path_for_raw_dir(raw_dir)
+    if clear_existing:
+        _reset_raw_dir(raw_dir)
+        PREPARED_SOURCE_METADATA.clear()
+        clear_prepared_source(prepared_source_path)
+    else:
+        raw_dir.mkdir(parents=True, exist_ok=True)
+
+    target_root = raw_dir / "uploaded-files"
+    target_root.mkdir(parents=True, exist_ok=True)
+    copied_files: list[Path] = []
+    for uploaded in uploaded_files:
+        safe_name = _uploaded_file_name(uploaded)
+        target_file = target_root / safe_name
+        if not (target_file.suffix.lower() in SOURCE_EXTENSIONS or target_file.name in SOURCE_FILENAMES):
+            raise ValueError(f"Unsupported uploaded file: {safe_name}")
+        data = _uploaded_file_bytes(uploaded)
+        if target_file.exists() and target_file.read_bytes() != data:
+            raise FileExistsError(f"Refusing to overwrite conflicting uploaded source: {target_file}")
+        target_file.write_bytes(data)
+        copied_files.append(target_file)
+
+    if copied_files:
+        source_names = ", ".join(path.name for path in copied_files)
+        _register_prepared_files(
+            sorted(copied_files),
+            source_input=f"uploaded:{source_names}",
+            source_type="upload",
+            source_slug="uploaded-files",
+            prepared_source_path=prepared_source_path,
+        )
+    return sorted(copied_files)
+
+
 def _download_limited(url: str, target: Path, max_bytes: int) -> None:
     request = Request(url, headers={"User-Agent": "advanced-rag-source-loader/1.0"})
     total_bytes = 0

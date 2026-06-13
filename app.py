@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import sqlite3
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Iterable, cast
 
@@ -47,6 +48,7 @@ CHAT_MESSAGES_KEY = "chat_messages"
 PREPARED_SOURCE_KEY = "prepared_source"
 ACTIVE_CHAT_SOURCE_KEY = "active_chat_source_slug"
 UI_GATE_OVERRIDES_KEY = "ui_gate_overrides"
+WORKSPACE_PAGE_KEY = "workspace_page"
 MAX_PERSISTED_CHAT_MESSAGES = 100
 UI_TOGGLE_GATES = {
     "ALLOW_HF_FETCH": {"label": "Allow Hugging Face fetch", "default": False},
@@ -88,6 +90,614 @@ ALLOWED_SYNTHESIS_KEYS = {
 }
 ALLOWED_SYNTHESIS_ERROR_KEYS = {"code", "stage", "retryable", "provider"}
 ALLOWED_PROVIDER_ATTEMPT_KEYS = {"provider", "model", "attempt", "outcome", "status_code", "duration_ms", "error_class"}
+
+
+def _system_light_theme_css() -> str:
+    return """
+        @media (prefers-color-scheme: light) {
+            :root {
+                --rag-bg: #f6f4ef;
+                --rag-bg-soft: #ebe8df;
+                --rag-surface: #ffffff;
+                --rag-surface-elevated: #fbfaf7;
+                --rag-border: #ddd8ce;
+                --rag-border-strong: #c6c0b5;
+                --rag-text: #171717;
+                --rag-muted: #5d625c;
+                --rag-subtle: #82877f;
+                --rag-accent: #9b6b16;
+                --rag-accent-2: #24766c;
+                --rag-danger: #ad3333;
+                --rag-shadow: 0 16px 52px rgba(45, 39, 29, 0.12);
+            }
+        }
+    """
+
+
+def _inject_app_chrome(st) -> None:
+    st.markdown(
+        """
+        <style>
+        :root {
+            --rag-bg: #08090a;
+            --rag-bg-soft: #101113;
+            --rag-surface: #141519;
+            --rag-surface-elevated: #191b20;
+            --rag-border: #2a2d34;
+            --rag-border-strong: #3a3f48;
+            --rag-text: #f4f1ea;
+            --rag-muted: #a8a29a;
+            --rag-subtle: #6f746f;
+            --rag-accent: #d7a545;
+            --rag-accent-2: #6fc7b6;
+            --rag-danger: #ec7777;
+            --rag-shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
+        }
+
+        """
+        + _system_light_theme_css()
+        + """
+
+        html, body, [data-testid="stAppViewContainer"], .stApp {
+            background: var(--rag-bg) !important;
+            color: var(--rag-text) !important;
+            overflow-x: hidden !important;
+        }
+
+        [data-testid="stHeader"] {
+            background: transparent;
+        }
+
+        [data-testid="stToolbar"] {
+            right: 1rem;
+        }
+
+        .block-container,
+        .main .block-container {
+            max-width: 100%;
+            padding: 1.05rem 1.35rem 8.5rem !important;
+        }
+
+        .rag-shell-header {
+            display: flex;
+            align-items: flex-end;
+            justify-content: space-between;
+            gap: 1rem;
+            flex-wrap: wrap;
+            padding: 0.35rem 0 1.05rem;
+            border-bottom: 1px solid var(--rag-border);
+            margin-bottom: 1rem;
+        }
+
+        .rag-title {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+        }
+
+        .rag-title h1 {
+            color: var(--rag-text);
+            font-size: 1.35rem;
+            line-height: 1.2;
+            font-weight: 690;
+            letter-spacing: 0;
+            margin: 0;
+        }
+
+        .rag-title p {
+            color: var(--rag-muted);
+            font-size: 0.86rem;
+            margin: 0;
+        }
+
+        .rag-status-strip {
+            display: flex;
+            align-items: center;
+            gap: 0.55rem;
+            color: var(--rag-muted);
+            font-size: 0.78rem;
+            max-width: min(100%, 34rem);
+            min-width: 0;
+            white-space: normal;
+        }
+
+        .rag-dot {
+            width: 0.55rem;
+            height: 0.55rem;
+            border-radius: 999px;
+            background: var(--rag-accent-2);
+            box-shadow: 0 0 0 4px color-mix(in srgb, var(--rag-accent-2) 16%, transparent);
+        }
+
+        [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"] {
+            background: var(--rag-surface);
+            border: 1px solid var(--rag-border);
+            border-radius: 8px;
+            box-shadow: var(--rag-shadow);
+            min-width: 0 !important;
+            padding: 1rem 1rem 1.1rem;
+        }
+
+        [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(2) {
+            background: linear-gradient(180deg, var(--rag-surface-elevated), var(--rag-surface) 34%);
+            min-height: calc(100vh - 12rem);
+        }
+
+        h2, h3, .stMarkdown h2, .stMarkdown h3 {
+            color: var(--rag-text) !important;
+            letter-spacing: 0;
+        }
+
+        .stMarkdown, .stMarkdown p, .stCaption, label, [data-testid="stWidgetLabel"] {
+            color: var(--rag-muted) !important;
+        }
+
+        .stButton > button,
+        .stDownloadButton > button {
+            border-radius: 7px;
+            border: 1px solid var(--rag-border-strong);
+            background: var(--rag-surface-elevated);
+            color: var(--rag-text);
+            font-weight: 560;
+            min-height: 2.35rem;
+        }
+
+        .stButton > button:hover,
+        .stDownloadButton > button:hover {
+            border-color: var(--rag-accent);
+            color: var(--rag-text);
+            background: color-mix(in srgb, var(--rag-accent) 12%, var(--rag-surface-elevated));
+        }
+
+        [data-testid="stChatMessage"] {
+            background: transparent;
+            border: 0;
+            padding: 0.65rem 0;
+        }
+
+        [data-testid="stChatMessageContent"] {
+            background: var(--rag-surface-elevated);
+            border: 1px solid var(--rag-border);
+            border-radius: 8px;
+            padding: 0.85rem 0.95rem;
+        }
+
+        [data-testid="stChatInput"] {
+            position: fixed;
+            left: clamp(21rem, 25vw, 27rem);
+            right: clamp(18rem, 24vw, 25rem);
+            bottom: 1.05rem;
+            z-index: 999;
+            box-sizing: border-box;
+            max-width: calc(100vw - 2rem);
+            padding: 0.35rem;
+            background: color-mix(in srgb, var(--rag-bg) 92%, transparent);
+            border: 0;
+            border-radius: 10px;
+            backdrop-filter: blur(16px);
+            box-shadow: 0 18px 60px rgba(0, 0, 0, 0.28);
+            overflow: hidden;
+        }
+
+        [data-testid="stChatInput"] > div,
+        [data-testid="stChatInput"] form,
+        [data-testid="stChatInput"] div[data-baseweb="textarea"],
+        [data-testid="stChatInput"] div[data-baseweb="textarea"] > div {
+            box-sizing: border-box !important;
+            max-width: 100% !important;
+            width: 100% !important;
+            min-width: 0 !important;
+        }
+
+        [data-testid="stChatInput"] textarea {
+            background: var(--rag-surface-elevated) !important;
+            color: var(--rag-text) !important;
+            border-radius: 7px !important;
+            border: 0 !important;
+            box-sizing: border-box !important;
+        }
+
+        div[data-baseweb="select"] > div,
+        div[data-baseweb="input"] > div,
+        div[data-baseweb="textarea"] > div {
+            background: var(--rag-surface-elevated);
+            border-color: var(--rag-border);
+            border-radius: 7px;
+            min-width: 0;
+        }
+
+        div[data-baseweb="select"] *,
+        div[data-baseweb="input"] *,
+        div[data-baseweb="textarea"] *,
+        div[data-baseweb="radio"] *,
+        .stRadio label,
+        .stRadio label *,
+        .stCheckbox label,
+        .stCheckbox label *,
+        input,
+        textarea {
+            color: var(--rag-text) !important;
+        }
+
+        input::placeholder,
+        textarea::placeholder {
+            color: var(--rag-subtle) !important;
+            opacity: 1 !important;
+        }
+
+        [data-testid="stDataFrame"],
+        [data-testid="stTable"] {
+            border: 1px solid var(--rag-border);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        [data-testid="stMetric"] {
+            background: var(--rag-bg-soft);
+            border: 1px solid var(--rag-border);
+            border-radius: 8px;
+            padding: 0.75rem;
+        }
+
+        [data-testid="stExpander"] {
+            border: 1px solid var(--rag-border);
+            border-radius: 8px;
+            background: var(--rag-surface-elevated);
+        }
+
+        .stAlert {
+            border-radius: 8px;
+            border: 1px solid var(--rag-border);
+        }
+
+        .stAlert [data-testid="stMarkdownContainer"] *,
+        [data-testid="stAlert"] [data-testid="stMarkdownContainer"] * {
+            color: var(--rag-text) !important;
+        }
+
+        .stAlert *,
+        [data-testid="stMarkdownContainer"] *,
+        [data-testid="stMetric"] * {
+            overflow-wrap: anywhere;
+        }
+
+        [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) {
+            align-items: stretch;
+        }
+
+        @media (max-width: 1500px) and (min-width: 901px) {
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) {
+                display: grid !important;
+                grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
+                gap: 1rem !important;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"] {
+                width: 100% !important;
+                flex: unset !important;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(1) {
+                grid-column: 1;
+                grid-row: 1 / span 2;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(2) {
+                grid-column: 2;
+                grid-row: 1;
+                min-height: 20rem;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(3) {
+                grid-column: 2;
+                grid-row: 2;
+            }
+
+            [data-testid="stChatInput"] {
+                position: sticky;
+                left: auto;
+                right: auto;
+                bottom: 0.75rem;
+                width: 100%;
+                margin-top: 1rem;
+            }
+        }
+
+        @media (max-width: 900px) {
+            [data-testid="stChatInput"] {
+                position: sticky;
+                left: auto;
+                right: auto;
+                bottom: 0.75rem;
+                width: 100%;
+                margin-top: 1rem;
+            }
+
+            .rag-shell-header {
+                align-items: flex-start;
+                flex-direction: column;
+            }
+
+            .rag-status-strip {
+                white-space: normal;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) {
+                display: grid !important;
+                grid-template-columns: minmax(0, 1fr);
+                gap: 1rem !important;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"] {
+                width: 100% !important;
+                flex: unset !important;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(1) {
+                grid-row: 2;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(2) {
+                grid-row: 1;
+                min-height: auto;
+            }
+
+            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(3) {
+                grid-row: 3;
+            }
+        }
+
+        @media (max-width: 520px) {
+            .block-container,
+            .main .block-container {
+                padding: 0.9rem 0.85rem 2rem !important;
+            }
+
+            .rag-title h1 {
+                font-size: 1.2rem;
+            }
+
+            h2, .stMarkdown h2 {
+                font-size: 1.35rem !important;
+            }
+        }
+
+        html,
+        body,
+        .stApp,
+        [data-testid="stAppViewContainer"],
+        [data-testid="stAppViewContainer"] > .main {
+            height: 100%;
+            max-height: 100%;
+            overflow: hidden !important;
+        }
+
+        .block-container,
+        .main .block-container {
+            height: 100dvh;
+            max-height: 100dvh;
+            overflow: hidden !important;
+            padding: 0.75rem 1rem !important;
+        }
+
+        .rag-shell-header {
+            flex: 0 0 auto;
+            padding: 0.2rem 0 0.72rem;
+            margin-bottom: 0.72rem;
+        }
+
+        .st-key-source_index_panel,
+        .st-key-main_workspace_panel {
+            box-sizing: border-box;
+            height: calc(100dvh - 10rem) !important;
+            min-height: calc(100dvh - 10rem) !important;
+            max-height: calc(100dvh - 10rem) !important;
+            overflow: hidden !important;
+            background: var(--rag-surface);
+            border: 1px solid var(--rag-border);
+            border-radius: 8px;
+            box-shadow: var(--rag-shadow);
+            padding: 0.82rem 0.82rem 0.9rem;
+            min-width: 0;
+        }
+
+        .st-key-main_workspace_panel {
+            display: flex !important;
+            flex-direction: column !important;
+            background: linear-gradient(180deg, var(--rag-surface-elevated), var(--rag-surface) 34%);
+        }
+
+        .st-key-source_index_panel {
+            overflow-y: auto !important;
+            overflow-x: hidden !important;
+        }
+
+        .st-key-source_index_panel [data-testid="stVerticalBlock"],
+        .st-key-main_workspace_panel [data-testid="stVerticalBlock"] {
+            min-height: 0;
+        }
+
+        .st-key-workspace_page_nav {
+            flex: 0 0 auto !important;
+        }
+
+        .st-key-workspace_page_nav [role="radiogroup"] {
+            display: flex;
+            flex-direction: row;
+            flex-wrap: wrap;
+            gap: 0.45rem 0.8rem;
+        }
+
+        .st-key-workspace_page_nav label[data-testid="stWidgetLabel"] {
+            display: none;
+        }
+
+        .st-key-chat_page_content,
+        .st-key-eval_page_content {
+            flex: 1 1 auto !important;
+            box-sizing: border-box;
+            height: calc(100dvh - 14.4rem) !important;
+            min-height: calc(100dvh - 14.4rem) !important;
+            max-height: calc(100dvh - 14.4rem) !important;
+            overflow-y: auto !important;
+            overflow-x: hidden !important;
+            padding-right: 0.2rem;
+        }
+
+        .st-key-chat_page_content {
+            display: flex !important;
+            flex-direction: column !important;
+            overflow: hidden !important;
+        }
+
+        .st-key-chat_history_panel {
+            flex: 1 1 auto !important;
+            min-height: 0 !important;
+            overflow-y: auto !important;
+            overflow-x: hidden !important;
+            padding: 0.35rem 0.2rem 0.7rem 0;
+        }
+
+        .st-key-chat_composer_panel {
+            flex: 0 0 auto !important;
+            padding-top: 0.55rem;
+            border-top: 1px solid var(--rag-border);
+        }
+
+        [data-testid="stChatInput"] {
+            position: sticky !important;
+            left: auto !important;
+            right: auto !important;
+            bottom: 0 !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            margin: 0 !important;
+            padding: 0.3rem !important;
+        }
+
+        [data-testid="stChatInput"] > div {
+            align-items: center !important;
+        }
+
+        [data-testid="stChatInput"] textarea {
+            min-height: 2.55rem !important;
+            line-height: 1.35rem !important;
+            padding: 0.58rem 3.25rem 0.58rem 0.75rem !important;
+            resize: none !important;
+        }
+
+        [data-testid="stChatInput"] div:has(> [data-testid="stChatInputSubmitButton"]) {
+            align-items: center !important;
+            bottom: 0 !important;
+            display: flex !important;
+            height: 100% !important;
+            right: 0.48rem !important;
+            top: 0 !important;
+        }
+
+        [data-testid="stChatInput"] [data-testid="stChatInputSubmitButton"] {
+            height: 2.15rem !important;
+            transform: none !important;
+            width: 2.15rem !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+
+        .st-key-source_index_panel [data-testid="stDataFrame"],
+        .st-key-eval_page_content [data-testid="stDataFrame"] {
+            max-height: 22rem;
+            overflow: auto;
+        }
+
+        @media (max-width: 900px) {
+            .block-container,
+            .main .block-container {
+                padding: 0.62rem 0.7rem !important;
+            }
+
+            .rag-shell-header {
+                gap: 0.45rem;
+                padding-bottom: 0.55rem;
+                margin-bottom: 0.55rem;
+            }
+
+            .rag-title p,
+            .rag-status-strip {
+                font-size: 0.74rem;
+            }
+
+            .st-key-source_index_panel,
+            .st-key-main_workspace_panel {
+                height: auto !important;
+                min-height: 0 !important;
+                max-height: none !important;
+            }
+
+            .st-key-source_index_panel {
+                max-height: 26dvh !important;
+            }
+
+            .st-key-main_workspace_panel {
+                height: 49dvh !important;
+                min-height: 49dvh !important;
+                max-height: 49dvh !important;
+            }
+
+            .st-key-chat_page_content,
+            .st-key-eval_page_content {
+                height: calc(49dvh - 4.3rem) !important;
+                min-height: calc(49dvh - 4.3rem) !important;
+                max-height: calc(49dvh - 4.3rem) !important;
+            }
+
+            .st-key-chat_history_panel {
+                flex: 0 1 auto !important;
+                height: max(2.5rem, calc(49dvh - 20rem)) !important;
+                min-height: max(2.5rem, calc(49dvh - 20rem)) !important;
+                max-height: max(2.5rem, calc(49dvh - 20rem)) !important;
+            }
+
+            .st-key-chat_composer_panel {
+                flex: 0 0 auto !important;
+            }
+        }
+
+        @media (max-width: 520px) {
+            .rag-title h1 {
+                font-size: 1.05rem;
+            }
+
+            h2, .stMarkdown h2 {
+                font-size: 1.12rem !important;
+            }
+
+            .st-key-source_index_panel,
+            .st-key-main_workspace_panel {
+                padding: 0.68rem;
+            }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_workbench_header(st) -> None:
+    st.markdown(
+        """
+        <div class="rag-shell-header">
+            <div class="rag-title">
+                <h1>Advanced RAG</h1>
+                <p>Source-aware chat, retrieval traces, and RAGAS evaluation in one workspace.</p>
+            </div>
+            <div class="rag-status-strip">
+                <span class="rag-dot"></span>
+                <span>Offline-first retrieval &middot; Free-tier cloud gates &middot; Source-scoped history</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _empty_frame(columns: list[str]) -> pd.DataFrame:
@@ -1513,6 +2123,61 @@ def _render_sidebar(st) -> None:
     )
 
 
+def _render_source_status_panel(st) -> None:
+    current_source = _source_ui_state(st)
+    badge_state = _sidebar_badge_state_for_source(current_source) if current_source is not None else get_source_badge_state()
+    if badge_state == "green":
+        slug = current_source.get("source_slug", "unknown") if current_source else "unknown"
+        indexed_at = current_source.get("indexed_at", "unknown") if current_source else "unknown"
+        st.success(f"Source indexed: {slug}")
+        st.caption(f"Indexed at: {indexed_at}")
+    elif badge_state == "yellow":
+        slug = current_source.get("source_slug", "unknown") if current_source else "unknown"
+        st.warning(f"Source prepared but not indexed: {slug}")
+    else:
+        st.error("No source prepared")
+
+
+def _render_gate_toggles_panel(st) -> None:
+    st.subheader("Session gates")
+    overrides = dict(_ui_gate_overrides(st))
+    for name, config in UI_TOGGLE_GATES.items():
+        default_value = _env_gate_default(name, config["default"])
+        value = st.checkbox(
+            config["label"],
+            value=bool(overrides.get(name, default_value)),
+            help=f"Default from .env: {'on' if default_value else 'off'}. Override applies only to this Streamlit session.",
+        )
+        overrides[name] = value
+    st.session_state[UI_GATE_OVERRIDES_KEY] = overrides
+
+
+def _render_run_metadata_panel(st) -> None:
+    stats = dataset_stats()
+    with st.expander("Run metadata", expanded=False):
+        st.write("Model")
+        st.json(MODEL_INFO)
+        st.write("Dataset stats")
+        st.json(stats)
+        st.write(f"Last eval: {last_eval_date()}")
+
+        data = RAGAS_RESULTS_PATH.read_bytes() if RAGAS_RESULTS_PATH.exists() else b""
+        st.download_button(
+            "Download results CSV",
+            data=data,
+            file_name="ragas_results.csv",
+            mime="text/csv",
+            disabled=not bool(data),
+        )
+
+
+def _render_source_workspace(st) -> None:
+    _render_source_status_panel(st)
+    _render_sources_tab(st)
+    _render_gate_toggles_panel(st)
+    _render_run_metadata_panel(st)
+
+
 def _render_sources_tab(st) -> None:
     st.subheader("Source preparation")
 
@@ -1708,6 +2373,12 @@ def _render_chat_message(st, message: dict[str, Any], stream_content: bool = Fal
                 _render_trace_debug(st, message.get("trace"))
 
 
+def _streamlit_container(st, key: str):
+    if hasattr(st, "container"):
+        return st.container(key=key)
+    return nullcontext()
+
+
 def _render_query_tab(st) -> None:
     current_source = _source_ui_state(st)
 
@@ -1721,10 +2392,13 @@ def _render_query_tab(st) -> None:
     strategy = st.selectbox("Strategy", STRATEGIES, index=STRATEGIES.index("hybrid_rerank"))
 
     messages = _chat_history(st)
-    for message in messages:
-        _render_chat_message(st, message)
+    history_panel = _streamlit_container(st, "chat_history_panel")
+    with history_panel:
+        for message in messages:
+            _render_chat_message(st, message)
 
-    prompt = st.chat_input("Ask about the indexed project context")
+    with _streamlit_container(st, "chat_composer_panel"):
+        prompt = st.chat_input("Ask about the indexed project context")
     if not prompt or not prompt.strip():
         return
 
@@ -1733,7 +2407,8 @@ def _render_query_tab(st) -> None:
     history = _retrieval_history(messages)
     messages.append(user_message)
     append_persisted_chat_message(source_slug, user_message)
-    _render_chat_message(st, user_message)
+    with history_panel:
+        _render_chat_message(st, user_message)
 
     try:
         result = run_chat_query(prompt.strip(), history=history, strategy=strategy)
@@ -1751,7 +2426,8 @@ def _render_query_tab(st) -> None:
     }
     messages.append(assistant_message)
     append_persisted_chat_message(source_slug, assistant_message)
-    _render_chat_message(st, assistant_message, stream_content=True)
+    with history_panel:
+        _render_chat_message(st, assistant_message, stream_content=True)
 
 
 def _render_eval_tab(st) -> None:
@@ -1889,20 +2565,12 @@ def _render_eval_tab(st) -> None:
                 except Exception as exc:
                     _show_eval_failure(st, exc)
 
-    st.subheader("Generated pre-questions")
-    st.dataframe(load_golden_questions(), use_container_width=True)
-
-    st.subheader("Chunking ablation")
-    st.dataframe(load_chunking_ablation(), use_container_width=True)
-
-    st.subheader("Embedding comparison")
-    st.dataframe(load_embedding_comparison(), use_container_width=True)
-
     st.subheader("Evaluation summary")
-    card_columns = st.columns(4)
     display_metrics = cards.get("display_metrics", {metric: metric for metric in METRICS})
-    for column, metric in zip(card_columns, METRICS, strict=True):
-        column.metric(display_metrics.get(metric, metric), _format_metric(cards[metric]))
+    for metric_row in [METRICS[:2], METRICS[2:]]:
+        card_columns = st.columns(2)
+        for column, metric in zip(card_columns, metric_row, strict=True):
+            column.metric(display_metrics.get(metric, metric), _format_metric(cards[metric]))
 
     best = cards.get("strategy")
     if best:
@@ -1929,20 +2597,42 @@ def _render_eval_tab(st) -> None:
     filtered = filter_questions_below_threshold(per_question, threshold)
     st.dataframe(filtered, use_container_width=True)
 
+    with st.expander("Generated pre-questions", expanded=False):
+        st.subheader("Generated pre-questions")
+        st.dataframe(load_golden_questions(), use_container_width=True)
+
+    with st.expander("Chunking ablation", expanded=False):
+        st.subheader("Chunking ablation")
+        st.dataframe(load_chunking_ablation(), use_container_width=True)
+
+    with st.expander("Embedding comparison", expanded=False):
+        st.subheader("Embedding comparison")
+        st.dataframe(load_embedding_comparison(), use_container_width=True)
+
 
 def render_app() -> None:
     import streamlit as st
 
-    st.set_page_config(page_title="Advanced RAG", layout="wide")
-    st.title("Advanced RAG")
-    _render_sidebar(st)
-    sources_tab, query_tab, eval_tab = st.tabs(["Sources", "Query interface", "Evaluation dashboard"])
-    with sources_tab:
-        _render_sources_tab(st)
-    with query_tab:
-        _render_query_tab(st)
-    with eval_tab:
-        _render_eval_tab(st)
+    st.set_page_config(page_title="Advanced RAG", layout="wide", initial_sidebar_state="collapsed")
+    _inject_app_chrome(st)
+    _render_workbench_header(st)
+
+    source_col, main_col = st.columns([0.78, 2.2], gap="medium")
+    with source_col:
+        with st.container(key="source_index_panel"):
+            _render_source_workspace(st)
+    with main_col:
+        with st.container(key="main_workspace_panel"):
+            with st.container(key="workspace_page_nav"):
+                page = st.radio("Workspace page", ["Chat", "RAGAS evaluation"], key=WORKSPACE_PAGE_KEY)
+            if page == "RAGAS evaluation":
+                with st.container(key="eval_page_content"):
+                    st.subheader("RAGAS evaluation")
+                    _render_eval_tab(st)
+            else:
+                with st.container(key="chat_page_content"):
+                    st.subheader("Chat")
+                    _render_query_tab(st)
 
 
 if __name__ == "__main__":

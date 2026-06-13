@@ -1675,6 +1675,143 @@ npm install.
         )
         self.assertNotIn("Model card for a SQL LoRA adapter", result["answer"])
 
+    def test_answer_query_fine_tune_dataset_question_uses_structured_model_card_metadata(self):
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [
+                    NodeWithScore(
+                        node=TextNode(
+                            id_="hf-readme",
+                            text=(
+                                "SQL generator model card.\n"
+                                "---\n"
+                                "base_model: microsoft/Phi-3-mini-4k-instruct\n"
+                                "datasets:\n"
+                                "  - b-mc2/sql-create-context\n"
+                                "---\n"
+                                "## Training Details\n"
+                                "Dataset: b-mc2/sql-create-context\n"
+                                "Epochs: 3\n"
+                                "## Evaluation\n"
+                                "| Model | exact match |\n"
+                                "| --- | --- |\n"
+                                "| adapter | 73.5% |\n"
+                            ),
+                            metadata={"file_name": "README.md"},
+                        ),
+                        score=0.05,
+                    )
+                ],
+                {"strategy": strategy},
+            )
+        )
+        pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
+
+        result = pipeline.answer_query("qual a dataset usada no fine tunning desse model do hugging face?", strategy="bm25_only")
+
+        self.assertEqual(result["trace"]["intent"], "fine_tune")
+        self.assertIn("Dataset: b-mc2/sql-create-context", result["answer"])
+        self.assertNotIn("Evaluation - Base vs Fine-tuned", result["answer"])
+
+    def test_resume_chat_summary_does_not_fail_low_evidence_precheck(self):
+        resume_text = (
+            "Paulo Shizuo Vasconcelos Tatibana\n"
+            "Perfil Profissional\n"
+            "Full Stack developer and Computer Science student.\n"
+            "Habilidades Técnicas\n"
+            "Linguagens: Java, TypeScript, JavaScript, Python, Kotlin, Ruby.\n"
+            "Frameworks: React, Spring Boot, NestJS, Node.js, Ruby on Rails.\n"
+            "Bancos de Dados: MySQL, PostgreSQL, SQLite.\n"
+            "Ferramentas: Git, GitHub, Docker, WSL/Ubuntu.\n"
+            "Projetos e Experiência Prática\n"
+            "Referral System with TypeScript, React, NestJS, SQLite, and JWT.\n"
+        )
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [
+                    NodeWithScore(
+                        node=TextNode(id_="resume", text=resume_text, metadata={"file_name": "Paulo_Shizuo___Currículo.pdf"}),
+                        score=0.01,
+                    )
+                ],
+                {"strategy": strategy},
+            )
+        )
+        pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query("Summarize this resume for a technical recruiter.", strategy="bm25_only")
+
+        self.assertEqual(result["intent"], "resume")
+        self.assertNotEqual(result["trace"]["synthesis"]["code"], "insufficient_evidence")
+        self.assertIn("Java", result["answer"])
+        self.assertIn("Referral System", result["answer"])
+
+    def test_answer_query_resume_skills_does_not_use_project_stack_formatter(self):
+        resume_text = (
+            "Habilidades Técnicas\n"
+            "Linguagens: Java, TypeScript, JavaScript, Python, Kotlin, Ruby.\n"
+            "Frameworks: React, Spring Boot, NestJS, Node.js, Ruby on Rails.\n"
+            "Bancos de Dados: MySQL, PostgreSQL, SQLite.\n"
+            "Ferramentas: Git, GitHub, Docker, WSL/Ubuntu.\n"
+        )
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [
+                    NodeWithScore(
+                        node=TextNode(id_="resume-skills", text=resume_text, metadata={"file_name": "Paulo_Shizuo___Currículo.pdf"}),
+                        score=0.01,
+                    )
+                ],
+                {"strategy": strategy},
+            )
+        )
+        pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)
+
+        result = pipeline.answer_query("What technical skills, frameworks, databases, and tools are listed in this resume?", strategy="bm25_only")
+
+        self.assertEqual(result["trace"]["intent"], "resume")
+        self.assertNotIn("Stack do projeto", result["answer"])
+        self.assertIn("Spring Boot", result["answer"])
+        self.assertIn("PostgreSQL", result["answer"])
+
+    def test_resume_skills_query_adds_later_resume_skill_chunk(self):
+        intro = TextNode(
+            id_="resume-intro",
+            text=(
+                "Paulo Shizuo Vasconcelos Tatibana\n"
+                "Perfil Profissional\n"
+                "Estudante de Ciências da Computação com projetos práticos em Java e Spring Boot.\n"
+                "Projetos e Experiência Prática\n"
+                "Referral System with TypeScript, React, NestJS, SQLite, JWT.\n"
+            ),
+            metadata={"file_name": "Paulo_Shizuo___Currículo.pdf"},
+        )
+        skills = TextNode(
+            id_="resume-skills-later",
+            text=(
+                "Habilidades Técnicas\n"
+                "Linguagens: Java, TypeScript, JavaScript, Python, Kotlin, Ruby.\n"
+                "Frameworks: React, Spring Boot, NestJS, Node.js, Ruby on Rails.\n"
+                "Bancos de Dados: MySQL, PostgreSQL, SQLite.\n"
+                "Ferramentas: Git, GitHub, Docker, WSL/Ubuntu.\n"
+            ),
+            metadata={"file_name": "Paulo_Shizuo___Currículo.pdf"},
+        )
+        retriever = SimpleNamespace(
+            ablation_retrieve=lambda query, strategy: (
+                [NodeWithScore(node=intro, score=0.2)],
+                {"strategy": strategy},
+            )
+        )
+        pipeline = LocalRAGPipeline(index=None, nodes=[intro, skills], retriever=retriever)
+
+        result = pipeline.answer_query("What technical skills, frameworks, databases, and tools are listed in this resume?", strategy="bm25_only")
+
+        self.assertIn("resume_evidence", result["trace"])
+        self.assertIn("Python", result["answer"])
+        self.assertIn("Docker", result["answer"])
+
     def test_fine_tune_sparse_metadata_replaces_missing_fields_with_unknowns(self):
         retriever = SimpleNamespace(
             ablation_retrieve=lambda query, strategy: (

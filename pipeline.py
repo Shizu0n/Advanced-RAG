@@ -203,13 +203,14 @@ LOW_VALUE_CODE_QUERY_TERMS = {
     "string",
 }
 INTENT_REWRITES = {
+    "resume": "resume curriculo cv technical skills habilidades experiencia experience projects projetos education formacao certifications recruiter",
     "stack": "stack tech stack tecnologias ferramentas frameworks dependencies package.json frontend backend react vite nestjs",
     "overview": "overview visao geral resumo objetivo problema solucao free-tier rag workspace local retrieval streamlit evaluation",
     "architecture": "architecture arquitetura mvc layer layers camada camadas modules modulos estrutura fluxo components backend frontend service services controller controllers repository repositories model models view views",
     "setup": "setup install instalar executar rodar ambiente env scripts npm deploy deployment docker compose build",
     "security": "security seguranca auth authentication jwt password senha bcrypt guard token",
     "evaluation": "evaluation avaliacao metricas tests testes qualidade benchmark ragas",
-    "fine_tune": "fine tune training dataset hyperparameters lora qlora phi training_details",
+    "fine_tune": "fine tune training dataset base model model card adapter hyperparameters lora qlora phi training_details",
 }
 ARCHITECTURE_LAYER_ALIASES = {
     "adapter": {"adapter", "adapters", "gateway", "gateways", "integration", "integrations"},
@@ -515,6 +516,18 @@ def analyze_query(query: str) -> QueryAnalysis:
     intents: list[str] = []
 
     intent_patterns = {
+        "resume": (
+            "resume",
+            "curriculo",
+            "curriculum",
+            "cv",
+            "technical skills",
+            "habilidades tecnicas",
+            "professional experience",
+            "experiencia profissional",
+            "recruiter",
+            "recrutador",
+        ),
         "stack": ("stack", "tech stack", "tecnologia", "tecnologias", "ferramenta", "ferramentas", "framework"),
         "overview": (
             "overview",
@@ -534,7 +547,23 @@ def analyze_query(query: str) -> QueryAnalysis:
         "setup": ("setup", "install", "instalar", "executar", "rodar", "ambiente", "env", "script", "scripts", "deploy", "deployment", "docker", "compose", "build"),
         "security": ("security", "seguranca", "auth", "authentication", "jwt", "senha", "password", "bcrypt", "token"),
         "evaluation": ("evaluation", "avaliacao", "avaliar", "metric", "metrics", "metrica", "metricas", "test", "tests"),
-        "fine_tune": ("fine tune", "fine-tune", "fine tunning", "fine tuning", "finetuning", "training data", "hyperparameter", "lora", "qlora", "dataset"),
+        "fine_tune": (
+            "fine tune",
+            "fine-tune",
+            "fine tunning",
+            "fine tuning",
+            "finetuning",
+            "training data",
+            "hyperparameter",
+            "lora",
+            "qlora",
+            "dataset",
+            "base model",
+            "model card",
+            "hugging face",
+            "hf model",
+            "adapter",
+        ),
     }
     for intent, patterns in intent_patterns.items():
         if any(pattern in normalized for pattern in patterns):
@@ -828,12 +857,291 @@ STACK_BEHAVIOR_PHRASES = (
 
 def _query_mixes_stack_with_behavior(query: str, analysis: QueryAnalysis | None = None) -> bool:
     analysis = analysis or analyze_query(query)
-    if "stack" not in analysis.intents:
+    if "stack" not in analysis.intents or "resume" in analysis.intents:
         return False
     normalized = f" {_normalize_for_match(query)} "
     if any(phrase in normalized for phrase in STACK_BEHAVIOR_PHRASES):
         return True
     return bool(analysis.terms & STACK_BEHAVIOR_TERMS)
+
+
+RESUME_SOURCE_MARKERS = (
+    "curriculo",
+    "resume",
+    "curriculum",
+    "habilidades tecnicas",
+    "technical skills",
+    "experiencia profissional",
+    "professional experience",
+    "formacao academica",
+    "education",
+    "certificacoes",
+    "certifications",
+)
+
+
+def _query_targets_resume(query: str, analysis: QueryAnalysis | None = None) -> bool:
+    analysis = analysis or analyze_query(query)
+    if "resume" in analysis.intents:
+        return True
+    normalized = _normalize_for_match(query)
+    return any(marker in normalized for marker in RESUME_SOURCE_MARKERS)
+
+
+def _source_set_is_resume_like(contexts: Sequence[str], sources: Sequence[dict[str, Any]]) -> bool:
+    source_text = " ".join(str(source.get("source_doc", "")) for source in sources)
+    body_text = " ".join(context[:1800] for context in contexts[:4])
+    normalized = _normalize_for_match(f"{source_text} {body_text}")
+    return any(marker in normalized for marker in RESUME_SOURCE_MARKERS)
+
+
+def _resume_context_lines(context: str) -> list[str]:
+    prepared = context.replace("\r\n", "\n").replace("\r", "\n")
+    prepared = re.sub(r"\s*[•]\s*", "\n•", prepared)
+    headings = (
+        "Perfil Profissional",
+        "Professional Profile",
+        "Formação Acadêmica",
+        "Formacao Academica",
+        "Education",
+        "Projetos e Experiência Prática",
+        "Projetos e Experiencia Pratica",
+        "Projects",
+        "Habilidades Técnicas",
+        "Habilidades Tecnicas",
+        "Technical Skills",
+        "Skills",
+        "Idiomas",
+        "Languages",
+        "Certificações",
+        "Certificacoes",
+        "Certifications",
+        "Experiência Profissional",
+        "Experiencia Profissional",
+        "Professional Experience",
+    )
+    for heading in headings:
+        prepared = re.sub(rf"(?<!\n)({re.escape(heading)})", r"\n\1", prepared, flags=re.IGNORECASE)
+    lines: list[str] = []
+    for raw_line in prepared.splitlines():
+        line = re.sub(r"\s+", " ", raw_line.strip(" \t-*•")).strip()
+        if line:
+            lines.append(line)
+    return lines or [part.strip() for part in re.split(r"(?<=[.!?])\s+", context) if part.strip()]
+
+
+def _resume_line_has_any(line: str, markers: Sequence[str]) -> bool:
+    folded = _normalize_for_match(line)
+    return any(marker in folded for marker in markers)
+
+
+def _resume_line_starts_section(line: str, markers: Sequence[str]) -> bool:
+    folded = _normalize_for_match(line).strip(" :-")
+    return any(folded == marker or folded.startswith(f"{marker} ") or folded.startswith(f"{marker}:") for marker in markers)
+
+
+def _resume_section_lines(
+    context: str,
+    start_markers: Sequence[str],
+    stop_markers: Sequence[str],
+    limit: int = 8,
+) -> list[str]:
+    selected: list[str] = []
+    collecting = False
+    for line in _resume_context_lines(context):
+        if not collecting and _resume_line_starts_section(line, start_markers):
+            collecting = True
+            if ":" in line:
+                remainder = line.split(":", 1)[1].strip()
+                if remainder:
+                    selected.append(remainder)
+            continue
+        if not collecting:
+            continue
+        if selected and _resume_line_starts_section(line, stop_markers):
+            break
+        selected.append(line)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _resume_lines_with_markers(context: str, markers: Sequence[str], limit: int = 8) -> list[str]:
+    lines = [line for line in _resume_context_lines(context) if _resume_line_has_any(line, markers)]
+    return lines[:limit]
+
+
+def _join_resume_lines(lines: Sequence[str], limit: int = 1000) -> str | None:
+    answer = " ".join(line.strip() for line in lines if line.strip())
+    answer = re.sub(r"\s+", " ", answer).strip()
+    return answer[:limit].rstrip(" ,;") or None
+
+
+def _format_resume_answer(query: str, contexts: Sequence[str], sources: Sequence[dict[str, Any]]) -> str | None:
+    if not contexts or not (_query_targets_resume(query) or _source_set_is_resume_like(contexts, sources)):
+        return None
+    context = "\n".join(contexts)
+    normalized_query = _normalize_for_match(query)
+    stop_markers = (
+        "idiomas",
+        "languages",
+        "formacao",
+        "education",
+        "projetos",
+        "projects",
+        "experiencia",
+        "experience",
+        "certificacoes",
+        "certifications",
+        "habilidades",
+        "skills",
+    )
+    if any(term in normalized_query for term in ("skill", "habilidade", "framework", "database", "banco", "tool", "ferramenta", "stack")):
+        lines = _resume_section_lines(
+            context,
+            ("habilidades tecnicas", "technical skills", "skills"),
+            stop_markers,
+            limit=10,
+        ) or _resume_lines_with_markers(
+            context,
+            (
+                "java",
+                "typescript",
+                "javascript",
+                "python",
+                "kotlin",
+                "ruby",
+                "react",
+                "spring boot",
+                "nestjs",
+                "node",
+                "rails",
+                "mysql",
+                "postgresql",
+                "sqlite",
+                "docker",
+                "ubuntu",
+                "wsl",
+                "git",
+            ),
+            limit=10,
+        )
+        return _join_resume_lines(lines)
+    if any(term in normalized_query for term in ("project", "projeto", "achievement", "realizacao")):
+        lines = _resume_section_lines(context, ("projetos", "projects"), stop_markers, limit=8)
+        return _join_resume_lines(lines)
+    if any(term in normalized_query for term in ("experience", "experiencia", "responsabil")):
+        lines = _resume_section_lines(context, ("experiencia profissional", "professional experience"), stop_markers, limit=8)
+        return _join_resume_lines(lines)
+    if any(term in normalized_query for term in ("education", "formacao", "certification", "certificacao")):
+        lines = _resume_section_lines(context, ("formacao", "education", "certificacoes", "certifications"), stop_markers, limit=8)
+        return _join_resume_lines(lines)
+
+    profile = _resume_section_lines(context, ("perfil profissional", "professional profile"), stop_markers, limit=3)
+    skills = _resume_section_lines(context, ("habilidades tecnicas", "technical skills", "skills"), stop_markers, limit=4)
+    projects = _resume_section_lines(context, ("projetos", "projects"), stop_markers, limit=4)
+    sections = [
+        ("Profile", _join_resume_lines(profile, limit=450)),
+        ("Skills", _join_resume_lines(skills, limit=450)),
+        ("Projects", _join_resume_lines(projects, limit=450)),
+    ]
+    formatted = [f"{label}: {text}" for label, text in sections if text]
+    if formatted:
+        return "\n".join(formatted)
+    return _join_resume_lines(_resume_context_lines(context)[:8])
+
+
+RESUME_SKILL_EVIDENCE_MARKERS = (
+    "habilidades tecnicas",
+    "technical skills",
+    "linguagens",
+    "frameworks",
+    "bancos de dados",
+    "databases",
+    "ferramentas",
+    "tools",
+    "java",
+    "typescript",
+    "python",
+    "spring boot",
+    "nestjs",
+    "postgresql",
+    "sqlite",
+    "docker",
+)
+
+
+def _resume_query_prefers_skills(query: str) -> bool:
+    normalized = _normalize_for_match(query)
+    return any(term in normalized for term in ("skill", "habilidade", "framework", "database", "banco", "tool", "ferramenta", "stack"))
+
+
+def _resume_evidence_score(query: str, node: Any, analysis: QueryAnalysis) -> float:
+    text = _node_text(node)
+    source = _source_doc(node)
+    score = _score_local_node(node, analysis)
+    if _source_set_is_resume_like([text], [{"source_doc": source}]):
+        score += 0.8
+    if _resume_query_prefers_skills(query) and _resume_line_has_any(text, RESUME_SKILL_EVIDENCE_MARKERS):
+        score += 2.0
+    if any(marker in _normalize_for_match(text) for marker in ("projetos", "projects", "experiencia", "experience")):
+        score += 0.3
+    return score
+
+
+def _balance_resume_evidence_results(
+    query: str,
+    results: Sequence[Any],
+    candidate_nodes: Sequence[Any],
+    top_k: int,
+) -> tuple[list[Any], dict[str, Any]]:
+    analysis = analyze_query(query)
+    trace = {
+        "enabled": False,
+        "added_sources": [],
+        "reason": None,
+    }
+    if not _query_targets_resume(query, analysis) or not candidate_nodes:
+        return list(results), trace
+
+    selected = list(results)
+    seen = {_node_key(item) for item in selected}
+    original = set(seen)
+    candidates: list[LocalNodeWithScore] = []
+    for node in candidate_nodes:
+        key = _node_key(node)
+        if key in seen:
+            continue
+        text = _node_text(node)
+        source = _source_doc(node)
+        if not _source_set_is_resume_like([text], [{"source_doc": source}]):
+            continue
+        score = _resume_evidence_score(query, node, analysis)
+        if score <= 0:
+            continue
+        candidates.append(LocalNodeWithScore(node=getattr(node, "node", node), score=score))
+
+    added_sources: list[str] = []
+    for candidate in sorted(candidates, key=lambda item: (-float(_score(item) or 0.0), _source_doc(item))):
+        if len(selected) >= top_k:
+            break
+        key = _node_key(candidate)
+        if key in seen:
+            continue
+        selected.append(candidate)
+        seen.add(key)
+        if key not in original:
+            added_sources.append(_source_doc(candidate))
+
+    if added_sources:
+        trace.update(
+            {
+                "enabled": True,
+                "added_sources": added_sources,
+                "reason": "resume_section_evidence",
+            }
+        )
+    return selected, trace
 
 
 def _node_key(item: Any) -> str:
@@ -1284,7 +1592,7 @@ def _balance_stack_evidence_results(
         "added_sources": [],
         "reason": None,
     }
-    if "stack" not in analysis.intents or not candidate_nodes:
+    if "stack" not in analysis.intents or "resume" in analysis.intents or not candidate_nodes:
         return list(results), trace
 
     asks_frontend, asks_backend = _stack_scope_flags(analysis)
@@ -1629,6 +1937,18 @@ def _format_fine_tune_mapping(values: dict[str, Any], key_overrides: dict[str, s
     )
 
 
+def _clean_markdown_label(value: str) -> str:
+    cleaned = re.sub(r"^[\s\-*`]+", "", value).strip()
+    cleaned = cleaned.strip(" *`")
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def _clean_markdown_value(value: str) -> str:
+    cleaned = value.strip().strip(" *`")
+    cleaned = re.sub(r"^\*+\s*", "", cleaned).strip(" *`")
+    return re.sub(r"\s+", " ", cleaned)
+
+
 def _format_fine_tune_extract_answer(metadata: FineTuneMetadata) -> str | None:
     if not _fine_tune_has_brief_fields(metadata):
         return None
@@ -1735,7 +2055,7 @@ def _parse_yaml_frontmatter(text: str) -> dict[str, Any]:
 
 def _parse_markdown_section(text: str, section_name: str) -> str:
     """Extract content under a specific markdown section heading."""
-    pattern = rf"^##\s+{re.escape(section_name)}\s*$"
+    pattern = rf"^##\s+{re.escape(section_name)}(?:\s|$|[-:/])"
     lines = text.split("\n")
     start_idx = None
 
@@ -1801,8 +2121,8 @@ def _extract_fine_tune_info(contexts: Sequence[str], sources: Sequence[dict[str,
             for line in training_text.split("\n"):
                 if ":" in line and not line.startswith("|"):
                     key, value = line.split(":", 1)
-                    key = key.strip().replace("*", "").strip()
-                    value = value.strip()
+                    key = _clean_markdown_label(key)
+                    value = _clean_markdown_value(value)
                     try:
                         if "." in value:
                             details[key] = float(value)
@@ -1814,7 +2134,7 @@ def _extract_fine_tune_info(contexts: Sequence[str], sources: Sequence[dict[str,
                     parts = [p.strip() for p in line.split("|") if p.strip()]
                     if len(parts) >= 2:
                         key = parts[0].replace("*", "").strip()
-                        value = parts[1].strip()
+                        value = _clean_markdown_value(parts[1])
                         try:
                             if "." in value:
                                 details[key] = float(value)
@@ -1848,15 +2168,18 @@ def _extract_fine_tune_info(contexts: Sequence[str], sources: Sequence[dict[str,
             if metrics:
                 metadata.evaluation_metrics = metrics
 
-        lora_text = _parse_markdown_section(context, "LoRA Config")
+        lora_text = (
+            _parse_markdown_section(context, "LoRA Config")
+            or _parse_markdown_section(context, "LoRA")
+        )
         if lora_text:
             lora: dict[str, Any] = {}
             for line in lora_text.split("\n"):
                 if "|" in line:
                     parts = [p.strip() for p in line.split("|") if p.strip()]
                     if len(parts) >= 2:
-                        key = parts[0].replace("*", "").strip().title()
-                        value = parts[1].strip()
+                        key = _clean_markdown_label(parts[0]).title()
+                        value = _clean_markdown_value(parts[1])
                         try:
                             lora[key] = int(value)
                         except ValueError:
@@ -1946,6 +2269,11 @@ def _confidence(query: str, contexts: Sequence[str], sources: Sequence[dict[str,
 def _has_enough_evidence(query: str, contexts: Sequence[str], sources: Sequence[dict[str, Any]]) -> bool:
     if not contexts:
         return False
+    analysis = analyze_query(query)
+    if "fine_tune" in analysis.intents:
+        return True
+    if _query_targets_resume(query, analysis) and _source_set_is_resume_like(contexts, sources):
+        return True
     if _evidence_score(query, contexts) >= LOW_EVIDENCE_THRESHOLD:
         return True
     return any(isinstance(source.get("score"), (int, float)) and source["score"] >= LOW_EVIDENCE_THRESHOLD for source in sources)
@@ -2234,6 +2562,8 @@ def _extractive_synthesis_result(
     intent: str = "general",
 ) -> SynthesisResult:
     answer = _format_fine_tune_extract_answer(fine_tune_metadata) if fine_tune_metadata else None
+    if answer is None and intent == "resume":
+        answer = _format_resume_answer(query, contexts, sources)
     if answer is None and intent == "stack" and not _query_mixes_stack_with_behavior(query):
         answer = _format_stack_answer(contexts, sources, query)
         if answer is None:
@@ -2858,6 +3188,9 @@ class LocalRAGPipeline:
         results, project_trace = _balance_project_evidence_results(query, results, self.nodes or [], self.top_k)
         if project_trace["enabled"]:
             metadata = {**metadata, "project_evidence": project_trace}
+        results, resume_trace = _balance_resume_evidence_results(query, results, self.nodes or [], self.top_k)
+        if resume_trace["enabled"]:
+            metadata = {**metadata, "resume_evidence": resume_trace}
         results, stack_trace = _balance_stack_evidence_results(query, results, self.nodes or [], self.top_k)
         if stack_trace["enabled"]:
             metadata = {**metadata, "stack_evidence": stack_trace}
@@ -2865,12 +3198,25 @@ class LocalRAGPipeline:
         logger.info("answer_query: retrieved %d contexts, %d results", len(contexts), len(results))
         sources = self._source_rows(results)
         analysis = analyze_query(query)
-        stack_answer = (
-            _format_stack_answer(contexts, sources, query)
-            if "stack" in analysis.intents and not _query_mixes_stack_with_behavior(query, analysis)
+        fine_tune_metadata = _extract_fine_tune_info(contexts, sources) if "fine_tune" in analysis.intents else None
+        fine_tune_answer = _format_fine_tune_extract_answer(fine_tune_metadata) if fine_tune_metadata else None
+        resume_answer = (
+            _format_resume_answer(query, contexts, sources)
+            if "resume" in analysis.intents or _query_targets_resume(query, analysis)
             else None
         )
-        if stack_answer:
+        stack_answer = (
+            _format_stack_answer(contexts, sources, query)
+            if "stack" in analysis.intents
+            and "resume" not in analysis.intents
+            and not _query_mixes_stack_with_behavior(query, analysis)
+            else None
+        )
+        if fine_tune_answer:
+            answer = fine_tune_answer
+        elif resume_answer:
+            answer = resume_answer
+        elif stack_answer:
             answer = stack_answer
         elif contexts and _query_needs_code_evidence(query, analysis):
             answer = synthesize_source_grounded_answer(query, contexts, sources) or synthesize_extractive_answer(query, contexts)
@@ -2883,7 +3229,11 @@ class LocalRAGPipeline:
             "contexts": contexts,
             "sources": sources,
             "strategy": strategy,
-            "trace": self._normalize_trace(metadata, results),
+            "trace": {
+                **self._normalize_trace(metadata, results),
+                "intent": analysis.intents[0] if analysis.intents else "general",
+                "intents": analysis.intents,
+            },
         }
 
     def chat_query(
@@ -2909,6 +3259,9 @@ class LocalRAGPipeline:
         results, project_trace = _balance_project_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
         if project_trace["enabled"]:
             metadata = {**metadata, "project_evidence": project_trace}
+        results, resume_trace = _balance_resume_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
+        if resume_trace["enabled"]:
+            metadata = {**metadata, "resume_evidence": resume_trace}
         results, stack_trace = _balance_stack_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
         if stack_trace["enabled"]:
             metadata = {**metadata, "stack_evidence": stack_trace}

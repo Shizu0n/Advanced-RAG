@@ -862,6 +862,56 @@ class GoldenDatasetTests(unittest.TestCase):
             self.assertIn("cooling down", errors["bm25_only"])
             self.assertEqual(statuses["hybrid_rerank"], "succeeded")
 
+    def test_run_evaluation_marks_partial_cloud_ragas_scores_as_degraded(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            summary_path = Path(tmpdir) / "summary.csv"
+            detail_path = Path(tmpdir) / "detail.csv"
+            golden_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "question": "What dataset was used?",
+                            "ground_truth": "The dataset is b-mc2/sql-create-context.",
+                            "reference_context": "The dataset is b-mc2/sql-create-context.",
+                            "source_doc": "README.md",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(evaluation, "STRATEGIES", ["semantic_only"]),
+                patch.object(evaluation, "EVAL_DIR", Path(tmpdir)),
+                patch.object(evaluation, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(evaluation, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.dict(
+                    "os.environ",
+                    {
+                        "USE_CLOUD_FREE_TIER_RAGAS": "1",
+                        "ALLOW_CLOUD_FREE_TIER": "1",
+                        "GEMINI_API_KEY": "key",
+                    },
+                    clear=True,
+                ),
+                patch.object(
+                    evaluation.cloud_ragas,
+                    "run_ragas",
+                    return_value={
+                        "answer_relevancy": 0.14,
+                        "context_recall": 1.0,
+                        "context_precision": 1.0,
+                    },
+                ),
+            ):
+                evaluation.run_evaluation(golden_path=golden_path, pipeline=StaticPipeline(), cloud_client=object())
+
+            summary = pd.read_csv(summary_path)
+            self.assertEqual(summary.loc[0, "summary_backend"], "cloud_free_tier_ragas")
+            self.assertEqual(summary.loc[0, "cloud_status"], "degraded")
+            self.assertIn("faithfulness", summary.loc[0, "cloud_error"])
+
     def test_run_evaluation_reuses_one_cloud_client_across_strategies(self):
         with TemporaryDirectory() as tmpdir:
             golden_path = Path(tmpdir) / "golden_dataset.json"
@@ -1195,6 +1245,68 @@ class SourceScopedEvalTests(unittest.TestCase):
         self.assertEqual(len(questions), len(set(questions)))
         self.assertTrue(any("backend/package.json" in question for question in questions))
         self.assertTrue(any("backend/src/auth/auth.controller.ts" in question for question in questions))
+
+    def test_generate_pre_questions_uses_model_card_questions_for_huggingface_readme(self):
+        with TemporaryDirectory() as tmpdir:
+            golden_path = Path(tmpdir) / "golden_dataset.json"
+            current_source_path = Path(tmpdir) / "current_source.json"
+            readme = TextNode(
+                id_="hf-readme",
+                text=(
+                    "Phi-3 Mini SQL Generator model card.\n"
+                    "---\n"
+                    "base_model: microsoft/Phi-3-mini-4k-instruct\n"
+                    "datasets:\n"
+                    "  - b-mc2/sql-create-context\n"
+                    "tags:\n"
+                    "  - lora\n"
+                    "  - qlora\n"
+                    "---\n"
+                    "## Training Details\n"
+                    "| Parameter | Value |\n"
+                    "| --- | --- |\n"
+                    "| Train samples | 1000 |\n"
+                    "| Validation samples | 200 |\n"
+                    "| Epochs | 3 |\n"
+                    "| Batch size | 8 |\n"
+                    "| Learning rate | 0.0002 |\n"
+                    "## Evaluation\n"
+                    "| Model | exact match |\n"
+                    "| --- | --- |\n"
+                    "| adapter | 73.5% |\n"
+                    "## LoRA Config\n"
+                    "| Parameter | Value |\n"
+                    "| Rank (r) | 16 |\n"
+                    "| Alpha | 32 |\n"
+                    "| Target modules | qkv_proj, o_proj |\n"
+                ),
+                metadata={"file_name": "README.md"},
+            )
+            indexed_pipeline = StaticPipeline(nodes=[readme])
+            current_source_path.write_text(json.dumps({"source_slug": "shizu0n-phi3-mini-sql-generator"}), encoding="utf-8")
+
+            with (
+                patch.object(evaluation, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(evaluation, "CURRENT_SOURCE_PATH", current_source_path),
+                patch.object(evaluation, "_load_indexed_pipeline", return_value=indexed_pipeline),
+            ):
+                dataset = evaluation.generate_pre_questions(
+                    output_path=golden_path,
+                    providers=[NoisyProvider()],
+                    chunk_limit=1,
+                    final_limit=6,
+                )
+
+        questions = " ".join(item["question"].lower() for item in dataset)
+        ground_truths = " ".join(item["ground_truth"] for item in dataset)
+        self.assertIn("dataset", questions)
+        self.assertIn("base model", questions)
+        self.assertIn("training setup", questions)
+        self.assertNotIn("what stack and tools does this project use", questions)
+        self.assertNotIn("what is the architecture of this project", questions)
+        self.assertIn("b-mc2/sql-create-context", ground_truths)
+        self.assertFalse(any(item["ground_truth"].strip().startswith("```") for item in dataset))
+        self.assertTrue(all(item["source_slug"] == "shizu0n-phi3-mini-sql-generator" for item in dataset))
 
     def test_run_evaluation_writes_evaluated_source_column_to_csv(self):
         with TemporaryDirectory() as tmpdir:

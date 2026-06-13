@@ -276,12 +276,19 @@ def cloud_ragas_status_message(summary: pd.DataFrame) -> str | None:
     if summary.empty or "cloud_status" not in summary.columns:
         return None
     statuses = summary["cloud_status"].fillna("").astype(str)
-    attempted = statuses.isin({"succeeded", "fallback_offline"})
+    attempted = statuses.isin({"succeeded", "degraded", "fallback_offline"})
     if not attempted.any():
         return None
     total = len(summary)
     succeeded = int(statuses.eq("succeeded").sum())
+    degraded = int(statuses.eq("degraded").sum())
     fallback = int(statuses.eq("fallback_offline").sum())
+    if degraded:
+        return (
+            f"Cloud RAGAS succeeded for {succeeded}/{total} strategies; "
+            f"{degraded}/{total} returned partial metrics; "
+            f"{fallback}/{total} fell back to offline."
+        )
     return f"Cloud RAGAS succeeded for {succeeded}/{total} strategies; {fallback}/{total} fell back to offline."
 
 
@@ -294,7 +301,7 @@ def cloud_ragas_status_rows(summary: pd.DataFrame) -> pd.DataFrame:
         if column not in frame.columns:
             frame[column] = ""
     statuses = frame["cloud_status"].fillna("").astype(str)
-    frame = frame[statuses.isin({"succeeded", "fallback_offline"})].copy()
+    frame = frame[statuses.isin({"succeeded", "degraded", "fallback_offline"})].copy()
     frame["cloud_error"] = frame["cloud_error"].fillna("")
     return frame[columns]
 

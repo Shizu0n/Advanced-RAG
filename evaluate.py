@@ -19,7 +19,13 @@ import pandas as pd
 import requests
 
 import cloud_ragas
-from pipeline import LocalRAGPipeline, load_local_context_nodes, _is_code_evidence_source, _is_readme_source
+from pipeline import (
+    LocalRAGPipeline,
+    load_local_context_nodes,
+    _extract_fine_tune_info,
+    _is_code_evidence_source,
+    _is_readme_source,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -213,6 +219,14 @@ def _is_instruction_like_ground_truth(ground_truth: str) -> bool:
     return any(normalized.startswith(prefix) for prefix in INSTRUCTION_GROUND_TRUTH_PREFIXES)
 
 
+def _is_trivial_code_fence_ground_truth(ground_truth: str) -> bool:
+    stripped = ground_truth.strip()
+    if not stripped.startswith("```"):
+        return False
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    return len(lines) <= 2
+
+
 def _context_support_score(ground_truth: str, reference_context: str) -> float:
     if not ground_truth.strip() or not reference_context.strip():
         return 0.0
@@ -229,6 +243,8 @@ def _context_support_score(ground_truth: str, reference_context: str) -> float:
 
 def _is_supported_ground_truth(ground_truth: str, reference_context: str) -> bool:
     if _is_instruction_like_ground_truth(ground_truth):
+        return False
+    if _is_trivial_code_fence_ground_truth(ground_truth):
         return False
     answer_numbers = set(re.findall(r"\d{2,4}", ground_truth))
     context_numbers = set(re.findall(r"\d{2,4}", reference_context))
@@ -773,6 +789,109 @@ def _source_set_is_resume_like(nodes: Sequence[Any]) -> bool:
     return any(marker in folded for marker in resume_markers)
 
 
+def _source_set_is_model_card_like(nodes: Sequence[Any]) -> bool:
+    source_text = " ".join(_source_doc(node) for node in nodes)
+    body_text = "\n".join(_node_text(node)[:3000] for node in list(nodes)[:4])
+    folded = _ascii_fold(f"{source_text}\n{body_text}")
+    has_model_metadata = "base_model:" in folded or "model card" in folded or "hugging face" in folded
+    has_training_signal = any(marker in folded for marker in ("datasets:", "dataset:", "fine-tuned", "fine tuned", "lora", "qlora", "exact match"))
+    return has_model_metadata and has_training_signal
+
+
+def _fine_tune_metadata_for_nodes(nodes: Sequence[Any]):
+    contexts = [_node_text(node) for node in nodes]
+    sources = [{"source_doc": _source_doc(node)} for node in nodes]
+    return _extract_fine_tune_info(contexts, sources)
+
+
+def _model_card_reference_context(nodes: Sequence[Any]) -> str:
+    return "\n\n".join(_node_text(node)[:2500] for node in list(nodes)[:4]).strip()
+
+
+def _fine_tune_dataset_text(dataset: Any) -> str:
+    if isinstance(dataset, list):
+        return ", ".join(str(item) for item in dataset if str(item).strip())
+    return str(dataset).strip() if dataset else ""
+
+
+def _fine_tune_mapping_text(values: dict[str, Any], limit: int = 6) -> str:
+    parts: list[str] = []
+    for key, value in values.items():
+        if not str(key).strip() or str(key).lower() == "parameter":
+            continue
+        if isinstance(value, str) and set(value.strip()) <= {"-", ":"}:
+            continue
+        parts.append(f"{key}={value}")
+        if len(parts) >= limit:
+            break
+    return ", ".join(parts)
+
+
+def _model_card_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
+    context = _model_card_reference_context(nodes)
+    source_doc = _source_doc(nodes[0]) if nodes else "unknown"
+    metadata = _fine_tune_metadata_for_nodes(nodes)
+    candidates: list[tuple[str, str]] = []
+
+    dataset_text = _fine_tune_dataset_text(metadata.dataset)
+    if dataset_text:
+        candidates.append(
+            (
+                "What dataset was used to fine-tune this Hugging Face model?",
+                f"The fine-tuning dataset is {dataset_text}.",
+            )
+        )
+    if metadata.base_model:
+        candidates.append(
+            (
+                "What base model does this adapter fine-tune?",
+                f"The adapter fine-tunes {metadata.base_model}.",
+            )
+        )
+    if metadata.training_details:
+        training_text = _fine_tune_mapping_text(metadata.training_details)
+        if training_text:
+            candidates.append(
+                (
+                    "What training setup is documented for this fine-tuned model?",
+                    f"Training details include {training_text}.",
+                )
+            )
+    if metadata.evaluation_metrics:
+        metrics_text = _fine_tune_mapping_text(metadata.evaluation_metrics)
+        if metrics_text:
+            candidates.append(
+                (
+                    "What evaluation result is reported for the fine-tuned adapter?",
+                    f"The model card reports {metrics_text}.",
+                )
+            )
+    if metadata.lora_config:
+        lora_text = _fine_tune_mapping_text(metadata.lora_config)
+        if lora_text:
+            candidates.append(
+                (
+                    "What LoRA or QLoRA configuration is documented for this model?",
+                    f"The LoRA configuration includes {lora_text}.",
+                )
+            )
+
+    return [
+        item
+        for question, answer in candidates
+        if (item := _validated_golden_item(question, answer, context, source_doc))
+    ]
+
+
+def _model_card_template_item_for_node(node: Any) -> dict[str, str] | None:
+    items = _model_card_query_items([node])
+    if not items:
+        return None
+    item = dict(items[0])
+    item["question"] = f"What fine-tuning metadata is documented in {_display_source_doc(_source_doc(node))}?"
+    return item
+
+
 def _resume_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
     context = _combined_question_context(nodes)
     source_doc = _source_doc(nodes[0]) if nodes else "unknown"
@@ -823,6 +942,8 @@ def _document_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
 def _realistic_user_query_items(nodes: Sequence[Any]) -> list[dict[str, str]]:
     if not nodes:
         return []
+    if _source_set_is_model_card_like(nodes):
+        return _model_card_query_items(nodes)
     if not _source_set_is_project_like(nodes):
         return _resume_query_items(nodes) if _source_set_is_resume_like(nodes) else _document_query_items(nodes)
 
@@ -859,6 +980,8 @@ def _template_golden_item_for_node(node: Any) -> dict[str, str] | None:
     context = _node_text(node).strip()
     if not context:
         return None
+    if _source_set_is_model_card_like([node]):
+        return _model_card_template_item_for_node(node)
     group = _question_source_group(node)
     if group == "manifest":
         question = f"What dependencies and tools does {display_source} declare for this project?"
@@ -938,9 +1061,15 @@ def generate_golden_dataset(
     question_nodes = _select_question_source_nodes(nodes, chunk_limit)
     composite_nodes = _build_composite_question_nodes(question_nodes or nodes)
     cloud_refinement_provider = _cloud_refinement_provider(providers)
+    model_card_source = _source_set_is_model_card_like(question_nodes or nodes)
 
     candidates = _realistic_user_query_items([*composite_nodes, *(question_nodes or nodes)])
     for node in [*composite_nodes, *question_nodes]:
+        if model_card_source:
+            template_item = _model_card_template_item_for_node(node)
+            if template_item:
+                candidates.append(template_item)
+            continue
         template_item = _template_golden_item_for_node(node)
         if template_item:
             candidates.append(template_item)
@@ -1182,6 +1311,29 @@ def maybe_run_real_ragas_with_status(
         raise
 
 
+def _finite_ragas_metrics(scores: dict[str, float]) -> set[str]:
+    finite: set[str] = set()
+    for metric in RAGAS_METRICS:
+        try:
+            value = float(scores[metric])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            finite.add(metric)
+    return finite
+
+
+def _cloud_ragas_score_status(scores: dict[str, float]) -> tuple[str, str]:
+    finite_metrics = _finite_ragas_metrics(scores)
+    missing = [metric for metric in RAGAS_METRICS if metric not in finite_metrics]
+    if missing:
+        return (
+            "degraded",
+            "Cloud RAGAS returned partial metrics; missing or non-finite: " + ", ".join(missing),
+        )
+    return "succeeded", ""
+
+
 def _finite_latency_ms(value: Any) -> float | None:
     try:
         number = float(value)
@@ -1274,8 +1426,7 @@ def run_evaluation(
             if real_scores:
                 summaries[strategy] = real_scores
                 summary_backends[strategy] = "cloud_free_tier_ragas"
-                cloud_statuses[strategy] = "succeeded"
-                cloud_errors[strategy] = ""
+                cloud_statuses[strategy], cloud_errors[strategy] = _cloud_ragas_score_status(real_scores)
             else:
                 cloud_statuses[strategy] = "fallback_offline"
                 cloud_errors[strategy] = cloud_error or "Cloud RAGAS did not return scores for this strategy."

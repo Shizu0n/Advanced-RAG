@@ -321,6 +321,25 @@ class AppHelperTests(unittest.TestCase):
         self.assertEqual(rows["strategy"].tolist(), ["semantic_only", "bm25_only", "hybrid_no_rerank", "hybrid_rerank"])
         self.assertIn("cloud_error", rows.columns)
 
+    def test_cloud_ragas_status_message_surfaces_degraded_partial_metrics(self):
+        summary = pd.DataFrame(
+            [
+                {"strategy": "semantic_only", "summary_backend": "cloud_free_tier_ragas", "cloud_status": "degraded", "cloud_error": "missing faithfulness"},
+                {"strategy": "bm25_only", "summary_backend": "cloud_free_tier_ragas", "cloud_status": "succeeded", "cloud_error": ""},
+                {"strategy": "hybrid_no_rerank", "summary_backend": "offline_heuristic", "cloud_status": "fallback_offline", "cloud_error": "429"},
+            ]
+        )
+
+        message = app.cloud_ragas_status_message(summary)
+        rows = app.cloud_ragas_status_rows(summary)
+
+        self.assertEqual(
+            message,
+            "Cloud RAGAS succeeded for 1/3 strategies; 1/3 returned partial metrics; 1/3 fell back to offline.",
+        )
+        self.assertEqual(rows["cloud_status"].tolist(), ["degraded", "succeeded", "fallback_offline"])
+        self.assertIn("missing faithfulness", rows["cloud_error"].tolist())
+
     def test_load_per_question_handles_empty_csv_file(self):
         with TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "ragas_per_question.csv"

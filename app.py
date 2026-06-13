@@ -1125,6 +1125,11 @@ def _clear_chroma_artifacts() -> None:
     try:
         client.delete_collection("advanced_rag")
     except Exception as exc:
+        invalid_database = "no such table: tenants" in str(exc).lower() or "database disk image is malformed" in str(exc).lower()
+        if invalid_database:
+            _remove_path(CHROMA_DIR)
+            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            return
         not_found_error = getattr(getattr(chromadb, "errors", None), "NotFoundError", None)
         missing_collection = isinstance(not_found_error, type) and isinstance(exc, not_found_error)
         missing_collection = missing_collection or (

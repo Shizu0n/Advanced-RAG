@@ -350,16 +350,23 @@ def clear_indexed_source_artifacts() -> None:
         try:
             client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         except Exception:
-            shutil.rmtree(CHROMA_DIR)
-            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            _reset_chroma_dir()
         else:
             try:
                 client.delete_collection(CHROMA_COLLECTION_NAME)
             except Exception as exc:
-                if not _is_missing_chroma_collection_error(exc):
+                if _is_invalid_chroma_database_error(exc):
+                    _reset_chroma_dir()
+                elif not _is_missing_chroma_collection_error(exc):
                     raise
     if CURRENT_SOURCE_PATH.exists():
         CURRENT_SOURCE_PATH.unlink()
+
+
+def _reset_chroma_dir() -> None:
+    if CHROMA_DIR.exists():
+        shutil.rmtree(CHROMA_DIR)
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _is_missing_chroma_collection_error(exc: Exception) -> bool:
@@ -367,6 +374,15 @@ def _is_missing_chroma_collection_error(exc: Exception) -> bool:
     if isinstance(not_found_error, type) and isinstance(exc, not_found_error):
         return True
     return isinstance(exc, ValueError) and "does not exist" in str(exc).lower()
+
+
+def _is_invalid_chroma_database_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "no such table: tenants" in message
+        or "attempt to write a readonly database" in message
+        or "database disk image is malformed" in message
+    )
 
 
 def _documents_from_source_files(files: Iterable[Path]) -> list[Document]:
@@ -537,15 +553,24 @@ def build_index(
         try:
             chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         except Exception:
-            shutil.rmtree(CHROMA_DIR)
-            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            _reset_chroma_dir()
             chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         try:
             chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
         except Exception as exc:
-            if not _is_missing_chroma_collection_error(exc):
+            if _is_invalid_chroma_database_error(exc):
+                _reset_chroma_dir()
+                chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+            elif not _is_missing_chroma_collection_error(exc):
                 raise
-        chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
+        try:
+            chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
+        except Exception as exc:
+            if not _is_invalid_chroma_database_error(exc):
+                raise
+            _reset_chroma_dir()
+            chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+            chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
         vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
         storage_context = StorageContext.from_defaults(vector_store=vector_store)
         embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)

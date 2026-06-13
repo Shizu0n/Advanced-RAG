@@ -549,35 +549,43 @@ def build_index(
     nodes = _split_documents(documents)
 
     try:
-        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        except Exception:
-            _reset_chroma_dir()
-            chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-        try:
-            chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
-        except Exception as exc:
-            if _is_invalid_chroma_database_error(exc):
-                _reset_chroma_dir()
-                chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-            elif not _is_missing_chroma_collection_error(exc):
-                raise
-        try:
-            chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
-        except Exception as exc:
-            if not _is_invalid_chroma_database_error(exc):
-                raise
-            _reset_chroma_dir()
-            chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
-            chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
-        vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
-        storage_context = StorageContext.from_defaults(vector_store=vector_store)
-        embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
+        for attempt in range(2):
+            try:
+                CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+                try:
+                    chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+                except Exception:
+                    _reset_chroma_dir()
+                    chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+                try:
+                    chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
+                except Exception as exc:
+                    if _is_invalid_chroma_database_error(exc):
+                        _reset_chroma_dir()
+                        chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+                    elif not _is_missing_chroma_collection_error(exc):
+                        raise
+                try:
+                    chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
+                except Exception as exc:
+                    if not _is_invalid_chroma_database_error(exc):
+                        raise
+                    _reset_chroma_dir()
+                    chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+                    chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
+                vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
+                storage_context = StorageContext.from_defaults(vector_store=vector_store)
+                embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
 
-        start = time.perf_counter()
-        index = VectorStoreIndex(nodes, storage_context=storage_context, embed_model=embed_model)
-        embedding_time = time.perf_counter() - start
+                start = time.perf_counter()
+                index = VectorStoreIndex(nodes, storage_context=storage_context, embed_model=embed_model)
+                embedding_time = time.perf_counter() - start
+                break
+            except Exception as exc:
+                if attempt == 0 and _is_invalid_chroma_database_error(exc):
+                    _reset_chroma_dir()
+                    continue
+                raise
 
         logger.info("Index built: %d documents, %d chunks, %.2fs embedding", len(documents), len(nodes), embedding_time)
 

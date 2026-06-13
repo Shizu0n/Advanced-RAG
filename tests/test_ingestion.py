@@ -361,6 +361,34 @@ class CurrentSourceTests(unittest.TestCase):
             self.assertEqual(mock_chromadb.PersistentClient.call_count, 2)
             good_client.create_collection.assert_called_once_with(ingestion.CHROMA_COLLECTION_NAME)
 
+    def test_build_index_retries_whole_chroma_write_when_vector_index_finds_invalid_db(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "test-repo"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "readme.md").write_text("# Hello\nThis is a test document with real content.", encoding="utf-8")
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("stale", encoding="utf-8")
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb") as mock_chromadb,
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                first_client = MagicMock()
+                second_client = MagicMock()
+                mock_chromadb.PersistentClient.side_effect = [first_client, second_client]
+                mock_index.side_effect = [RuntimeError("no such table: tenants"), "fake_index"]
+                ingestion.build_index(raw_dir=raw_dir)
+
+            self.assertTrue(source_path.exists())
+            self.assertEqual(mock_chromadb.PersistentClient.call_count, 2)
+            self.assertEqual(mock_index.call_count, 2)
+            second_client.create_collection.assert_called_once_with(ingestion.CHROMA_COLLECTION_NAME)
+
     def test_build_index_writes_current_source_json(self):
         with TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw" / "test-repo"

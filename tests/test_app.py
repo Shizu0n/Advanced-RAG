@@ -1223,6 +1223,39 @@ class AppHelperTests(unittest.TestCase):
             mock_client.delete_collection.assert_called_once_with("advanced_rag")
             self.assertFalse(current_source.exists())
 
+    def test_clear_source_cache_removes_chroma_dir_when_client_cannot_open_it(self):
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            raw_dir = root / "data" / "raw"
+            chroma_dir = root / "chroma_db"
+            current_source = root / "data" / "current_source.json"
+            prepared_source = root / "data" / "prepared_source.json"
+            query_log = root / "data" / "query_log.jsonl"
+            golden_path = root / "data" / "eval" / "golden_dataset.json"
+            summary_path = root / "data" / "eval" / "ragas_results.csv"
+            detail_path = root / "data" / "eval" / "ragas_per_question.csv"
+            raw_dir.mkdir(parents=True)
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("stale", encoding="utf-8")
+            mock_chromadb = MagicMock()
+            mock_chromadb.PersistentClient.side_effect = RuntimeError("cannot open chroma")
+
+            with (
+                patch.object(app, "RAW_DIR", raw_dir),
+                patch.object(app, "CHROMA_DIR", chroma_dir),
+                patch.object(app, "CURRENT_SOURCE_PATH", current_source),
+                patch.object(app, "PREPARED_SOURCE_PATH", prepared_source),
+                patch.object(app, "QUERY_LOG_PATH", query_log),
+                patch.object(app, "GOLDEN_DATASET_PATH", golden_path),
+                patch.object(app, "RAGAS_RESULTS_PATH", summary_path),
+                patch.object(app, "RAGAS_PER_QUESTION_PATH", detail_path),
+                patch.dict("sys.modules", {"chromadb": mock_chromadb}),
+            ):
+                app.clear_source_cache(clear_raw=False)
+
+            self.assertTrue(chroma_dir.exists())
+            self.assertEqual(list(chroma_dir.iterdir()), [])
+
     def test_reset_session_source_state_removes_prepared_files_and_chat(self):
         fake_st = FakeStreamlit(messages=[{"role": "user", "content": "old"}])
         fake_st.session_state[app.PREPARED_SOURCE_KEY] = {"source_slug": "old", "indexed_at": None}

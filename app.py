@@ -1116,7 +1116,12 @@ def _clear_chroma_artifacts() -> None:
     import chromadb
 
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    try:
+        client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+    except Exception:
+        _remove_path(CHROMA_DIR)
+        CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+        return
     try:
         client.delete_collection("advanced_rag")
     except Exception as exc:

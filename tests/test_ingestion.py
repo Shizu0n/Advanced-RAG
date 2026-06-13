@@ -287,6 +287,26 @@ class CurrentSourceTests(unittest.TestCase):
             self.assertEqual(mock_chromadb.PersistentClient.return_value.delete_collection.call_count, 2)
             mock_chromadb.PersistentClient.return_value.delete_collection.assert_any_call(ingestion.CHROMA_COLLECTION_NAME)
 
+    def test_clear_indexed_source_artifacts_removes_chroma_dir_when_client_cannot_open_it(self):
+        with TemporaryDirectory() as tmpdir:
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            source_path.write_text('{"source_slug":"old-source"}', encoding="utf-8")
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("stale", encoding="utf-8")
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "chromadb") as mock_chromadb,
+            ):
+                mock_chromadb.PersistentClient.side_effect = RuntimeError("cannot open chroma")
+                ingestion.clear_indexed_source_artifacts()
+
+            self.assertFalse(source_path.exists())
+            self.assertTrue(chroma_dir.exists())
+            self.assertEqual(list(chroma_dir.iterdir()), [])
+
     def test_build_index_writes_current_source_json(self):
         with TemporaryDirectory() as tmpdir:
             raw_dir = Path(tmpdir) / "raw" / "test-repo"

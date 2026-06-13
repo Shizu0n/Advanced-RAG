@@ -1119,16 +1119,20 @@ def _clear_chroma_artifacts() -> None:
     try:
         client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     except Exception:
+        _clear_chroma_system_cache()
         _remove_path(CHROMA_DIR)
         CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+        _clear_chroma_system_cache()
         return
     try:
         client.delete_collection("advanced_rag")
     except Exception as exc:
         invalid_database = "no such table: tenants" in str(exc).lower() or "database disk image is malformed" in str(exc).lower()
         if invalid_database:
+            _clear_chroma_system_cache()
             _remove_path(CHROMA_DIR)
             CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            _clear_chroma_system_cache()
             return
         not_found_error = getattr(getattr(chromadb, "errors", None), "NotFoundError", None)
         missing_collection = isinstance(not_found_error, type) and isinstance(exc, not_found_error)
@@ -1137,6 +1141,15 @@ def _clear_chroma_artifacts() -> None:
         )
         if not missing_collection:
             raise
+
+
+def _clear_chroma_system_cache() -> None:
+    try:
+        from chromadb.api.shared_system_client import SharedSystemClient
+
+        SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass
 
 
 def clear_source_cache(clear_raw: bool = True) -> None:

@@ -364,9 +364,20 @@ def clear_indexed_source_artifacts() -> None:
 
 
 def _reset_chroma_dir() -> None:
+    _clear_chroma_system_cache()
     if CHROMA_DIR.exists():
         shutil.rmtree(CHROMA_DIR)
     CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    _clear_chroma_system_cache()
+
+
+def _clear_chroma_system_cache() -> None:
+    try:
+        from chromadb.api.shared_system_client import SharedSystemClient
+
+        SharedSystemClient.clear_system_cache()
+    except Exception:
+        pass
 
 
 def _is_missing_chroma_collection_error(exc: Exception) -> bool:

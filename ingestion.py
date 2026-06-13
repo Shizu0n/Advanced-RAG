@@ -534,7 +534,12 @@ def build_index(
 
     try:
         CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-        chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        try:
+            chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
+        except Exception:
+            shutil.rmtree(CHROMA_DIR)
+            CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+            chroma_client = chromadb.PersistentClient(path=str(CHROMA_DIR))
         try:
             chroma_client.delete_collection(CHROMA_COLLECTION_NAME)
         except Exception as exc:

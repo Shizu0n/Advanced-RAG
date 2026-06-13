@@ -3,7 +3,7 @@ import os
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -306,6 +306,32 @@ class CurrentSourceTests(unittest.TestCase):
             self.assertFalse(source_path.exists())
             self.assertTrue(chroma_dir.exists())
             self.assertEqual(list(chroma_dir.iterdir()), [])
+
+    def test_build_index_retries_chroma_client_after_reset_when_existing_dir_is_invalid(self):
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw" / "test-repo"
+            raw_dir.mkdir(parents=True)
+            (raw_dir / "readme.md").write_text("# Hello\nThis is a test document with real content.", encoding="utf-8")
+            source_path = Path(tmpdir) / "current_source.json"
+            chroma_dir = Path(tmpdir) / "chroma_db"
+            chroma_dir.mkdir()
+            (chroma_dir / "chroma.sqlite3").write_text("stale", encoding="utf-8")
+
+            with (
+                patch.object(ingestion, "CURRENT_SOURCE_PATH", source_path),
+                patch.object(ingestion, "CHROMA_DIR", chroma_dir),
+                patch.object(ingestion, "HuggingFaceEmbedding"),
+                patch.object(ingestion, "chromadb") as mock_chromadb,
+                patch.object(ingestion, "VectorStoreIndex") as mock_index,
+            ):
+                mock_client = MagicMock()
+                mock_chromadb.PersistentClient.side_effect = [RuntimeError("bad chroma"), mock_client]
+                mock_index.return_value = "fake_index"
+                ingestion.build_index(raw_dir=raw_dir)
+
+            self.assertTrue(source_path.exists())
+            self.assertEqual(mock_chromadb.PersistentClient.call_count, 2)
+            mock_client.create_collection.assert_called_once_with(ingestion.CHROMA_COLLECTION_NAME)
 
     def test_build_index_writes_current_source_json(self):
         with TemporaryDirectory() as tmpdir:

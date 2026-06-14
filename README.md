@@ -2,7 +2,7 @@
 
 Advanced-RAG is a Retrieval-Augmented Generation workspace for local and public technical sources. It prepares source material, builds a local retrieval index, answers questions with hybrid retrieval, and evaluates retrieval quality with offline heuristics or optional RAGAS-backed cloud evaluation.
 
-![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white) ![Streamlit](https://img.shields.io/badge/Streamlit-1.39-FF4B4B?logo=streamlit&logoColor=white) ![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.11-4A67FF?logo=llama&logoColor=white) ![ChromaDB](https://img.shields.io/badge/ChromaDB-0.5-7B61FF) ![BM25](https://img.shields.io/badge/rank--bm25-BM25-555555) ![Sentence%20Transformers](https://img.shields.io/badge/Sentence%20Transformers-bge--small--en--v1.5-0A7EA4) ![RAGAS](https://img.shields.io/badge/RAGAS-0.2.5-0F766E)
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white) ![Streamlit](https://img.shields.io/badge/Streamlit-1.54-FF4B4B?logo=streamlit&logoColor=white) ![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.11-4A67FF?logo=llama&logoColor=white) ![ChromaDB](https://img.shields.io/badge/ChromaDB-0.5-7B61FF) ![BM25](https://img.shields.io/badge/rank--bm25-BM25-555555) ![Sentence%20Transformers](https://img.shields.io/badge/Sentence%20Transformers-bge--small--en--v1.5-0A7EA4) ![RAGAS](https://img.shields.io/badge/RAGAS-0.2.5-0F766E)
 
 Core stack: Python 3.11, Streamlit, LlamaIndex, ChromaDB, rank-bm25, sentence-transformers, and RAGAS.
 
@@ -10,17 +10,18 @@ The project is offline-first by default. External fetches, model downloads, and 
 
 ## Supported Sources
 
-The product currently supports four source types:
+The product currently supports three source types:
 
-- **Uploaded files** - browser-uploaded source files for hosted deployments
-- **Local paths** — local directories or supported files from the device filesystem
+- **Uploaded files/folders** - browser-uploaded files, project folders, or `.zip` archives for hosted deployments
 - **GitHub repositories** — public repository URLs from `github.com`
 - **Hugging Face model or dataset cards** — `hf:owner/model` shorthand or `https://huggingface.co/...` URLs
 
 Notes:
 
-- Uploaded, local, and GitHub sources ingest supported files into `data/raw/`
-- Local paths only work when Streamlit runs on the same machine as the files. On Streamlit Cloud, use uploaded files or a public GitHub/Hugging Face source instead.
+- Uploaded folders preserve relative paths such as `backend/package.json` and `frontend/src/App.tsx`
+- Uploaded `.zip` archives are safely extracted with unsupported files and ignored directories skipped
+- Uploaded and GitHub sources ingest supported files into `data/raw/`
+- Public deployments cannot read a visitor's local filesystem path directly; upload the folder or archive instead
 - Hugging Face sources ingest the source card `README.md` for the selected model or dataset
 
 ## System Architecture
@@ -62,8 +63,8 @@ Core modules:
 
 Prepared sources are stored under `data/raw/`.
 
-- Uploaded files are copied from the browser session into `data/raw/uploaded-files/` before indexing
-- Local and GitHub sources are filtered by supported extensions such as `.py`, `.md`, `.ts`, `.js`, `.json`, `.yaml`, `.toml`, `.txt`, `.rst`, `.pdf`, and `.docx`
+- Uploaded files, folders, and `.zip` archives are copied from the browser session into `data/raw/uploaded-files/` before indexing
+- Uploaded and GitHub sources are filtered by supported extensions such as `.py`, `.md`, `.ts`, `.js`, `.json`, `.yaml`, `.toml`, `.txt`, `.rst`, `.pdf`, and `.docx`
 - Symlinks are rejected
 - Ignored directories such as `node_modules`, `.git`, and `__pycache__` are skipped
 - Hugging Face sources fetch the card `README.md` through the raw `/resolve/main/README.md` endpoint
@@ -189,7 +190,7 @@ streamlit run app.py
 
 The app opens at `http://localhost:8501` with three tabs:
 
-- **Sources** — prepare uploaded files, local paths, GitHub repositories, or Hugging Face cards
+- **Sources** — prepare uploaded files/folders, GitHub repositories, or Hugging Face cards
 - **Query** — run questions against the indexed source with trace visibility
 - **Evaluation** — compare retrieval strategies and inspect results
 
@@ -199,7 +200,7 @@ The first public deployment target is Streamlit Cloud. Runtime artifacts are int
 
 Configure Streamlit secrets with the same gates documented in `.env.example`. Keep cloud proof runs guarded with low `MAX_CLOUD_CALLS` and `MAX_REAL_RAGAS_ROWS`; the public app must still work through offline fallback when provider keys or quota are unavailable.
 
-Public deployments cannot read a visitor's `C:\...` or `/Users/...` filesystem path. The local path source type is for local Streamlit runs or server-local paths only. For public usage, use the default upload flow or a public GitHub/Hugging Face source.
+Public deployments cannot read a visitor's `C:\...` or `/Users/...` filesystem path directly. For local projects, use the default upload flow to select the project folder, or upload a `.zip` archive. Public GitHub and Hugging Face sources remain available for hosted sources.
 
 See [`docs/designs/final-polish-backlog-plan.md`](docs/designs/final-polish-backlog-plan.md) for the deployment checklist, Railway fallback criteria, and final acceptance checklist.
 

@@ -62,6 +62,75 @@ class SourceLoaderTests(unittest.TestCase):
             self.assertEqual(prepared["source_type"], "upload")
             self.assertEqual(prepared["source_slug"], "uploaded-files")
 
+    def test_prepare_uploaded_directory_preserves_relative_project_paths(self):
+        class Uploaded:
+            def __init__(self, name: str, data: bytes):
+                self.name = name
+                self._data = data
+
+            def getbuffer(self):
+                return self._data
+
+        uploads = [
+            Uploaded("ReferralSystem/backend/package.json", b'{"name":"backend"}\n'),
+            Uploaded("ReferralSystem/frontend/package.json", b'{"name":"frontend"}\n'),
+            Uploaded("ReferralSystem/backend/src/users/users.service.ts", b"export class UsersService {}\n"),
+            Uploaded("ReferralSystem/node_modules/pkg/index.js", b"ignored\n"),
+            Uploaded("ReferralSystem/frontend/assets/logo.png", b"ignored binary\n"),
+        ]
+
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+
+            files = source_loader.prepare_uploaded_files(uploads, raw_dir=raw_dir, clear_existing=True)
+
+            relative_paths = sorted(path.relative_to(raw_dir).as_posix() for path in files)
+            self.assertEqual(
+                relative_paths,
+                [
+                    "uploaded-files/ReferralSystem/backend/package.json",
+                    "uploaded-files/ReferralSystem/backend/src/users/users.service.ts",
+                    "uploaded-files/ReferralSystem/frontend/package.json",
+                ],
+            )
+            prepared = json.loads((Path(tmpdir) / "prepared_source.json").read_text(encoding="utf-8"))
+            self.assertIn("ReferralSystem/backend/package.json", prepared["source_input"])
+            self.assertNotIn("node_modules", prepared["source_input"])
+
+    def test_prepare_uploaded_zip_extracts_supported_project_files(self):
+        class Uploaded:
+            name = "ReferralSystem.zip"
+
+            def __init__(self, data: bytes):
+                self._data = data
+
+            def getbuffer(self):
+                return self._data
+
+        with TemporaryDirectory() as tmpdir:
+            zip_path = Path(tmpdir) / "fixture.zip"
+            with zipfile.ZipFile(zip_path, "w") as archive:
+                archive.writestr("ReferralSystem/backend/package.json", '{"name":"backend"}\n')
+                archive.writestr("ReferralSystem/frontend/src/App.tsx", "export function App() { return null; }\n")
+                archive.writestr("ReferralSystem/node_modules/pkg/index.js", "ignored\n")
+                archive.writestr("ReferralSystem/frontend/assets/logo.png", "ignored\n")
+            raw_dir = Path(tmpdir) / "raw"
+
+            files = source_loader.prepare_uploaded_files(
+                [Uploaded(zip_path.read_bytes())],
+                raw_dir=raw_dir,
+                clear_existing=True,
+            )
+
+            relative_paths = sorted(path.relative_to(raw_dir).as_posix() for path in files)
+            self.assertEqual(
+                relative_paths,
+                [
+                    "uploaded-files/ReferralSystem/backend/package.json",
+                    "uploaded-files/ReferralSystem/frontend/src/App.tsx",
+                ],
+            )
+
     def test_prepare_uploaded_files_rejects_unsupported_uploads(self):
         class Uploaded:
             name = "payload.exe"
@@ -70,7 +139,7 @@ class SourceLoaderTests(unittest.TestCase):
                 return b"binary"
 
         with TemporaryDirectory() as tmpdir:
-            with self.assertRaisesRegex(ValueError, "Unsupported uploaded file"):
+            with self.assertRaisesRegex(ValueError, "No supported uploaded source files"):
                 source_loader.prepare_uploaded_files([Uploaded()], raw_dir=Path(tmpdir) / "raw")
 
     def test_prepare_sources_ignores_generated_and_private_directories(self):

@@ -50,7 +50,7 @@ ACTIVE_CHAT_SOURCE_KEY = "active_chat_source_slug"
 UI_GATE_OVERRIDES_KEY = "ui_gate_overrides"
 WORKSPACE_PAGE_KEY = "workspace_page"
 SOURCE_TYPE_KEY = "source_type"
-DEFAULT_SOURCE_TYPE = "Upload files"
+DEFAULT_SOURCE_TYPE = "Upload files/folder"
 MAX_PERSISTED_CHAT_MESSAGES = 100
 UI_TOGGLE_GATES = {
     "ALLOW_HF_FETCH": {"label": "Allow Hugging Face fetch", "default": False},
@@ -1152,9 +1152,12 @@ def _clear_chroma_system_cache() -> None:
         pass
 
 
-def clear_source_cache(clear_raw: bool = True) -> None:
+def clear_source_cache(clear_raw: bool = True, clear_prepared: bool = True) -> None:
     _clear_chroma_artifacts()
-    for path in [CURRENT_SOURCE_PATH, PREPARED_SOURCE_PATH, QUERY_LOG_PATH, CHAT_HISTORY_DB_PATH]:
+    paths = [CURRENT_SOURCE_PATH, QUERY_LOG_PATH, CHAT_HISTORY_DB_PATH]
+    if clear_prepared:
+        paths.append(PREPARED_SOURCE_PATH)
+    for path in paths:
         _remove_path(path)
     clear_eval_artifacts()
     if clear_raw:
@@ -1791,9 +1794,9 @@ def _prepared_source_type(source_type: str) -> str:
         return "huggingface"
     if source_type == "GitHub repo":
         return "github"
-    if source_type == "Upload files":
+    if source_type == DEFAULT_SOURCE_TYPE:
         return "upload"
-    return "local"
+    return "upload"
 
 
 def _render_prepared_files(st, prepared: list[Path]) -> None:
@@ -2229,7 +2232,7 @@ def _render_sources_tab(st) -> None:
 
     source_type = st.radio(
         "Source type",
-        [DEFAULT_SOURCE_TYPE, "Local directory", "GitHub repo", "HuggingFace model/dataset"],
+        [DEFAULT_SOURCE_TYPE, "GitHub repo", "HuggingFace model/dataset"],
         key=SOURCE_TYPE_KEY,
     )
 
@@ -2239,16 +2242,16 @@ def _render_sources_tab(st) -> None:
     if source_type == DEFAULT_SOURCE_TYPE:
         from source_loader import SOURCE_EXTENSIONS
 
-        allowed_types = sorted(ext.lstrip(".") for ext in SOURCE_EXTENSIONS)
+        allowed_types = sorted([*(ext.lstrip(".") for ext in SOURCE_EXTENSIONS), "zip"])
         uploaded_files = st.file_uploader(
-            "Upload source files",
+            "Upload source files or folder",
             type=allowed_types,
-            accept_multiple_files=True,
-            help="Use this for public deployments. Browser uploads are copied into the app session before indexing.",
+            accept_multiple_files="directory",
+            help=(
+                "Use this for public deployments. Upload individual files, a project folder, "
+                "or a .zip archive; supported files are copied into the app session before indexing."
+            ),
         )
-    elif source_type == "Local directory":
-        st.caption("Local paths only work when Streamlit runs on the same machine as the files. Use uploads for public deployments.")
-        source_text = st.text_input("Local path", placeholder="C:\\path\\to\\project")
     elif source_type == "GitHub repo":
         source_text = st.text_input("GitHub URL", placeholder="https://github.com/user/repo")
     else:
@@ -2284,18 +2287,11 @@ def _render_sources_tab(st) -> None:
                         allow_github_fetch=allow_github_fetch,
                         clear_existing=True,
                     )
-                else:
-                    prepared = prepare_sources_for_app(
-                        sources,
-                        allow_github_fetch=False,
-                        allow_huggingface_fetch=False,
-                        clear_existing=True,
-                    )
             except Exception as exc:
                 st.error(str(exc))
                 return
             if prepared:
-                clear_source_cache(clear_raw=False)
+                clear_source_cache(clear_raw=False, clear_prepared=False)
                 reset_session_source_state(st)
                 st.success(f"Prepared {len(prepared)} files under data/raw.")
                 source_input = sources[0] if sources else f"uploaded:{', '.join(str(getattr(file, 'name', 'file')) for file in uploaded_files)}"

@@ -5,7 +5,7 @@ llama-index-readers-file==0.6.0
 chromadb>=0.5.17
 rank-bm25==0.2.2
 sentence-transformers==3.2.1
-streamlit==1.39.0
+streamlit==1.54.0
 pandas==2.3.3
 matplotlib==3.10.9
 PyPDF2==3.0.1

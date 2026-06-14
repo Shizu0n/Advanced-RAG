@@ -52,6 +52,7 @@ SOURCE_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
+UPLOAD_ARCHIVE_EXTENSIONS = {".zip"}
 SOURCE_FILENAMES = {"Dockerfile", "Makefile", "Procfile"}
 IGNORED_FILE_NAMES = {
     "Cargo.lock",
@@ -189,13 +190,35 @@ def _copy_source_tree(source_dir: Path, raw_dir: Path, target_name: str) -> list
     return sorted(copied_files)
 
 
-def _uploaded_file_name(uploaded: object) -> str:
+def _uploaded_relative_path(uploaded: object) -> Path:
     raw_name = str(getattr(uploaded, "name", "uploaded-file")).replace("\\", "/")
-    name = Path(raw_name).name
-    path = Path(name)
-    stem = _slug(path.stem)
-    suffix = path.suffix
-    return f"{stem}{suffix}" if suffix else stem
+    if raw_name.startswith("/") or re.match(r"^[A-Za-z]:", raw_name):
+        raise RuntimeError(f"Refusing unsafe uploaded path: {raw_name}")
+
+    parts: list[str] = []
+    for part in raw_name.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise RuntimeError(f"Refusing unsafe uploaded path: {raw_name}")
+        safe_part = _slug(part)
+        if safe_part:
+            parts.append(safe_part)
+    if not parts:
+        raise ValueError("Uploaded file is missing a usable filename.")
+    return Path(*parts)
+
+
+def _uploaded_path_supported(path: Path) -> bool:
+    return (
+        path.name not in IGNORED_FILE_NAMES
+        and not any(part in IGNORED_DIR_NAMES for part in path.parts[:-1])
+        and (path.suffix.lower() in SOURCE_EXTENSIONS or path.name in SOURCE_FILENAMES)
+    )
+
+
+def _uploaded_path_ignored(path: Path) -> bool:
+    return path.name in IGNORED_FILE_NAMES or any(part in IGNORED_DIR_NAMES for part in path.parts[:-1])
 
 
 def _uploaded_file_bytes(uploaded: object) -> bytes:
@@ -224,29 +247,52 @@ def prepare_uploaded_files(
         raw_dir.mkdir(parents=True, exist_ok=True)
 
     target_root = raw_dir / "uploaded-files"
+    resolved_target_root = target_root.resolve(strict=False)
     target_root.mkdir(parents=True, exist_ok=True)
     copied_files: list[Path] = []
     for uploaded in uploaded_files:
-        safe_name = _uploaded_file_name(uploaded)
-        target_file = target_root / safe_name
-        if not (target_file.suffix.lower() in SOURCE_EXTENSIONS or target_file.name in SOURCE_FILENAMES):
-            raise ValueError(f"Unsupported uploaded file: {safe_name}")
+        relative_path = _uploaded_relative_path(uploaded)
+        if _uploaded_path_ignored(relative_path):
+            continue
         data = _uploaded_file_bytes(uploaded)
+
+        if relative_path.suffix.lower() in UPLOAD_ARCHIVE_EXTENSIONS:
+            with tempfile.NamedTemporaryFile(suffix=relative_path.suffix, delete=False) as tmp:
+                tmp.write(data)
+                tmp_path = Path(tmp.name)
+            try:
+                extracted_root = _extract_supported_zip(tmp_path, target_root)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+            copied_files.extend(_iter_source_files(extracted_root))
+            continue
+
+        if not _uploaded_path_supported(relative_path):
+            continue
+
+        target_file = target_root / relative_path
+        resolved_target_file = target_file.resolve(strict=False)
+        if not _is_relative_to(resolved_target_file, resolved_target_root):
+            raise RuntimeError(f"Refusing unsafe uploaded path: {relative_path.as_posix()}")
         if target_file.exists() and target_file.read_bytes() != data:
             raise FileExistsError(f"Refusing to overwrite conflicting uploaded source: {target_file}")
+        target_file.parent.mkdir(parents=True, exist_ok=True)
         target_file.write_bytes(data)
         copied_files.append(target_file)
 
-    if copied_files:
-        source_names = ", ".join(path.name for path in copied_files)
-        _register_prepared_files(
-            sorted(copied_files),
-            source_input=f"uploaded:{source_names}",
-            source_type="upload",
-            source_slug="uploaded-files",
-            prepared_source_path=prepared_source_path,
-        )
-    return sorted(copied_files)
+    copied_files = sorted(set(copied_files))
+    if not copied_files:
+        raise ValueError("No supported uploaded source files were provided.")
+
+    source_names = ", ".join(path.relative_to(target_root).as_posix() for path in copied_files)
+    _register_prepared_files(
+        copied_files,
+        source_input=f"uploaded:{source_names}",
+        source_type="upload",
+        source_slug="uploaded-files",
+        prepared_source_path=prepared_source_path,
+    )
+    return copied_files
 
 
 def _download_limited(url: str, target: Path, max_bytes: int) -> None:

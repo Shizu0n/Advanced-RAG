@@ -108,7 +108,7 @@ class FakeStreamlit:
             value = self._radio_value if self._radio_value is not None else options[index]
             if key:
                 self.session_state[key] = value
-        self.events.append(("radio", label, value))
+        self.events.append(("radio", label, value, list(options)))
         return value
 
     def text_input(self, label, placeholder="", **kwargs):
@@ -1818,11 +1818,12 @@ class SourcesTabTests(unittest.TestCase):
         radio_events = [event for event in fake_st.events if event[0] == "radio"]
         self.assertEqual(len(radio_events), 1)
         self.assertEqual(radio_events[0][1], "Source type")
-        self.assertEqual(radio_events[0][2], "Upload files")
+        self.assertEqual(radio_events[0][2], "Upload files/folder")
+        self.assertEqual(radio_events[0][3], ["Upload files/folder", "GitHub repo", "HuggingFace model/dataset"])
 
     def test_input_field_adapts_to_source_type(self):
         fake_st = FakeStreamlit()
-        fake_st._radio_value = "Local directory"
+        fake_st._radio_value = "GitHub repo"
         with (
             patch("app.prepare_sources_for_app", return_value=[]),
             patch("app._has_raw_source_files", return_value=False),
@@ -1831,8 +1832,8 @@ class SourcesTabTests(unittest.TestCase):
 
         text_inputs = [event for event in fake_st.events if event[0] == "text_input"]
         self.assertEqual(len(text_inputs), 1)
-        self.assertEqual(text_inputs[0][1], "Local path")
-        self.assertIn("path", text_inputs[0][2].lower())
+        self.assertEqual(text_inputs[0][1], "GitHub URL")
+        self.assertIn("github.com", text_inputs[0][2].lower())
 
     def test_upload_files_source_type_uses_file_uploader(self):
         fake_st = FakeStreamlit()
@@ -1844,7 +1845,9 @@ class SourcesTabTests(unittest.TestCase):
 
         upload_events = [event for event in fake_st.events if event[0] == "file_uploader"]
         self.assertEqual(len(upload_events), 1)
-        self.assertEqual(upload_events[0][1], "Upload source files")
+        self.assertEqual(upload_events[0][1], "Upload source files or folder")
+        self.assertEqual(upload_events[0][2]["accept_multiple_files"], "directory")
+        self.assertIn("zip", upload_events[0][2]["type"])
 
     def test_build_index_button_appears_when_source_prepared(self):
         fake_st = FakeStreamlit()
@@ -1940,7 +1943,7 @@ class SourcesTabTests(unittest.TestCase):
         fake_st = FakeStreamlit()
         fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
         fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
-        fake_st._radio_value = "Upload files"
+        fake_st._radio_value = "Upload files/folder"
         fake_st._file_uploader_value = [MagicMock(name="uploaded")]
         prepared = [Path("data/raw/uploaded-files/resume.pdf")]
 
@@ -1956,7 +1959,7 @@ class SourcesTabTests(unittest.TestCase):
                 app._render_sources_tab(fake_st)
 
         prepare_uploads.assert_called_once_with(fake_st._file_uploader_value, clear_existing=True)
-        clear_cache.assert_called_once_with(clear_raw=False)
+        clear_cache.assert_called_once_with(clear_raw=False, clear_prepared=False)
         reset_state.assert_called_once_with(fake_st)
         self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_type"], "upload")
 
@@ -1964,8 +1967,8 @@ class SourcesTabTests(unittest.TestCase):
         fake_st = FakeStreamlit()
         fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
         fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
-        fake_st._radio_value = "Local directory"
-        fake_st._text_input_value = "/tmp/new-project"
+        fake_st._radio_value = "GitHub repo"
+        fake_st._text_input_value = "https://github.com/acme/new-project"
         prepared = [Path("data/raw/new-project/README.md")]
 
         with TemporaryDirectory() as tmpdir:
@@ -1980,12 +1983,11 @@ class SourcesTabTests(unittest.TestCase):
                 app._render_sources_tab(fake_st)
 
         prepare.assert_called_once_with(
-            ["/tmp/new-project"],
+            ["https://github.com/acme/new-project"],
             allow_github_fetch=False,
-            allow_huggingface_fetch=False,
             clear_existing=True,
         )
-        clear_cache.assert_called_once_with(clear_raw=False)
+        clear_cache.assert_called_once_with(clear_raw=False, clear_prepared=False)
         reset_state.assert_called_once_with(fake_st)
         self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_slug"], "new-project")
 
@@ -2013,8 +2015,8 @@ class SourcesTabTests(unittest.TestCase):
         fake_st = FakeStreamlit()
         fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
         fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
-        fake_st._radio_value = "Local directory"
-        fake_st._text_input_value = "/tmp/missing-project"
+        fake_st._radio_value = "GitHub repo"
+        fake_st._text_input_value = "https://github.com/acme/missing-project"
 
         with (
             patch("app.clear_source_cache") as clear_cache,

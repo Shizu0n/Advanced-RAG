@@ -1308,6 +1308,96 @@ def _dedupe_results(results: Sequence[Any]) -> list[Any]:
     return deduped
 
 
+def _query_named_source_refs(query: str, candidate_nodes: Sequence[Any]) -> set[str]:
+    query_key = query.lower().replace("\\", "/")
+    refs: set[str] = set()
+    for node in candidate_nodes:
+        source = _source_doc(node)
+        source_key = source.lower().replace("\\", "/")
+        parts = [part for part in source_key.split("/") if part]
+        if not parts:
+            continue
+        basename = parts[-1]
+        if basename in query_key:
+            refs.add(source)
+            continue
+        for width in range(min(4, len(parts)), 1, -1):
+            suffix = "/".join(parts[-width:])
+            if suffix in query_key:
+                refs.add(source)
+                break
+    return refs
+
+
+def _include_named_file_evidence_results(
+    query: str,
+    results: Sequence[Any],
+    candidate_nodes: Sequence[Any],
+    top_k: int,
+) -> tuple[list[Any], dict[str, Any]]:
+    trace = {
+        "enabled": False,
+        "added_sources": [],
+        "reason": None,
+    }
+    if not candidate_nodes:
+        return list(results), trace
+
+    named_sources = _query_named_source_refs(query, candidate_nodes)
+    if not named_sources:
+        return list(results), trace
+
+    analysis = analyze_query(query)
+    selected = _dedupe_results(results)
+    selected_sources = {_source_doc(item) for item in selected}
+    best_by_source: dict[str, LocalNodeWithScore] = {}
+    for node in candidate_nodes:
+        source = _source_doc(node)
+        if source not in named_sources or source in selected_sources:
+            continue
+        score = (
+            _score_local_node(node, analysis)
+            + _lexical_score(analysis.rewritten_query, _node_text(node))
+            + (1.5 * _lexical_score(analysis.original_query, source))
+            + 2.0
+        )
+        candidate = LocalNodeWithScore(node=getattr(node, "node", node), score=score)
+        if source not in best_by_source or score > (best_by_source[source].score or 0):
+            best_by_source[source] = candidate
+
+    added_sources: list[str] = []
+    for source, candidate in sorted(best_by_source.items(), key=lambda item: (-item[1].score, item[0])):
+        if len(selected) >= top_k:
+            removable_index = next(
+                (
+                    index
+                    for index in range(len(selected) - 1, -1, -1)
+                    if _source_doc(selected[index]) not in named_sources
+                ),
+                len(selected) - 1,
+            )
+            selected.pop(removable_index)
+        selected.append(candidate)
+        added_sources.append(source)
+
+    if added_sources:
+        selected.sort(
+            key=lambda item: (
+                0 if _source_doc(item) in named_sources else 1,
+                -float(_score(item) or 0.0),
+                _source_doc(item),
+            )
+        )
+        trace.update(
+            {
+                "enabled": True,
+                "added_sources": added_sources,
+                "reason": "named_file_evidence",
+            }
+        )
+    return selected, trace
+
+
 def _deepen_code_evidence_results(
     query: str,
     results: Sequence[Any],
@@ -3236,6 +3326,9 @@ class LocalRAGPipeline:
         results, stack_trace = _balance_stack_evidence_results(query, results, self.nodes or [], self.top_k)
         if stack_trace["enabled"]:
             metadata = {**metadata, "stack_evidence": stack_trace}
+        results, named_file_trace = _include_named_file_evidence_results(query, results, self.nodes or [], self.top_k)
+        if named_file_trace["enabled"]:
+            metadata = {**metadata, "named_file_evidence": named_file_trace}
         contexts = [_node_text(result) for result in results]
         logger.info("answer_query: retrieved %d contexts, %d results", len(contexts), len(results))
         sources = self._source_rows(results)
@@ -3307,6 +3400,9 @@ class LocalRAGPipeline:
         results, stack_trace = _balance_stack_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
         if stack_trace["enabled"]:
             metadata = {**metadata, "stack_evidence": stack_trace}
+        results, named_file_trace = _include_named_file_evidence_results(retrieval_query, results, self.nodes or [], self.top_k)
+        if named_file_trace["enabled"]:
+            metadata = {**metadata, "named_file_evidence": named_file_trace}
         contexts = [_node_text(result) for result in results]
         sources = self._source_rows(results)
         citations = _make_citations(results)

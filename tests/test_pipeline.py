@@ -2040,6 +2040,43 @@ npm install.
         self.assertIn("getProfile", result["answer"])
         self.assertIn("referralLink", result["answer"])
 
+    def test_chat_query_includes_files_explicitly_named_in_uploaded_directory_query(self):
+        nodes = [
+            pipeline_module.LocalTextNode(
+                text="Directory codename: Harbor Lantern. Backend framework: FastAPI. Data store: DuckDB.",
+                node_id="readme#0",
+                metadata={"file_name": "uploaded-files/project/README.md"},
+            ),
+            pipeline_module.LocalTextNode(
+                text='def health_check(): return {"status": "ok", "owner": "QA Directory Flow", "acceptance_phrase": "folder upload preserved relative paths"}',
+                node_id="service#0",
+                metadata={"file_name": "uploaded-files/project/backend/service.py"},
+            ),
+            pipeline_module.LocalTextNode(
+                text='export const productName = "Harbor Lantern"; export const sourceFlow = "directory upload"; export const acceptancePhrase = "folder upload preserved relative paths";',
+                node_id="app#0",
+                metadata={"file_name": "uploaded-files/project/frontend/src/App.tsx"},
+            ),
+        ]
+
+        class ReadmeOnlyRetriever:
+            def ablation_retrieve(self, query, strategy):
+                return [pipeline_module.LocalNodeWithScore(nodes[0], 0.9)], {"strategy": strategy}
+
+        pipeline = LocalRAGPipeline(nodes=nodes, retriever=ReadmeOnlyRetriever(), top_k=3)
+
+        with patch.dict("os.environ", {"ALLOW_CLOUD_CHAT": "0"}, clear=True):
+            result = pipeline.chat_query(
+                "For this uploaded directory, list the facts from README.md, backend/service.py, and frontend/src/App.tsx.",
+                strategy="hybrid_rerank",
+            )
+
+        citation_sources = {citation["source_doc"] for citation in result["citations"]}
+        self.assertIn("uploaded-files/project/README.md", citation_sources)
+        self.assertIn("uploaded-files/project/backend/service.py", citation_sources)
+        self.assertIn("uploaded-files/project/frontend/src/App.tsx", citation_sources)
+        self.assertEqual(result["trace"]["named_file_evidence"]["reason"], "named_file_evidence")
+
     def test_chat_query_followup_can_use_last_user_message_without_assistant_text(self):
         retriever = RecordingRetriever()
         pipeline = LocalRAGPipeline(index=None, nodes=[], retriever=retriever)

@@ -1516,20 +1516,19 @@ def run_embedding_comparison_inline() -> list[dict[str, Any]]:
     )
 
 
-def _run_with_timeout(fn, timeout_seconds: float) -> bool:
+def _run_with_timeout(fn, timeout_seconds: float) -> tuple[bool, Any | None]:
     import concurrent.futures as _cf
 
     if timeout_seconds <= 0:
-        return False
+        return False, None
 
     _pool = _cf.ThreadPoolExecutor(max_workers=1)
     _future = _pool.submit(fn)
     try:
-        _future.result(timeout=timeout_seconds)
-        return True
+        return True, _future.result(timeout=timeout_seconds)
     except _cf.TimeoutError:
         _future.cancel()
-        return False
+        return False, None
     finally:
         _pool.shutdown(wait=False, cancel_futures=True)
 
@@ -1885,6 +1884,26 @@ def _show_no_raw_files_error(st) -> None:
 
 def _show_eval_success(st) -> None:
     st.success("Evaluation complete. Refreshing...")
+
+
+def _set_eval_aux_status(st, key: str, message: str, level: str = "info") -> None:
+    st.session_state[key] = {"message": message, "level": level}
+
+
+def _show_eval_aux_status(st, key: str) -> None:
+    status = st.session_state.get(key)
+    if not isinstance(status, dict):
+        return
+    message = str(status.get("message", "")).strip()
+    if not message:
+        return
+    level = status.get("level", "info")
+    if level == "error":
+        st.error(message)
+    elif level == "success":
+        st.success(message)
+    else:
+        st.info(message)
 
 
 def _show_build_success(st, nodes: list, slug: str) -> None:
@@ -2822,7 +2841,7 @@ def _render_eval_tab(st) -> None:
                                 os.environ[name] = value
 
                 try:
-                    completed = _run_with_timeout(_run_cloud_ragas, cloud_ragas_timeout_seconds)
+                    completed, _ = _run_with_timeout(_run_cloud_ragas, cloud_ragas_timeout_seconds)
                     if completed:
                         _show_eval_success(st)
                         st.rerun()
@@ -2839,15 +2858,33 @@ def _render_eval_tab(st) -> None:
         if not _eval_should_allow_run(st):
             _render_eval_run_blocked(st)
         else:
-            with st.spinner("Running chunk-size ablation..."):
+            timeout_seconds = float(os.getenv("CHUNKING_ABLATION_TIMEOUT_SECONDS", "60"))
+            with st.spinner(f"Running chunk-size ablation (timeout: {timeout_seconds:g}s)..."):
                 try:
-                    rows = _with_session_gate_env(
-                        st,
-                        ["ALLOW_DOCS_DOWNLOAD"],
-                        run_chunking_ablation_inline,
+                    completed, rows = _run_with_timeout(
+                        lambda: _with_session_gate_env(
+                            st,
+                            ["ALLOW_DOCS_DOWNLOAD"],
+                            run_chunking_ablation_inline,
+                        ),
+                        timeout_seconds,
                     )
-                    st.success(f"Chunking ablation completed for {len(rows)} chunk sizes.")
-                    st.rerun()
+                    if completed:
+                        rows = list(rows or [])
+                        _set_eval_aux_status(
+                            st,
+                            "chunking_ablation_status",
+                            f"Chunking ablation completed for {len(rows)} chunk sizes.",
+                            "success",
+                        )
+                        st.rerun()
+                    else:
+                        message = (
+                            f"Chunking ablation timed out after {timeout_seconds:g}s. "
+                            "Try again with a smaller uploaded source or increase CHUNKING_ABLATION_TIMEOUT_SECONDS."
+                        )
+                        _set_eval_aux_status(st, "chunking_ablation_status", message, "error")
+                        st.error(message)
                 except Exception as exc:
                     _show_eval_failure(st, exc)
 
@@ -2855,17 +2892,40 @@ def _render_eval_tab(st) -> None:
         if not _eval_should_allow_run(st):
             _render_eval_run_blocked(st)
         else:
-            with st.spinner("Running embedding model comparison..."):
+            timeout_seconds = float(os.getenv("EMBEDDING_COMPARISON_TIMEOUT_SECONDS", "60"))
+            with st.spinner(f"Running embedding model comparison (timeout: {timeout_seconds:g}s)..."):
                 try:
-                    rows = _with_session_gate_env(
-                        st,
-                        ["ALLOW_DOCS_DOWNLOAD", "ALLOW_MODEL_DOWNLOADS"],
-                        run_embedding_comparison_inline,
+                    completed, rows = _run_with_timeout(
+                        lambda: _with_session_gate_env(
+                            st,
+                            ["ALLOW_DOCS_DOWNLOAD", "ALLOW_MODEL_DOWNLOADS"],
+                            run_embedding_comparison_inline,
+                        ),
+                        timeout_seconds,
                     )
-                    st.success(f"Embedding comparison completed for {len(rows)} models.")
-                    st.rerun()
+                    if completed:
+                        rows = list(rows or [])
+                        skipped = sum(1 for row in rows if str(row.get("status", "")).startswith("skipped"))
+                        suffix = f" ({skipped} skipped by gates)." if skipped else "."
+                        _set_eval_aux_status(
+                            st,
+                            "embedding_comparison_status",
+                            f"Embedding comparison completed for {len(rows)} models{suffix}",
+                            "success",
+                        )
+                        st.rerun()
+                    else:
+                        message = (
+                            f"Embedding comparison timed out after {timeout_seconds:g}s. "
+                            "Keep Allow model downloads off for a fast skipped-status table, or increase EMBEDDING_COMPARISON_TIMEOUT_SECONDS."
+                        )
+                        _set_eval_aux_status(st, "embedding_comparison_status", message, "error")
+                        st.error(message)
                 except Exception as exc:
                     _show_eval_failure(st, exc)
+
+    _show_eval_aux_status(st, "chunking_ablation_status")
+    _show_eval_aux_status(st, "embedding_comparison_status")
 
     st.subheader("Evaluation summary")
     display_metrics = cards.get("display_metrics", {metric: metric for metric in METRICS})

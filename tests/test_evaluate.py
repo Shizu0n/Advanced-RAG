@@ -307,6 +307,31 @@ class GoldenDatasetTests(unittest.TestCase):
         self.assertEqual(filtered[0]["source_doc"], "b")
         self.assertEqual(filtered[1]["source_doc"], "c")
 
+    def test_filter_removes_reference_questions_built_from_local_path_tokens(self):
+        candidates = [
+            {
+                "question": "What does the reference context explain about Source Users Paulo Shizuo?",
+                "ground_truth": "The backend exposes a FastAPI health check.",
+                "reference_context": "The backend exposes a FastAPI health check.",
+                "source_doc": "backend/service.py",
+            },
+            {
+                "question": "What setup, architecture, or usage guidance is documented in data/raw/uploaded-files/project/README.md?",
+                "ground_truth": "The README documents the project stack.",
+                "reference_context": "The README documents the project stack.",
+                "source_doc": "data/raw/uploaded-files/project/README.md",
+            },
+        ]
+
+        filtered = evaluation.filter_best_golden_items(candidates, limit=2)
+
+        questions = [item["question"] for item in filtered]
+        self.assertNotIn("What does the reference context explain about Source Users Paulo Shizuo?", questions)
+        self.assertIn(
+            "What setup, architecture, or usage guidance is documented in data/raw/uploaded-files/project/README.md?",
+            questions,
+        )
+
     def test_run_evaluation_rejects_empty_golden_dataset(self):
         with TemporaryDirectory() as tmpdir:
             golden_path = Path(tmpdir) / "golden_dataset.json"
@@ -450,6 +475,8 @@ class GoldenDatasetTests(unittest.TestCase):
             RuntimeError("MAX_CLOUD_CALLS exceeded"),
             RuntimeError("cloud providers unavailable"),
             RuntimeError("Gemini embedding models unavailable"),
+            RuntimeError("No module named 'langchain_community.chat_models.vertexai'"),
+            ModuleNotFoundError("No module named 'langchain_community.chat_models.vertexai'"),
         ]
 
         for error in recoverable:
@@ -467,6 +494,37 @@ class GoldenDatasetTests(unittest.TestCase):
                 patch.object(evaluation.cloud_ragas, "run_ragas", side_effect=error),
             ):
                 self.assertIsNone(evaluation.maybe_run_real_ragas(rows, cloud_client=object()))
+
+    def test_cloud_runtime_import_error_records_fallback_status(self):
+        rows = [
+            {
+                "question": "What is Python?",
+                "answer": "Python is a language.",
+                "contexts": '["Python is a language."]',
+                "ground_truth": "Python is a language.",
+            }
+        ]
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "USE_CLOUD_FREE_TIER_RAGAS": "1",
+                    "ALLOW_CLOUD_FREE_TIER": "1",
+                    "GEMINI_API_KEY": "key",
+                },
+                clear=True,
+            ),
+            patch.object(
+                evaluation.cloud_ragas,
+                "run_ragas",
+                side_effect=RuntimeError("No module named 'langchain_community.chat_models.vertexai'"),
+            ),
+        ):
+            scores, cloud_error = evaluation.maybe_run_real_ragas_with_status(rows, cloud_client=object())
+
+        self.assertIsNone(scores)
+        self.assertIn("langchain_community.chat_models.vertexai", cloud_error)
 
         with (
             patch.dict(

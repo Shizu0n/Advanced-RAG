@@ -973,6 +973,15 @@ NOISY_QUESTION_TERMS = {
     "what fields exist",
 }
 
+PATH_ARTIFACT_QUESTION_TERMS = {
+    "source users",
+    "users paulo",
+    "paulo shizuo",
+    "documents projects",
+    "advanced-rag data raw",
+    "data raw uploaded files",
+}
+
 
 def _template_golden_item_for_node(node: Any) -> dict[str, str] | None:
     source_doc = _source_doc(node)
@@ -1006,6 +1015,10 @@ def _is_noisy_golden_question(item: dict[str, str]) -> bool:
     normalized = question.lower()
     compact = re.sub(r"[^a-z0-9]+", "", normalized)
     if any(term.replace(" ", "") in compact for term in NOISY_QUESTION_TERMS):
+        return True
+    if "reference context" in normalized and any(
+        term.replace(" ", "") in compact for term in PATH_ARTIFACT_QUESTION_TERMS
+    ):
         return True
     if "reference context" in normalized and any(term in normalized for term in (" import ", " schema ", " transform")):
         return True
@@ -1230,6 +1243,18 @@ def _strict_cloud_ragas_enabled() -> bool:
     return os.getenv("CLOUD_RAGAS_STRICT") == "1"
 
 
+def _is_recoverable_cloud_runtime_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return (
+        isinstance(exc, (ImportError, ModuleNotFoundError))
+        or "MAX_CLOUD_CALLS" in message
+        or "cloud providers unavailable" in message
+        or "Gemini embedding models unavailable" in message
+        or "No module named" in message
+        or "langchain_community" in message
+    )
+
+
 def _max_real_ragas_rows() -> int:
     raw_value = os.getenv("MAX_REAL_RAGAS_ROWS", "3")
     try:
@@ -1264,11 +1289,10 @@ def maybe_run_real_ragas(
         if _strict_cloud_ragas_enabled():
             raise
         return None
-    except RuntimeError as exc:
+    except (RuntimeError, ImportError, ModuleNotFoundError) as exc:
         if _strict_cloud_ragas_enabled():
             raise
-        message = str(exc)
-        if "MAX_CLOUD_CALLS" in message or "cloud providers unavailable" in message or "Gemini embedding models unavailable" in message:
+        if _is_recoverable_cloud_runtime_error(exc):
             return None
         raise
 
@@ -1302,12 +1326,11 @@ def maybe_run_real_ragas_with_status(
         if _strict_cloud_ragas_enabled():
             raise
         return None, f"{type(exc).__name__}: {exc}"
-    except RuntimeError as exc:
+    except (RuntimeError, ImportError, ModuleNotFoundError) as exc:
         if _strict_cloud_ragas_enabled():
             raise
-        message = str(exc)
-        if "MAX_CLOUD_CALLS" in message or "cloud providers unavailable" in message or "Gemini embedding models unavailable" in message:
-            return None, message
+        if _is_recoverable_cloud_runtime_error(exc):
+            return None, f"{type(exc).__name__}: {exc}"
         raise
 
 

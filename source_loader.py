@@ -221,6 +221,22 @@ def _uploaded_path_ignored(path: Path) -> bool:
     return path.name in IGNORED_FILE_NAMES or any(part in IGNORED_DIR_NAMES for part in path.parts[:-1])
 
 
+def accepted_uploaded_source_names(uploaded_files: list[object] | tuple[object, ...]) -> list[str]:
+    """Return upload paths that the app will accept for source preparation."""
+
+    accepted: list[str] = []
+    for uploaded in uploaded_files:
+        try:
+            relative_path = _uploaded_relative_path(uploaded)
+        except (RuntimeError, ValueError):
+            continue
+        if _uploaded_path_ignored(relative_path):
+            continue
+        if relative_path.suffix.lower() in UPLOAD_ARCHIVE_EXTENSIONS or _uploaded_path_supported(relative_path):
+            accepted.append(relative_path.as_posix())
+    return sorted(set(accepted))
+
+
 def _uploaded_file_bytes(uploaded: object) -> bytes:
     if hasattr(uploaded, "getbuffer"):
         return bytes(uploaded.getbuffer())

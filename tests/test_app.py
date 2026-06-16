@@ -81,12 +81,14 @@ class FakeSidebar:
 
 
 class FakeStreamlit:
+    __version__ = "1.54.0"
     _radio_value: str | None = None
     _text_input_value: str = ""
     _text_area_value: str = ""
     _checkbox_value: bool = False
     _button_return: bool = False
     _file_uploader_value = []
+    _file_uploader_values_by_label = {}
 
     def __init__(self, prompt=None, messages=None):
         self.session_state = {}
@@ -96,6 +98,7 @@ class FakeStreamlit:
         self.events = []
         self.sidebar = FakeSidebar(self)
         self._file_uploader_value = []
+        self._file_uploader_values_by_label = {}
 
     def selectbox(self, label, options, index=0, **kwargs):
         self.events.append(("selectbox", label, options[index]))
@@ -117,7 +120,12 @@ class FakeStreamlit:
 
     def file_uploader(self, label, **kwargs):
         self.events.append(("file_uploader", label, kwargs))
+        if label in self._file_uploader_values_by_label:
+            return self._file_uploader_values_by_label[label]
         return self._file_uploader_value
+
+    def markdown(self, value, **kwargs):
+        self.events.append(("markdown", value, kwargs))
 
     def text_area(self, label, placeholder=""):
         self.events.append(("text_area", label))
@@ -127,7 +135,7 @@ class FakeStreamlit:
         self.events.append(("checkbox", label))
         return self._checkbox_value if self._checkbox_value is not None else value
 
-    def chat_input(self, label):
+    def chat_input(self, label, **kwargs):
         self.events.append(("chat_input", label))
         return self.prompt
 
@@ -144,7 +152,8 @@ class FakeStreamlit:
         return FakeContext(lambda: self.events.append(("expander", label, expanded)))
 
     def dataframe(self, value, use_container_width=False):
-        self.events.append(("dataframe", list(value.columns), use_container_width))
+        records = value.to_dict("records") if hasattr(value, "to_dict") else []
+        self.events.append(("dataframe", list(value.columns), use_container_width, records))
 
     def json(self, value):
         self.events.append(("json", value))
@@ -161,7 +170,7 @@ class FakeStreamlit:
     def success(self, value):
         self.events.append(("success", value))
 
-    def button(self, label):
+    def button(self, label, **kwargs):
         self.events.append(("button", label))
         return self._button_return if hasattr(self, "_button_return") else False
 
@@ -181,7 +190,7 @@ class FakeStreamlit:
     def subheader(self, value):
         self.events.append(("subheader", value))
 
-    def slider(self, label, min_value=0.0, max_value=1.0, value=0.5, step=0.05):
+    def slider(self, label, min_value=0.0, max_value=1.0, value=0.5, step=0.05, **kwargs):
         self.events.append(("slider", label))
         return value
 
@@ -227,6 +236,20 @@ class AppHelperTests(unittest.TestCase):
         result = app._with_session_gate_env(fake_st, ["ALLOW_CLOUD_CHAT"], capture)
         self.assertEqual(result, "ok")
         self.assertEqual(observed["value"], "0")
+
+    def test_streamlit_directory_upload_support_falls_back_to_installed_version(self):
+        class FakeStreamlitWithoutVersion:
+            pass
+
+        with patch("app.importlib.metadata.version", return_value="1.54.0"):
+            self.assertTrue(app._streamlit_supports_directory_upload(FakeStreamlitWithoutVersion()))
+
+    def test_streamlit_directory_upload_support_prefers_newer_installed_metadata(self):
+        class FakeStreamlitWithStaleVersion:
+            __version__ = "1.39.0"
+
+        with patch("app.importlib.metadata.version", return_value="1.54.0"):
+            self.assertTrue(app._streamlit_supports_directory_upload(FakeStreamlitWithStaleVersion()))
 
     def test_load_eval_summary_reads_expected_metric_columns(self):
         with TemporaryDirectory() as tmpdir:
@@ -1835,7 +1858,7 @@ class SourcesTabTests(unittest.TestCase):
         self.assertEqual(text_inputs[0][1], "GitHub URL")
         self.assertIn("github.com", text_inputs[0][2].lower())
 
-    def test_upload_files_source_type_uses_file_uploader(self):
+    def test_upload_files_source_type_uses_file_and_folder_uploaders(self):
         fake_st = FakeStreamlit()
         with (
             patch("app.prepare_sources_for_app", return_value=[]),
@@ -1844,10 +1867,58 @@ class SourcesTabTests(unittest.TestCase):
             app._render_sources_tab(fake_st)
 
         upload_events = [event for event in fake_st.events if event[0] == "file_uploader"]
-        self.assertEqual(len(upload_events), 1)
-        self.assertEqual(upload_events[0][1], "Upload source files or folder")
-        self.assertEqual(upload_events[0][2]["accept_multiple_files"], "directory")
+        self.assertEqual(len(upload_events), 2)
+        self.assertEqual(upload_events[0][1], "Upload source files")
+        self.assertEqual(upload_events[0][2]["accept_multiple_files"], True)
+        self.assertEqual(upload_events[1][1], "Upload source folder")
+        self.assertEqual(upload_events[1][2]["accept_multiple_files"], "directory")
         self.assertIn("zip", upload_events[0][2]["type"])
+        self.assertIn("zip", upload_events[1][2]["type"])
+        markdown_events = [event for event in fake_st.events if event[0] == "markdown"]
+        self.assertTrue(any("stFileUploaderFile" in event[1] for event in markdown_events))
+
+    def test_upload_folder_control_is_hidden_on_old_streamlit_versions(self):
+        fake_st = FakeStreamlit()
+        fake_st.__version__ = "1.39.0"
+        with (
+            patch("app.importlib.metadata.version", return_value="1.39.0"),
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=False),
+        ):
+            app._render_sources_tab(fake_st)
+
+        upload_events = [event for event in fake_st.events if event[0] == "file_uploader"]
+        self.assertEqual(len(upload_events), 1)
+        self.assertEqual(upload_events[0][1], "Upload source files")
+        self.assertEqual(upload_events[0][2]["accept_multiple_files"], True)
+        warnings = [event[1] for event in fake_st.events if event[0] == "warning"]
+        self.assertTrue(any("Streamlit 1.54" in warning for warning in warnings))
+        self.assertTrue(any("python" in warning.lower() for warning in warnings))
+
+    def test_upload_preview_shows_only_supported_uploaded_paths(self):
+        fake_st = FakeStreamlit()
+        allowed = MagicMock()
+        allowed.name = "Project/src/App.tsx"
+        ignored = MagicMock()
+        ignored.name = "Project/.git/config"
+        unsupported = MagicMock()
+        unsupported.name = "Project/assets/logo.png"
+        fake_st._file_uploader_values_by_label = {
+            "Upload source folder": [allowed, ignored, unsupported],
+        }
+
+        with (
+            patch("app.prepare_sources_for_app", return_value=[]),
+            patch("app._has_raw_source_files", return_value=False),
+        ):
+            app._render_sources_tab(fake_st)
+
+        captions = [event[1] for event in fake_st.events if event[0] == "caption"]
+        self.assertTrue(any("1 supported" in caption for caption in captions))
+        dataframes = [event for event in fake_st.events if event[0] == "dataframe"]
+        self.assertTrue(dataframes)
+        preview_files = [record["file"] for record in dataframes[-1][3]]
+        self.assertEqual(preview_files, ["Project/src/App.tsx"])
 
     def test_build_index_button_appears_when_source_prepared(self):
         fake_st = FakeStreamlit()
@@ -1944,7 +2015,9 @@ class SourcesTabTests(unittest.TestCase):
         fake_st._button_return_by_label = {"Prepare sources": True, "Clear active source cache": False, "Build Index": False}
         fake_st.button = lambda label: fake_st._button_return_by_label.get(label, False)
         fake_st._radio_value = "Upload files/folder"
-        fake_st._file_uploader_value = [MagicMock(name="uploaded")]
+        uploaded = MagicMock()
+        uploaded.name = "resume.md"
+        fake_st._file_uploader_values_by_label = {"Upload source files": [uploaded]}
         prepared = [Path("data/raw/uploaded-files/resume.pdf")]
 
         with TemporaryDirectory() as tmpdir:
@@ -1958,7 +2031,7 @@ class SourcesTabTests(unittest.TestCase):
             ):
                 app._render_sources_tab(fake_st)
 
-        prepare_uploads.assert_called_once_with(fake_st._file_uploader_value, clear_existing=True)
+        prepare_uploads.assert_called_once_with([uploaded], clear_existing=True)
         clear_cache.assert_called_once_with(clear_raw=False, clear_prepared=False)
         reset_state.assert_called_once_with(fake_st)
         self.assertEqual(fake_st.session_state[app.PREPARED_SOURCE_KEY]["source_type"], "upload")

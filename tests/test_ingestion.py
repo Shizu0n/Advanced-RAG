@@ -131,7 +131,7 @@ class IngestionTests(unittest.TestCase):
 
     def test_embedding_model_comparison_embeds_sample_when_allowed(self):
         class FakeEmbedding:
-            def __init__(self, model_name):
+            def __init__(self, model_name, **kwargs):
                 self.model_name = model_name
 
             def get_text_embedding_batch(self, samples):
@@ -155,6 +155,40 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(rows[0]["model"], "model-a")
         self.assertEqual(rows[0]["sample_count"], 1)
         self.assertEqual(rows[0]["embedding_dim"], 3)
+
+    def test_huggingface_embedding_helper_forces_cpu_and_reuses_model(self):
+        created = []
+
+        class FakeEmbedding:
+            def __init__(self, model_name, **kwargs):
+                self.model_name = model_name
+                self.kwargs = kwargs
+                created.append(self)
+
+        ingestion.clear_embedding_model_cache()
+        try:
+            with patch.object(ingestion, "HuggingFaceEmbedding", FakeEmbedding):
+                first = ingestion.get_huggingface_embedding("model-a")
+                second = ingestion.get_huggingface_embedding("model-a")
+        finally:
+            ingestion.clear_embedding_model_cache()
+
+        self.assertIs(first, second)
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].kwargs["device"], "cpu")
+
+    def test_huggingface_embedding_helper_surfaces_meta_tensor_hint(self):
+        class FakeEmbedding:
+            def __init__(self, model_name, **kwargs):
+                raise NotImplementedError("Cannot copy out of meta tensor; no data!")
+
+        ingestion.clear_embedding_model_cache()
+        try:
+            with patch.object(ingestion, "HuggingFaceEmbedding", FakeEmbedding):
+                with self.assertRaisesRegex(RuntimeError, "meta tensor"):
+                    ingestion.get_huggingface_embedding("model-a")
+        finally:
+            ingestion.clear_embedding_model_cache()
 
     def test_load_or_download_sources_requires_network_opt_in_when_raw_empty(self):
         with TemporaryDirectory() as tmpdir:

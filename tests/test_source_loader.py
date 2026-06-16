@@ -97,6 +97,23 @@ class SourceLoaderTests(unittest.TestCase):
             self.assertIn("ReferralSystem/backend/package.json", prepared["source_input"])
             self.assertNotIn("node_modules", prepared["source_input"])
 
+    def test_accepted_uploaded_source_names_filters_ignored_and_unsupported_paths(self):
+        class Uploaded:
+            def __init__(self, name: str):
+                self.name = name
+
+        names = source_loader.accepted_uploaded_source_names(
+            [
+                Uploaded("ReferralSystem/README.md"),
+                Uploaded("ReferralSystem/.git/config"),
+                Uploaded("ReferralSystem/node_modules/pkg/index.js"),
+                Uploaded("ReferralSystem/assets/logo.png"),
+                Uploaded("ReferralSystem.zip"),
+            ]
+        )
+
+        self.assertEqual(names, ["ReferralSystem.zip", "ReferralSystem/README.md"])
+
     def test_prepare_uploaded_zip_extracts_supported_project_files(self):
         class Uploaded:
             name = "ReferralSystem.zip"

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import logging
 import os
 import shutil
 import sqlite3
+import sys
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Iterable, cast
@@ -148,10 +150,17 @@ def _inject_app_chrome(st) -> None:
 
         [data-testid="stHeader"] {
             background: transparent;
+            height: 0 !important;
+            min-height: 0 !important;
+            visibility: hidden;
         }
 
         [data-testid="stToolbar"] {
-            right: 1rem;
+            display: none !important;
+            right: 0.65rem;
+            top: 0.25rem;
+            transform: scale(0.86);
+            transform-origin: top right;
         }
 
         .block-container,
@@ -160,69 +169,124 @@ def _inject_app_chrome(st) -> None:
             padding: 1.05rem 1.35rem 8.5rem !important;
         }
 
+        section[data-testid="stSidebar"] {
+            background: var(--rag-bg-soft) !important;
+            border-right: 1px solid var(--rag-border);
+            min-width: 280px !important;
+            max-width: min(520px, 82vw) !important;
+            overflow: auto !important;
+            resize: horizontal;
+        }
+
+        section[data-testid="stSidebar"] > div {
+            min-width: 0 !important;
+            width: 100% !important;
+        }
+
+        section[data-testid="stSidebar"][aria-expanded="false"] {
+            border-right: 0;
+            max-width: 0 !important;
+            min-width: 0 !important;
+            overflow: visible !important;
+            resize: none;
+            transform: none !important;
+            width: 0 !important;
+        }
+
+        section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarContent"] {
+            min-width: 0 !important;
+            overflow: visible !important;
+            width: 0 !important;
+        }
+
+        section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarContent"] > :not([data-testid="stSidebarHeader"]) {
+            display: none !important;
+        }
+
+        section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarHeader"] {
+            min-width: 0 !important;
+            overflow: visible !important;
+            width: 0 !important;
+        }
+
+        section[data-testid="stSidebar"][aria-expanded="false"] [data-testid="stSidebarCollapseButton"] {
+            left: 0.75rem !important;
+            position: fixed !important;
+            top: 0.75rem !important;
+            z-index: 1000 !important;
+        }
+
+        [data-testid="stAppViewContainer"]:has(section[data-testid="stSidebar"][aria-expanded="false"]) .rag-shell-header {
+            padding-left: 3.25rem;
+        }
+
         .rag-shell-header {
             display: flex;
-            align-items: flex-end;
+            align-items: center;
             justify-content: space-between;
-            gap: 1rem;
-            flex-wrap: wrap;
-            padding: 0.35rem 0 1.05rem;
+            gap: 0.55rem;
+            flex-wrap: nowrap;
+            min-height: 1.35rem;
+            padding: 0 0 0.18rem;
             border-bottom: 1px solid var(--rag-border);
-            margin-bottom: 1rem;
+            margin-bottom: 0.25rem;
         }
 
         .rag-title {
             display: flex;
-            flex-direction: column;
-            gap: 0.25rem;
+            align-items: baseline;
+            flex-direction: row;
+            gap: 0.65rem;
+            min-width: 0;
         }
 
-        .rag-title h1 {
+        .rag-title h1,
+        .rag-app-name {
             color: var(--rag-text);
-            font-size: 1.35rem;
+            display: block;
+            font-size: 1rem;
             line-height: 1.2;
             font-weight: 690;
             letter-spacing: 0;
             margin: 0;
+            padding: 0 !important;
+            white-space: nowrap;
         }
 
         .rag-title p {
             color: var(--rag-muted);
-            font-size: 0.86rem;
+            display: none;
+            font-size: 0.76rem;
             margin: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .rag-status-strip {
             display: flex;
             align-items: center;
-            gap: 0.55rem;
+            gap: 0.45rem;
             color: var(--rag-muted);
-            font-size: 0.78rem;
+            font-size: 0.72rem;
             max-width: min(100%, 34rem);
             min-width: 0;
-            white-space: normal;
+            white-space: nowrap;
+        }
+
+        .rag-status-strip span:last-child {
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
         }
 
         .rag-dot {
-            width: 0.55rem;
-            height: 0.55rem;
+            flex: 0 0 auto;
+            width: 0.45rem;
+            height: 0.45rem;
             border-radius: 999px;
             background: var(--rag-accent-2);
             box-shadow: 0 0 0 4px color-mix(in srgb, var(--rag-accent-2) 16%, transparent);
-        }
-
-        [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"] {
-            background: var(--rag-surface);
-            border: 1px solid var(--rag-border);
-            border-radius: 8px;
-            box-shadow: var(--rag-shadow);
-            min-width: 0 !important;
-            padding: 1rem 1rem 1.1rem;
-        }
-
-        [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(2) {
-            background: linear-gradient(180deg, var(--rag-surface-elevated), var(--rag-surface) 34%);
-            min-height: calc(100vh - 12rem);
         }
 
         h2, h3, .stMarkdown h2, .stMarkdown h3 {
@@ -241,7 +305,7 @@ def _inject_app_chrome(st) -> None:
             background: var(--rag-surface-elevated);
             color: var(--rag-text);
             font-weight: 560;
-            min-height: 2.35rem;
+            min-height: 2.75rem;
         }
 
         .stButton > button:hover,
@@ -305,6 +369,7 @@ def _inject_app_chrome(st) -> None:
             background: var(--rag-surface-elevated);
             border-color: var(--rag-border);
             border-radius: 7px;
+            min-height: 2.75rem;
             min-width: 0;
         }
 
@@ -363,48 +428,6 @@ def _inject_app_chrome(st) -> None:
             overflow-wrap: anywhere;
         }
 
-        [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) {
-            align-items: stretch;
-        }
-
-        @media (max-width: 1500px) and (min-width: 901px) {
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) {
-                display: grid !important;
-                grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
-                gap: 1rem !important;
-            }
-
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"] {
-                width: 100% !important;
-                flex: unset !important;
-            }
-
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(1) {
-                grid-column: 1;
-                grid-row: 1 / span 2;
-            }
-
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(2) {
-                grid-column: 2;
-                grid-row: 1;
-                min-height: 20rem;
-            }
-
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(3) {
-                grid-column: 2;
-                grid-row: 2;
-            }
-
-            [data-testid="stChatInput"] {
-                position: sticky;
-                left: auto;
-                right: auto;
-                bottom: 0.75rem;
-                width: 100%;
-                margin-top: 1rem;
-            }
-        }
-
         @media (max-width: 900px) {
             [data-testid="stChatInput"] {
                 position: sticky;
@@ -424,29 +447,6 @@ def _inject_app_chrome(st) -> None:
                 white-space: normal;
             }
 
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) {
-                display: grid !important;
-                grid-template-columns: minmax(0, 1fr);
-                gap: 1rem !important;
-            }
-
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"] {
-                width: 100% !important;
-                flex: unset !important;
-            }
-
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(1) {
-                grid-row: 2;
-            }
-
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(2) {
-                grid-row: 1;
-                min-height: auto;
-            }
-
-            [data-testid="stHorizontalBlock"]:has(> [data-testid="stColumn"]:nth-child(3)) > [data-testid="stColumn"]:nth-child(3) {
-                grid-row: 3;
-            }
         }
 
         @media (max-width: 520px) {
@@ -479,39 +479,75 @@ def _inject_app_chrome(st) -> None:
             height: 100dvh;
             max-height: 100dvh;
             overflow: hidden !important;
-            padding: 0.75rem 1rem !important;
+            padding: 0.35rem 1rem 0.7rem !important;
         }
 
         .rag-shell-header {
             flex: 0 0 auto;
-            padding: 0.2rem 0 0.72rem;
-            margin-bottom: 0.72rem;
+            padding: 0 0 0.16rem;
+            margin-bottom: 0.25rem;
         }
 
         .st-key-source_index_panel,
         .st-key-main_workspace_panel {
             box-sizing: border-box;
-            height: calc(100dvh - 10rem) !important;
-            min-height: calc(100dvh - 10rem) !important;
-            max-height: calc(100dvh - 10rem) !important;
+            height: calc(100dvh - 3.35rem) !important;
+            max-height: calc(100dvh - 3.35rem) !important;
             overflow: hidden !important;
             background: var(--rag-surface);
             border: 1px solid var(--rag-border);
             border-radius: 8px;
             box-shadow: var(--rag-shadow);
-            padding: 0.82rem 0.82rem 0.9rem;
+            padding: 1rem;
             min-width: 0;
+        }
+
+        [data-testid="stLayoutWrapper"]:has(> .st-key-main_workspace_panel) {
+            display: flex !important;
+            height: 100% !important;
+            max-height: 100% !important;
+            min-height: 0 !important;
         }
 
         .st-key-main_workspace_panel {
             display: flex !important;
+            flex: 1 1 auto !important;
             flex-direction: column !important;
+            height: 100% !important;
+            max-height: 100% !important;
+            min-height: 0 !important;
             background: linear-gradient(180deg, var(--rag-surface-elevated), var(--rag-surface) 34%);
         }
 
+        .st-key-main_workspace_panel > [data-testid="stVerticalBlock"] {
+            display: flex !important;
+            flex: 1 1 auto !important;
+            flex-direction: column !important;
+            min-height: 0 !important;
+            height: 100% !important;
+        }
+
+        .st-key-main_workspace_panel > [data-testid="stLayoutWrapper"]:has(.st-key-workspace_page_nav) {
+            flex: 0 0 auto !important;
+        }
+
+        .st-key-main_workspace_panel > [data-testid="stLayoutWrapper"]:has(.st-key-chat_page_content),
+        .st-key-main_workspace_panel > [data-testid="stLayoutWrapper"]:has(.st-key-eval_page_content) {
+            display: flex !important;
+            flex: 1 1 auto !important;
+            min-height: 0 !important;
+            height: auto !important;
+            overflow: hidden !important;
+        }
+
         .st-key-source_index_panel {
+            border: 0;
+            box-shadow: none;
+            height: auto !important;
+            max-height: none !important;
             overflow-y: auto !important;
             overflow-x: hidden !important;
+            padding: 0;
         }
 
         .st-key-source_index_panel [data-testid="stVerticalBlock"],
@@ -538,9 +574,9 @@ def _inject_app_chrome(st) -> None:
         .st-key-eval_page_content {
             flex: 1 1 auto !important;
             box-sizing: border-box;
-            height: calc(100dvh - 14.4rem) !important;
-            min-height: calc(100dvh - 14.4rem) !important;
-            max-height: calc(100dvh - 14.4rem) !important;
+            height: 100% !important;
+            min-height: 0 !important;
+            max-height: 100% !important;
             overflow-y: auto !important;
             overflow-x: hidden !important;
             padding-right: 0.2rem;
@@ -552,18 +588,79 @@ def _inject_app_chrome(st) -> None:
             overflow: hidden !important;
         }
 
-        .st-key-chat_history_panel {
+        .st-key-chat_page_content > [data-testid="stVerticalBlock"],
+        .st-key-chat_shell,
+        .st-key-chat_shell > [data-testid="stVerticalBlock"] {
+            display: flex !important;
+            flex: 1 1 auto !important;
+            flex-direction: column !important;
+            min-height: 0 !important;
+            height: 100% !important;
+        }
+
+        .st-key-chat_page_content [data-testid="stLayoutWrapper"]:has(.st-key-chat_shell) {
+            display: flex !important;
             flex: 1 1 auto !important;
             min-height: 0 !important;
+            height: auto !important;
+            overflow: hidden !important;
+        }
+
+        .st-key-chat_topbar,
+        .st-key-chat_history_panel,
+        .st-key-chat_composer_panel {
+            width: min(100%, 58rem) !important;
+            margin-left: auto !important;
+            margin-right: auto !important;
+        }
+
+        .st-key-chat_topbar {
+            flex: 0 0 auto !important;
+        }
+
+        .st-key-chat_shell [data-testid="stLayoutWrapper"]:has(.st-key-chat_history_panel) {
+            display: flex !important;
+            flex: 1 1 auto !important;
+            min-height: 0 !important;
+            height: auto !important;
+            overflow: hidden !important;
+        }
+
+        .st-key-chat_shell [data-testid="stLayoutWrapper"]:has(.st-key-chat_composer_panel) {
+            display: flex !important;
+            flex: 0 0 auto !important;
+            margin-top: auto !important;
+            min-height: 0 !important;
+            width: 100% !important;
+        }
+
+        .st-key-chat_history_panel {
+            flex: 1 1 auto !important;
+            height: 100% !important;
+            min-height: 12rem !important;
+            max-height: 100% !important;
             overflow-y: auto !important;
             overflow-x: hidden !important;
-            padding: 0.35rem 0.2rem 0.7rem 0;
+            padding: 0.35rem 0.2rem 0.6rem 0;
+        }
+
+        .rag-chat-empty-space {
+            min-height: 100%;
+        }
+
+        .st-key-chat_history_panel > [data-testid="stVerticalBlock"] {
+            min-height: 0 !important;
         }
 
         .st-key-chat_composer_panel {
             flex: 0 0 auto !important;
-            padding-top: 0.55rem;
+            padding-top: 0.3rem;
             border-top: 1px solid var(--rag-border);
+            background: var(--rag-surface);
+            position: sticky;
+            bottom: 0;
+            z-index: 20;
+            padding-bottom: 0.25rem;
         }
 
         [data-testid="stChatInput"] {
@@ -574,17 +671,20 @@ def _inject_app_chrome(st) -> None:
             width: 100% !important;
             max-width: 100% !important;
             margin: 0 !important;
-            padding: 0.3rem !important;
+            min-height: 3rem !important;
+            padding: 0.15rem !important;
         }
 
         [data-testid="stChatInput"] > div {
             align-items: center !important;
+            min-height: 2.55rem !important;
+            padding: 0.35rem 0.6rem !important;
         }
 
         [data-testid="stChatInput"] textarea {
-            min-height: 2.55rem !important;
-            line-height: 1.35rem !important;
-            padding: 0.58rem 3.25rem 0.58rem 0.75rem !important;
+            min-height: 2.05rem !important;
+            line-height: 1.2rem !important;
+            padding: 0.42rem 2.9rem 0.42rem 0.75rem !important;
             resize: none !important;
         }
 
@@ -593,14 +693,14 @@ def _inject_app_chrome(st) -> None:
             bottom: 0 !important;
             display: flex !important;
             height: 100% !important;
-            right: 0.48rem !important;
+            right: 0.42rem !important;
             top: 0 !important;
         }
 
         [data-testid="stChatInput"] [data-testid="stChatInputSubmitButton"] {
-            height: 2.15rem !important;
+            height: 2.05rem !important;
             transform: none !important;
-            width: 2.15rem !important;
+            width: 2.05rem !important;
             align-items: center !important;
             justify-content: center !important;
         }
@@ -614,13 +714,19 @@ def _inject_app_chrome(st) -> None:
         @media (max-width: 900px) {
             .block-container,
             .main .block-container {
-                padding: 0.62rem 0.7rem !important;
+                height: 100dvh !important;
+                min-height: 100dvh !important;
+                max-height: 100dvh !important;
+                overflow-x: hidden !important;
+                overflow-y: hidden !important;
+                padding: 0.62rem 0.7rem 1rem !important;
             }
 
             .rag-shell-header {
-                gap: 0.45rem;
-                padding-bottom: 0.55rem;
-                margin-bottom: 0.55rem;
+                gap: 0.35rem;
+                flex-wrap: wrap;
+                padding-bottom: 0.2rem;
+                margin-bottom: 0.28rem;
             }
 
             .rag-title p,
@@ -636,27 +742,28 @@ def _inject_app_chrome(st) -> None:
             }
 
             .st-key-source_index_panel {
-                max-height: 26dvh !important;
+                max-height: 30dvh !important;
+                overflow-y: auto !important;
             }
 
             .st-key-main_workspace_panel {
-                height: 49dvh !important;
-                min-height: 49dvh !important;
-                max-height: 49dvh !important;
+                height: min(74dvh, 42rem) !important;
+                min-height: min(30rem, calc(100dvh - 1.25rem)) !important;
+                max-height: min(74dvh, 42rem) !important;
             }
 
             .st-key-chat_page_content,
             .st-key-eval_page_content {
-                height: calc(49dvh - 4.3rem) !important;
-                min-height: calc(49dvh - 4.3rem) !important;
-                max-height: calc(49dvh - 4.3rem) !important;
+                height: 100% !important;
+                min-height: 0 !important;
+                max-height: 100% !important;
             }
 
             .st-key-chat_history_panel {
-                flex: 0 1 auto !important;
-                height: max(2.5rem, calc(49dvh - 20rem)) !important;
-                min-height: max(2.5rem, calc(49dvh - 20rem)) !important;
-                max-height: max(2.5rem, calc(49dvh - 20rem)) !important;
+                flex: 1 1 auto !important;
+                height: auto !important;
+                min-height: 10rem !important;
+                max-height: none !important;
             }
 
             .st-key-chat_composer_panel {
@@ -675,7 +782,36 @@ def _inject_app_chrome(st) -> None:
 
             .st-key-source_index_panel,
             .st-key-main_workspace_panel {
-                padding: 0.68rem;
+                padding: 0.85rem;
+            }
+        }
+
+        @media (max-height: 820px) and (min-width: 901px) {
+            .block-container,
+            .main .block-container {
+                padding-top: 0.28rem !important;
+            }
+
+            .rag-shell-header {
+                padding-bottom: 0.14rem;
+                margin-bottom: 0.22rem;
+            }
+
+            .st-key-source_index_panel,
+            .st-key-main_workspace_panel {
+                height: calc(100dvh - 3.35rem) !important;
+                max-height: calc(100dvh - 3.35rem) !important;
+            }
+
+            .st-key-chat_page_content,
+            .st-key-eval_page_content {
+                height: 100% !important;
+                min-height: 0 !important;
+                max-height: 100% !important;
+            }
+
+            .st-key-chat_history_panel {
+                min-height: 12rem !important;
             }
         }
         </style>
@@ -689,7 +825,7 @@ def _render_workbench_header(st) -> None:
         """
         <div class="rag-shell-header">
             <div class="rag-title">
-                <h1>Advanced RAG</h1>
+                <div class="rag-app-name">Advanced RAG</div>
                 <p>Source-aware chat, retrieval traces, and RAGAS evaluation in one workspace.</p>
             </div>
             <div class="rag-status-strip">
@@ -1513,6 +1649,12 @@ def prepare_uploaded_files_for_app(uploaded_files: list[Any], clear_existing: bo
     )
 
 
+def accepted_uploaded_source_names_for_app(uploaded_files: list[Any]) -> list[str]:
+    from source_loader import accepted_uploaded_source_names
+
+    return accepted_uploaded_source_names(uploaded_files)
+
+
 def _prepared_source_state(st) -> dict[str, Any] | None:
     value = st.session_state.get(PREPARED_SOURCE_KEY)
     return value if isinstance(value, dict) else None
@@ -2214,6 +2356,95 @@ def _render_run_metadata_panel(st) -> None:
         )
 
 
+def _major_minor_version(value: Any) -> tuple[int, int]:
+    parts: list[int] = []
+    for chunk in str(value or "").split("."):
+        digits = ""
+        for char in chunk:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+        if len(parts) == 2:
+            break
+    return (parts[0], parts[1]) if len(parts) >= 2 else (0, 0)
+
+
+def _streamlit_runtime_version(st) -> str:
+    candidates: list[str] = []
+    module_version = str(getattr(st, "__version__", "") or "").strip()
+    if module_version:
+        candidates.append(module_version)
+    try:
+        metadata_version = importlib.metadata.version("streamlit")
+    except importlib.metadata.PackageNotFoundError:
+        metadata_version = ""
+    if metadata_version:
+        candidates.append(metadata_version)
+    if not candidates:
+        return ""
+    return max(candidates, key=_major_minor_version)
+
+
+def _streamlit_supports_directory_upload(st) -> bool:
+    return _major_minor_version(_streamlit_runtime_version(st)) >= (1, 54)
+
+
+def _render_upload_controls(st, allowed_types: list[str]) -> list[Any]:
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stFileUploader"] div[data-testid="stFileUploaderFile"] {
+            display: none;
+        }
+        div[data-testid="stFileUploader"] section[data-testid="stFileUploaderDropzone"] + div {
+            display: none;
+        }
+        div[data-testid="stFileUploader"] ul {
+            display: none;
+        }
+        div[data-testid="stFileUploader"] ul + div {
+            display: none;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    file_uploads = st.file_uploader(
+        "Upload source files",
+        type=allowed_types,
+        accept_multiple_files=True,
+        help="Upload one or more supported source files.",
+        key="source_file_uploads",
+    )
+    folder_uploads = []
+    if _streamlit_supports_directory_upload(st):
+        folder_uploads = st.file_uploader(
+            "Upload source folder",
+            type=allowed_types,
+            accept_multiple_files="directory",
+            help="Upload a project folder; ignored directories such as .git and node_modules are filtered out.",
+            key="source_folder_uploads",
+        )
+    else:
+        version = _streamlit_runtime_version(st) or "unknown"
+        st.warning(
+            "Folder upload requires Streamlit 1.54 or newer in the Python process running this app. "
+            f"Current runtime reports Streamlit {version} from {sys.executable}. "
+            "Upload individual files or a .zip archive instead."
+        )
+    uploaded_files = [*(file_uploads or []), *(folder_uploads or [])]
+    accepted_names = accepted_uploaded_source_names_for_app(uploaded_files)
+    if accepted_names:
+        st.caption(f"{len(accepted_names)} supported uploaded file(s) ready to prepare.")
+        st.dataframe(pd.DataFrame({"file": accepted_names}), use_container_width=True)
+    elif uploaded_files:
+        st.warning("No supported source files were selected.")
+    return uploaded_files
+
+
 def _render_source_workspace(st) -> None:
     _render_source_status_panel(st)
     _render_sources_tab(st)
@@ -2243,15 +2474,7 @@ def _render_sources_tab(st) -> None:
         from source_loader import SOURCE_EXTENSIONS
 
         allowed_types = sorted([*(ext.lstrip(".") for ext in SOURCE_EXTENSIONS), "zip"])
-        uploaded_files = st.file_uploader(
-            "Upload source files or folder",
-            type=allowed_types,
-            accept_multiple_files="directory",
-            help=(
-                "Use this for public deployments. Upload individual files, a project folder, "
-                "or a .zip archive; supported files are copied into the app session before indexing."
-            ),
-        )
+        uploaded_files = _render_upload_controls(st, allowed_types)
     elif source_type == "GitHub repo":
         source_text = st.text_input("GitHub URL", placeholder="https://github.com/user/repo")
     else:
@@ -2294,7 +2517,8 @@ def _render_sources_tab(st) -> None:
                 clear_source_cache(clear_raw=False, clear_prepared=False)
                 reset_session_source_state(st)
                 st.success(f"Prepared {len(prepared)} files under data/raw.")
-                source_input = sources[0] if sources else f"uploaded:{', '.join(str(getattr(file, 'name', 'file')) for file in uploaded_files)}"
+                accepted_upload_names = accepted_uploaded_source_names_for_app(uploaded_files)
+                source_input = sources[0] if sources else f"uploaded:{', '.join(accepted_upload_names)}"
                 _store_prepared_source(st, prepared, source_input, _prepared_source_type(source_type))
                 st.dataframe(
                     pd.DataFrame({"file": [path.as_posix() for path in prepared]}),
@@ -2444,19 +2668,23 @@ def _render_query_tab(st) -> None:
         _render_query_blocked(st)
         return
 
-    _render_query_ready(st)
     _sync_chat_history_to_source(st, current_source)
 
-    strategy = st.selectbox("Strategy", STRATEGIES, index=STRATEGIES.index("hybrid_rerank"))
+    with _streamlit_container(st, "chat_shell"):
+        with _streamlit_container(st, "chat_topbar"):
+            _render_query_ready(st)
+            strategy = st.selectbox("Strategy", STRATEGIES, index=STRATEGIES.index("hybrid_rerank"))
 
-    messages = _chat_history(st)
-    history_panel = _streamlit_container(st, "chat_history_panel")
-    with history_panel:
-        for message in messages:
-            _render_chat_message(st, message)
+        messages = _chat_history(st)
+        history_panel = _streamlit_container(st, "chat_history_panel")
+        with history_panel:
+            if not messages:
+                st.markdown('<div class="rag-chat-empty-space"></div>', unsafe_allow_html=True)
+            for message in messages:
+                _render_chat_message(st, message)
 
-    with _streamlit_container(st, "chat_composer_panel"):
-        prompt = st.chat_input("Ask about the indexed project context")
+        with _streamlit_container(st, "chat_composer_panel"):
+            prompt = st.chat_input("Ask about the indexed project context")
     if not prompt or not prompt.strip():
         return
 
@@ -2687,26 +2915,26 @@ def _render_eval_tab(st) -> None:
 def render_app() -> None:
     import streamlit as st
 
-    st.set_page_config(page_title="Advanced RAG", layout="wide", initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="Advanced RAG", layout="wide", initial_sidebar_state="expanded")
     _inject_app_chrome(st)
     _render_workbench_header(st)
 
-    source_col, main_col = st.columns([0.78, 2.2], gap="medium")
-    with source_col:
+    with st.sidebar:
+        st.markdown("### Source prep")
         with st.container(key="source_index_panel"):
             _render_source_workspace(st)
-    with main_col:
-        with st.container(key="main_workspace_panel"):
-            with st.container(key="workspace_page_nav"):
-                page = st.radio("Workspace page", ["Chat", "RAGAS evaluation"], key=WORKSPACE_PAGE_KEY)
-            if page == "RAGAS evaluation":
-                with st.container(key="eval_page_content"):
-                    st.subheader("RAGAS evaluation")
-                    _render_eval_tab(st)
-            else:
-                with st.container(key="chat_page_content"):
-                    st.subheader("Chat")
-                    _render_query_tab(st)
+
+    with st.container(key="main_workspace_panel"):
+        with st.container(key="workspace_page_nav"):
+            page = st.radio("Workspace page", ["Chat", "RAGAS evaluation"], key=WORKSPACE_PAGE_KEY)
+        if page == "RAGAS evaluation":
+            with st.container(key="eval_page_content"):
+                st.subheader("RAGAS evaluation")
+                _render_eval_tab(st)
+        else:
+            with st.container(key="chat_page_content"):
+                st.subheader("Chat")
+                _render_query_tab(st)
 
 
 if __name__ == "__main__":

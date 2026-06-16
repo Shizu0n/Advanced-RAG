@@ -12,12 +12,14 @@ The project is offline-first by default. External fetches, model downloads, and 
 
 The product currently supports three source types:
 
-- **Uploaded files/folders** - browser-uploaded files, project folders, or `.zip` archives for hosted deployments
+- **Uploaded files/folders** - browser-uploaded individual files, project folders, or `.zip` archives for hosted deployments
 - **GitHub repositories** — public repository URLs from `github.com`
 - **Hugging Face model or dataset cards** — `hf:owner/model` shorthand or `https://huggingface.co/...` URLs
 
 Notes:
 
+- Use **Upload source files** for individual files and **Upload source folder** for project directories
+- Folder upload requires Streamlit 1.54 or newer; older local installs can still upload individual files or `.zip` archives
 - Uploaded folders preserve relative paths such as `backend/package.json` and `frontend/src/App.tsx`
 - Uploaded `.zip` archives are safely extracted with unsupported files and ignored directories skipped
 - Uploaded and GitHub sources ingest supported files into `data/raw/`

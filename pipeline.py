@@ -3107,17 +3107,15 @@ class LocalRAGPipeline:
 
             from llama_index.core import VectorStoreIndex
             from llama_index.core.schema import TextNode
-            from llama_index.embeddings.huggingface import HuggingFaceEmbedding
             from llama_index.vector_stores.chroma import ChromaVectorStore
+            from ingestion import get_huggingface_embedding
 
             chroma_client = chromadb.PersistentClient(path=str(chroma_dir))
             collection = chroma_client.get_collection("advanced_rag")
             if collection.count() == 0:
                 return None, None
             vector_store = ChromaVectorStore(chroma_collection=collection)
-            embed_model = HuggingFaceEmbedding(
-                model_name="BAAI/bge-small-en-v1.5",
-            )
+            embed_model = get_huggingface_embedding("BAAI/bge-small-en-v1.5")
             index = VectorStoreIndex.from_vector_store(
                 vector_store, embed_model=embed_model
             )

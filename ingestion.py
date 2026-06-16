@@ -9,7 +9,7 @@ import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.parse import urljoin, urlparse
 
 import chromadb
@@ -39,6 +39,7 @@ EMBEDDING_COMPARISON_MODELS = [
     "BAAI/bge-base-en-v1.5",
     "intfloat/e5-small-v2",
 ]
+_EMBEDDING_MODEL_CACHE: dict[tuple[str, str, int], Any] = {}
 SOURCE_EXTENSIONS = {
     ".c",
     ".cfg",
@@ -423,6 +424,38 @@ def _split_documents(
     return splitter.get_nodes_from_documents(list(documents))
 
 
+def _embedding_device() -> str:
+    return (os.getenv("EMBED_DEVICE") or "cpu").strip() or "cpu"
+
+
+def clear_embedding_model_cache() -> None:
+    _EMBEDDING_MODEL_CACHE.clear()
+
+
+def get_huggingface_embedding(model_name: str = EMBED_MODEL) -> Any:
+    """Return a reused local embedding model to avoid repeated Streamlit rerun loads."""
+
+    resolved_model = str(model_name)
+    device = _embedding_device()
+    cache_key = (resolved_model, device, id(HuggingFaceEmbedding))
+    if cache_key not in _EMBEDDING_MODEL_CACHE:
+        try:
+            _EMBEDDING_MODEL_CACHE[cache_key] = HuggingFaceEmbedding(
+                model_name=resolved_model,
+                device=device,
+            )
+        except NotImplementedError as exc:
+            if "meta tensor" not in str(exc):
+                raise
+            clear_embedding_model_cache()
+            raise RuntimeError(
+                "Failed to load the local embedding model because PyTorch reported a meta tensor. "
+                "The app now forces EMBED_DEVICE=cpu by default; restart the Streamlit process with "
+                "the project .venv and reinstall requirements if this process is still using stale packages."
+            ) from exc
+    return _EMBEDDING_MODEL_CACHE[cache_key]
+
+
 def run_chunking_ablation(
     source_files: Iterable[Path] | None = None,
     raw_dir: Path = RAW_DIR,
@@ -498,7 +531,7 @@ def run_embedding_model_comparison(
             )
             continue
         try:
-            embed_model = HuggingFaceEmbedding(model_name=str(model_name))
+            embed_model = get_huggingface_embedding(str(model_name))
             embeddings = embed_model.get_text_embedding_batch(samples)
             first_embedding = embeddings[0] if embeddings else []
             rows.append(
@@ -586,7 +619,7 @@ def build_index(
                     chroma_collection = chroma_client.create_collection(CHROMA_COLLECTION_NAME)
                 vector_store = ChromaVectorStore(chroma_collection=chroma_collection)
                 storage_context = StorageContext.from_defaults(vector_store=vector_store)
-                embed_model = HuggingFaceEmbedding(model_name=EMBED_MODEL)
+                embed_model = get_huggingface_embedding(EMBED_MODEL)
 
                 start = time.perf_counter()
                 index = VectorStoreIndex(nodes, storage_context=storage_context, embed_model=embed_model)

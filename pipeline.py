@@ -424,9 +424,9 @@ SOURCE_CODE_REQUEST_PATTERNS = (
     r"\bfrom the code\b",
     r"\bfrom code\b",
     r"\bno codigo\b",
-    r"\bno cÃ³digo\b",
+    r"\bno código\b",
     r"\bpelo codigo\b",
-    r"\bpelo cÃ³digo\b",
+    r"\bpelo código\b",
     r"\bsource files?\b",
 )
 

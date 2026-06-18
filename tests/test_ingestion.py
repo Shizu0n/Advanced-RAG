@@ -156,6 +156,34 @@ class IngestionTests(unittest.TestCase):
         self.assertEqual(rows[0]["sample_count"], 1)
         self.assertEqual(rows[0]["embedding_dim"], 3)
 
+    def test_embedding_model_comparison_runs_cached_model_when_downloads_disabled(self):
+        class FakeEmbedding:
+            def __init__(self, model_name, **kwargs):
+                self.model_name = model_name
+
+            def get_text_embedding_batch(self, samples):
+                return [[0.1, 0.2, 0.3, 0.4] for _ in samples]
+
+        with TemporaryDirectory() as tmpdir:
+            raw_dir = Path(tmpdir) / "raw"
+            raw_dir.mkdir()
+            source = raw_dir / "notes.md"
+            source.write_text("Embedding comparison sample text.", encoding="utf-8")
+
+            with (
+                patch.object(ingestion, "HuggingFaceEmbedding", FakeEmbedding),
+                patch.object(ingestion, "_hf_model_cached_locally", return_value=True),
+            ):
+                rows = ingestion.run_embedding_model_comparison(
+                    source_files=[source],
+                    models=["cached-model"],
+                    sample_size=1,
+                    allow_model_downloads=False,
+                )
+
+        self.assertEqual(rows[0]["status"], "ok")
+        self.assertEqual(rows[0]["embedding_dim"], 4)
+
     def test_huggingface_embedding_helper_forces_cpu_and_reuses_model(self):
         created = []
 

@@ -432,6 +432,21 @@ def clear_embedding_model_cache() -> None:
     _EMBEDDING_MODEL_CACHE.clear()
 
 
+def _hf_model_cached_locally(model_name: str) -> bool:
+    """Return True if *model_name* is already present in the local HuggingFace cache.
+
+    Uses ``local_files_only=True`` so the check never hits the network; a missing
+    model raises and is reported as not cached.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(repo_id=model_name, local_files_only=True)
+        return True
+    except Exception:
+        return False
+
+
 def get_huggingface_embedding(model_name: str = EMBED_MODEL) -> Any:
     """Return a reused local embedding model to avoid repeated Streamlit rerun loads."""
 
@@ -518,7 +533,10 @@ def run_embedding_model_comparison(
     rows: list[dict[str, float | int | str]] = []
     for model_name in models:
         started = time.perf_counter()
-        if not downloads_allowed:
+        # A model already in the local HuggingFace cache (e.g. the active embedder)
+        # needs no network, so run it even when downloads are disabled. Only models
+        # that would require a fresh download are skipped under the gate.
+        if not downloads_allowed and not _hf_model_cached_locally(str(model_name)):
             rows.append(
                 {
                     "model": str(model_name),

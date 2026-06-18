@@ -1,6 +1,7 @@
 import unittest
 import io
 import json
+import math
 from contextlib import redirect_stdout
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -678,6 +679,45 @@ class GoldenDatasetTests(unittest.TestCase):
         self.assertTrue(any("architecture" in question for question in questions))
         self.assertTrue(any("troubleshoot" in question for question in questions))
 
+    def test_generate_golden_dataset_is_llm_first_and_template_free_when_cloud_enabled(self):
+        nodes = [
+            TextNode(id_="a", text="Alpha module configures the billing pipeline.", metadata={"file_name": "alpha.py"}),
+            TextNode(id_="b", text="Beta module exposes the public API gateway.", metadata={"file_name": "beta.py"}),
+        ]
+
+        class FakeCloudClient:
+            def generate_json(self, prompt):
+                if "Alpha" in prompt:
+                    return {
+                        "question": "What does the Alpha module configure?",
+                        "ground_truth": "Alpha module configures the billing pipeline.",
+                    }
+                return {
+                    "question": "What does the Beta module expose?",
+                    "ground_truth": "Beta module exposes the public API gateway.",
+                }
+
+        provider = evaluation.CloudQuestionProvider(cloud_client=FakeCloudClient())
+
+        with TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "golden_dataset.json"
+            dataset = evaluation.generate_golden_dataset(
+                nodes,
+                output_path=output_path,
+                providers=[provider],
+                chunk_limit=5,
+                final_limit=6,
+            )
+
+        questions = [item["question"].lower() for item in dataset]
+        joined = " ".join(questions)
+        # No fixed project/resume template prefix leaks in.
+        self.assertNotIn("what stack and tools does this project use", joined)
+        self.assertNotIn("how do i set up and run this project", joined)
+        # Every question is LLM-generated and specific to its source chunk.
+        self.assertTrue(any("alpha module" in question for question in questions))
+        self.assertTrue(any("beta module" in question for question in questions))
+
     def test_generate_golden_dataset_uses_resume_questions_for_resume_pdf(self):
         node = TextNode(
             id_="resume",
@@ -1021,6 +1061,10 @@ class GoldenDatasetTests(unittest.TestCase):
             self.assertEqual(summary.loc[0, "summary_backend"], "cloud_free_tier_ragas")
             self.assertEqual(summary.loc[0, "cloud_status"], "degraded")
             self.assertIn("faithfulness", summary.loc[0, "cloud_error"])
+            # The cloud faithfulness was dropped, but the lexical proxy must survive so the
+            # chart still renders a faithfulness dimension instead of silently omitting it.
+            self.assertIn("lexical_faithfulness", summary.columns)
+            self.assertTrue(math.isfinite(float(summary.loc[0, "lexical_faithfulness"])))
 
     def test_run_evaluation_reuses_one_cloud_client_across_strategies(self):
         with TemporaryDirectory() as tmpdir:

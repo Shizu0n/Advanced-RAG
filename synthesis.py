@@ -1,4 +1,4 @@
-"""Geração e síntese de respostas do RAG com suporte a LLM e fallback extraívo."""
+"""RAG answer generation and synthesis with LLM support and an extractive fallback."""
 
 from __future__ import annotations
 
@@ -29,73 +29,75 @@ def _build_prompt(
     intent: str | None = None,
     fine_tune_metadata: Any | None = None,
 ) -> str:
-    """Constrói prompt rico para LLM com contexto estruturado por documento.
+    """Build a rich, document-structured prompt for the LLM.
 
     Args:
-        query: A pergunta do usuário.
-        contexts: Lista de textos de contexto recuperados.
-        sources: Lista de dicionários com metadata de cada fonte (source_doc, score, text).
-        intent: Intent detection opcional (stack, overview, architecture, setup, security, evaluation, fine_tune, general).
-        fine_tune_metadata: Metadados estruturados de fine-tuning extraídos de HuggingFace model cards.
+        query: The user's question.
+        contexts: List of retrieved context passages.
+        sources: List of per-source metadata dicts (source_doc, score, text).
+        intent: Optional detected intent (stack, overview, architecture, setup, security, evaluation, fine_tune, general).
+        fine_tune_metadata: Structured fine-tuning metadata extracted from HuggingFace model cards.
 
     Returns:
-        Prompt formatado para o LLM.
+        The formatted prompt string.
     """
     intent_label = intent or "general"
     fine_tune_rules = (
-        "6. Se a pergunta é sobre fine-tuning (dataset, base model, treinamento, LoRA), "
-        "extraia o nome exato do dataset, modelo base, e detalhes de treinamento do Model Card a seguir.\n"
-        "7. Responda diretamente: qual dataset foi usado, quem desenvolveu, métricas de avaliação.\n"
+        "6. If the question is about fine-tuning (dataset, base model, training, LoRA), "
+        "extract the exact dataset name, base model, and training details from the Model Card below.\n"
+        "7. Answer directly: which dataset was used, who developed it, and the evaluation metrics.\n"
         if intent_label == "fine_tune"
         else ""
     )
 
     lines: list[str] = [
-        "Você é um assistente inteligente de RAG (Retrieval-Augmented Generation). "
-        "Sua tarefa é responder à pergunta do usuário usando APENAS os documentos fornecidos abaixo. "
-        "Responda sempre no MESMO IDIOMA da pergunta do usuário.",
+        "You are an intelligent RAG (Retrieval-Augmented Generation) assistant. "
+        "Answer the user's question using ONLY the documents provided below.",
         "",
-        "REGRAS:",
-        "1. NÃO invente informações. Use SOMENTE o conteúdo dos documentos.",
-        "2. NÃO retorne JSON cru, listas de código ou snippets sem explicação.",
-        "3. Sintetize as informações em uma resposta completa e coerente em linguagem natural.",
-        "4. Se a informação for insuficiente, diga claramente que não há evidências suficientes.",
+        "LANGUAGE: Detect the language of the QUESTION and write your ENTIRE answer in that "
+        "SAME LANGUAGE. If the question is in Portuguese, answer in Portuguese; if in English, "
+        "answer in English; and so on. Never reply in a different language than the question.",
+        "",
+        "RULES:",
+        "1. Do NOT invent information. Use ONLY the content of the documents.",
+        "2. Do NOT return raw JSON, code listings, or snippets without explanation.",
+        "3. Synthesize the information into a complete, coherent natural-language answer.",
+        "4. If the information is insufficient, clearly state that there is not enough evidence.",
         "5. Do not include citations, source lists, or referenced-document footers in the answer body; "
         "the interface will display sources separately.",
         fine_tune_rules,
         "",
-        f"PERGUNTA: {query}",
+        f"QUESTION: {query}",
         "",
     ]
 
     if intent_label != "general":
-        lines.append(f"TIPO DE PERGUNTA: {intent_label}")
+        lines.append(f"QUESTION TYPE: {intent_label}")
         lines.append("")
 
     if fine_tune_metadata is not None:
         summary = fine_tune_metadata.to_summary() if hasattr(fine_tune_metadata, 'to_summary') else str(fine_tune_metadata)
         if summary:
-            lines.append("METADADOS ESTRUTURADOS DO MODELO (extraídos do HuggingFace Model Card):")
+            lines.append("STRUCTURED MODEL METADATA (extracted from the HuggingFace Model Card):")
             lines.append(summary)
             lines.append("")
 
-    lines.append("DOCUMENTOS RECUPERADOS:")
+    lines.append("RETRIEVED DOCUMENTS:")
     lines.append("")
 
     for idx, context in enumerate(contexts, 1):
         source = sources[idx - 1] if idx - 1 < len(sources) else {}
-        source_name = source.get("source_doc", f"documento_{idx}")
+        source_name = source.get("source_doc", f"document_{idx}")
         cleaned_context = _context_for_synthesis(context)
 
-        lines.append(f"--- Documento {idx}: {source_name} ---")
+        lines.append(f"--- Document {idx}: {source_name} ---")
         lines.append(cleaned_context)
         lines.append("")
 
     lines.append("---")
     lines.append(
-        "Com base APENAS nos documentos acima, responda à pergunta do usuário no MESMO IDIOMA "
-        "da PERGUNTA (responda em inglês se a pergunta estiver em inglês, em português se estiver "
-        "em português), de forma completa e sem inventar informações."
+        "Based ONLY on the documents above, answer the user's question completely and without "
+        "inventing information. Write your entire answer in the SAME LANGUAGE as the QUESTION."
     )
     return "\n".join(lines)
 
@@ -106,7 +108,7 @@ def _llm_available() -> bool:
 
 def _get_llm_client() -> Any:
     if not _llm_available():
-        raise RuntimeError("LLM não está disponível. Configure ao menos um provedor cloud suportado.")
+        raise RuntimeError("LLM is not available. Configure at least one supported cloud provider.")
     return cloud_ragas.FreeTierCloudClient(
         budget=cloud_ragas.CloudCallBudget(max_calls=int(os.getenv("MAX_CLOUD_CHAT_CALLS", "1"))),
         providers=tuple(cloud_ragas.providers_from_env()),
@@ -120,17 +122,17 @@ def synthesize_generative_answer(
     intent: str | None = None,
     fine_tune_metadata: Any | None = None,
 ) -> str | None:
-    """Sintetiza resposta usando LLM com contexto rico e opcional intent detection.
+    """Synthesize an answer with the LLM using rich context and optional intent detection.
 
     Args:
-        query: A pergunta do usuário.
-        contexts: Lista de textos de contexto recuperados.
-        sources: Lista de dicionários com metadata de cada fonte.
-        intent: Intent detection opcional (stack, overview, architecture, etc).
-        fine_tune_metadata: Metadados estruturados de fine-tuning extraídos de HuggingFace model cards.
+        query: The user's question.
+        contexts: List of retrieved context passages.
+        sources: List of per-source metadata dicts.
+        intent: Optional detected intent (stack, overview, architecture, etc).
+        fine_tune_metadata: Structured fine-tuning metadata extracted from HuggingFace model cards.
 
     Returns:
-        Resposta sintetizada ou None se LLM indisponível.
+        The synthesized answer, or None if the LLM is unavailable.
     """
     if not _llm_available():
         logger.info("LLM not available (missing supported cloud provider key), skipping generative synthesis")
@@ -193,25 +195,25 @@ def synthesize_intelligent_answer(
     intent: str | None = None,
     fine_tune_metadata: Any | None = None,
 ) -> str:
-    """LLM-first synthesis with intelligent fallback to extractive.
+    """LLM-first synthesis with an intelligent fallback to extractive.
 
-    Primary path: synthesize_generative_answer (LLM com contexto rico)
-    Fallback: synthesize_extractive_answer (apenas quando LLM indisponível)
+    Primary path: synthesize_generative_answer (LLM with rich context).
+    Fallback: synthesize_extractive_answer (only when the LLM is unavailable).
 
     Args:
-        query: A pergunta do usuário.
-        contexts: Lista de textos de contexto recuperados.
-        sources: Lista de dicionários com metadata de cada fonte.
-        intent: Intent detection opcional.
-        fine_tune_metadata: Metadados estruturados de fine-tuning extraídos de HuggingFace model cards.
+        query: The user's question.
+        contexts: List of retrieved context passages.
+        sources: List of per-source metadata dicts.
+        intent: Optional detected intent.
+        fine_tune_metadata: Structured fine-tuning metadata extracted from HuggingFace model cards.
 
     Returns:
-        Resposta sintetizada (LLM ou extractiva).
+        The synthesized answer (LLM or extractive).
     """
     answer = synthesize_generative_answer(query, contexts, sources, intent, fine_tune_metadata)
     if answer is not None:
         return answer
 
-    # Fallback extraívo melhorado
+    # Improved extractive fallback.
     logger.info("LLM unavailable, falling back to extractive synthesis")
     return synthesize_extractive_answer(query, contexts, max_sentences=5)

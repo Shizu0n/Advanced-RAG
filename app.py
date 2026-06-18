@@ -3004,6 +3004,11 @@ def _render_eval_tab(st) -> None:
 
     with st.expander("Embedding comparison", expanded=False):
         st.subheader("Embedding comparison")
+        st.caption(
+            "Models already in the local cache run regardless of the gate; "
+            "rows marked `skipped_model_downloads_disabled` need a fresh download "
+            "(enable Allow model downloads to compare them)."
+        )
         st.dataframe(load_embedding_comparison(), use_container_width=True)
 
 

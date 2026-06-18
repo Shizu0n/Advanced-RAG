@@ -2,7 +2,7 @@
 
 Advanced-RAG is a Retrieval-Augmented Generation workspace for local and public technical sources. It prepares source material, builds a local retrieval index, answers questions with hybrid retrieval, and evaluates retrieval quality with offline heuristics or optional RAGAS-backed cloud evaluation.
 
-![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white) ![Streamlit](https://img.shields.io/badge/Streamlit-1.54-FF4B4B?logo=streamlit&logoColor=white) ![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.11-4A67FF?logo=llama&logoColor=white) ![ChromaDB](https://img.shields.io/badge/ChromaDB-0.5-7B61FF) ![BM25](https://img.shields.io/badge/rank--bm25-BM25-555555) ![Sentence%20Transformers](https://img.shields.io/badge/Sentence%20Transformers-bge--small--en--v1.5-0A7EA4) ![RAGAS](https://img.shields.io/badge/RAGAS-0.2.5-0F766E)
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white) ![Streamlit](https://img.shields.io/badge/Streamlit-1.54-FF4B4B?logo=streamlit&logoColor=white) ![LlamaIndex](https://img.shields.io/badge/LlamaIndex-0.14-4A67FF?logo=llama&logoColor=white) ![ChromaDB](https://img.shields.io/badge/ChromaDB-0.5-7B61FF) ![BM25](https://img.shields.io/badge/rank--bm25-BM25-555555) ![Sentence%20Transformers](https://img.shields.io/badge/Sentence%20Transformers-bge--small--en--v1.5-0A7EA4) ![RAGAS](https://img.shields.io/badge/RAGAS-0.2.5-0F766E)
 
 Core stack: Python 3.11, Streamlit, LlamaIndex, ChromaDB, rank-bm25, sentence-transformers, and RAGAS.
 
@@ -190,11 +190,11 @@ cp .env.example .env
 streamlit run app.py
 ```
 
-The app opens at `http://localhost:8501` with three tabs:
+The app opens at `http://localhost:8501` as a chat-first workbench:
 
-- **Sources** — prepare uploaded files/folders, GitHub repositories, or Hugging Face cards
-- **Query** — run questions against the indexed source with trace visibility
-- **Evaluation** — compare retrieval strategies and inspect results
+- **Left rail** — prepare a source (uploaded files/folders, GitHub repository, or Hugging Face card) and toggle session gates
+- **Center** — a chat panel that answers questions against the indexed source, with a retrieval trace/debug expander; a Chat / RAGAS evaluation switch sits at the top
+- **Right rail (RAGAS evaluation)** — generate pre-questions, run fast offline or Cloud RAGAS evaluation, and run chunking/embedding experiments
 
 ### Streamlit Cloud Deployment
 

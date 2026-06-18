@@ -13,7 +13,6 @@ from typing import Any, Sequence
 
 from pipeline import (
     _context_for_synthesis,
-    _has_enough_evidence,
     synthesize_extractive_answer,
 )
 
@@ -53,7 +52,8 @@ def _build_prompt(
 
     lines: list[str] = [
         "Você é um assistente inteligente de RAG (Retrieval-Augmented Generation). "
-        "Sua tarefa é responder à pergunta do usuário usando APENAS os documentos fornecidos abaixo.",
+        "Sua tarefa é responder à pergunta do usuário usando APENAS os documentos fornecidos abaixo. "
+        "Responda sempre no MESMO IDIOMA da pergunta do usuário.",
         "",
         "REGRAS:",
         "1. NÃO invente informações. Use SOMENTE o conteúdo dos documentos.",
@@ -93,8 +93,9 @@ def _build_prompt(
 
     lines.append("---")
     lines.append(
-        "Com base APENAS nos documentos acima, responda à pergunta do usuário em português, "
-        "de forma completa e sem inventar informações."
+        "Com base APENAS nos documentos acima, responda à pergunta do usuário no MESMO IDIOMA "
+        "da PERGUNTA (responda em inglês se a pergunta estiver em inglês, em português se estiver "
+        "em português), de forma completa e sem inventar informações."
     )
     return "\n".join(lines)
 

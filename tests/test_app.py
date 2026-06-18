@@ -2975,5 +2975,38 @@ class QueryTabWarningTests(unittest.TestCase):
         run_eval.assert_not_called()
 
 
+class CitationAndRerankerTests(unittest.TestCase):
+    def test_citation_display_path_strips_deploy_mount_prefix(self):
+        absolute = "/mount/src/advanced-rag/data/raw/my-source/README.md"
+        self.assertEqual(app._citation_display_path(absolute), "my-source/README.md")
+
+    def test_citation_display_path_handles_windows_paths(self):
+        win = r"C:\Users\x\Advanced-RAG\data\raw\my-source\backend\app.py"
+        self.assertEqual(app._citation_display_path(win), "my-source/backend/app.py")
+
+    def test_render_citations_deduplicates_by_display_path(self):
+        captions = []
+        fake_st = MagicMock()
+        fake_st.caption.side_effect = lambda text: captions.append(text)
+        citations = [
+            {"source_doc": "/mount/src/advanced-rag/data/raw/s/README.md"},
+            {"source_doc": "/mount/src/advanced-rag/data/raw/s/README.md"},
+            {"source_doc": "/mount/src/advanced-rag/data/raw/s/main.py"},
+        ]
+        app._render_citations(fake_st, citations)
+        self.assertEqual(captions, ["1. s/README.md", "2. s/main.py"])
+
+    def test_reranker_note_reports_cross_encoder_when_downloads_allowed(self):
+        note = app._reranker_note("hybrid_rerank", True)
+        self.assertIn("cross-encoder", note)
+
+    def test_reranker_note_reports_lexical_fallback_when_downloads_disabled(self):
+        note = app._reranker_note("hybrid_rerank", False)
+        self.assertIn("lexical fallback", note)
+
+    def test_reranker_note_is_none_for_non_rerank_strategy(self):
+        self.assertIsNone(app._reranker_note("semantic_only", False))
+        self.assertIsNone(app._reranker_note("bm25_only", True))
+
 if __name__ == "__main__":
     unittest.main()

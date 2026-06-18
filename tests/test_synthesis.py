@@ -37,6 +37,16 @@ class SynthesisHelperTests(unittest.TestCase):
 
         self.assertEqual(answer, "Resposta sobre a arquitetura.")
 
+    def test_build_prompt_instructs_answer_in_question_language(self):
+        prompt = synthesis._build_prompt(
+            "What is the backend tech stack?",
+            ["The backend uses NestJS and PostgreSQL."],
+            [{"source_doc": "README.md"}],
+        )
+
+        self.assertIn("MESMO IDIOMA", prompt)
+        self.assertNotIn("responda à pergunta do usuário em português", prompt)
+
     def test_build_prompt_includes_structured_fine_tune_metadata(self):
         class FakeMetadata:
             def to_summary(self):

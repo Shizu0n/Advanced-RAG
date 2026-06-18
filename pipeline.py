@@ -204,13 +204,13 @@ LOW_VALUE_CODE_QUERY_TERMS = {
 }
 INTENT_REWRITES = {
     "resume": "resume curriculo cv technical skills habilidades experiencia experience projects projetos education formacao certifications recruiter",
-    "stack": "stack tech stack tecnologias ferramentas frameworks dependencies package.json frontend backend react vite nestjs",
+    "stack": "stack tech stack tecnologias ferramentas frameworks dependencies package.json requirements frontend backend",
     "overview": "overview visao geral resumo objetivo problema solucao free-tier rag workspace local retrieval streamlit evaluation",
     "architecture": "architecture arquitetura mvc layer layers camada camadas modules modulos estrutura fluxo components backend frontend service services controller controllers repository repositories model models view views",
     "setup": "setup install instalar executar rodar ambiente env scripts npm deploy deployment docker compose build",
     "security": "security seguranca auth authentication jwt password senha bcrypt guard token",
     "evaluation": "evaluation avaliacao metricas tests testes qualidade benchmark ragas",
-    "fine_tune": "fine tune training dataset base model model card adapter hyperparameters lora qlora phi training_details",
+    "fine_tune": "fine tune training dataset base model model card adapter hyperparameters lora qlora training_details",
 }
 ARCHITECTURE_LAYER_ALIASES = {
     "adapter": {"adapter", "adapters", "gateway", "gateways", "integration", "integrations"},
@@ -572,24 +572,20 @@ def analyze_query(query: str) -> QueryAnalysis:
     rewrite_parts = [normalized]
     for intent in intents:
         rewrite_parts.append(INTENT_REWRITES[intent])
+    # Generic, source-agnostic query expansion. Repo-specific identifiers must not be
+    # hardcoded here: term expansion should generalize to any indexed source.
     if "front" in normalized:
-        rewrite_parts.append("frontend front-end client ui react vite")
+        rewrite_parts.append("frontend front-end client ui")
     if "back" in normalized:
-        rewrite_parts.append("backend server api nestjs typeorm sqlite")
+        rewrite_parts.append("backend server api")
     if "autenticacao" in normalized or "autentic" in normalized:
-        rewrite_parts.append("auth authentication service guard token")
-    if "indicacao" in normalized or "referencia" in normalized or "referral" in normalized:
-        rewrite_parts.append("referral referralCode referrer register registration service")
-    if "profile" in normalized or "endpoint" in normalized:
-        rewrite_parts.append("users controller route @Get profile getProfile users service")
-    if "referrallink" in normalized or ("referral" in normalized and "link" in normalized):
-        rewrite_parts.append("referralLink generateReferralLink users service frontendUrl register ref")
+        rewrite_parts.append("auth authentication login session")
     if "registro" in normalized or "cadastrar" in normalized or "cadastro" in normalized:
-        rewrite_parts.append("register registration create user service")
+        rewrite_parts.append("register registration signup account")
     if "token" in normalized and ("attached" in normalized or "request" in normalized or "api" in normalized):
-        rewrite_parts.append("authorization bearer headers")
+        rewrite_parts.append("authorization bearer header")
     if "token" in normalized and ("stored" in normalized or "storage" in normalized or "cache" in normalized):
-        rewrite_parts.append("localStorage cache")
+        rewrite_parts.append("storage cache")
 
     layer_terms = _expand_architecture_layer_terms(_significant_terms(normalized))
     layer_expansion = sorted(layer_terms - _significant_terms(normalized))

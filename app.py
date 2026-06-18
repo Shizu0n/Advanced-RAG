@@ -1204,6 +1204,15 @@ def _env_gate_default(name: str, default: bool) -> bool:
     return os.getenv(name, "1" if default else "0") != "0"
 
 
+def _reranker_note(strategy: str, allow_model_downloads: bool) -> str | None:
+    """Be transparent about which reranker hybrid_rerank actually uses."""
+    if strategy != "hybrid_rerank":
+        return None
+    if allow_model_downloads:
+        return "Reranker: cross-encoder (ms-marco-MiniLM-L-6-v2)."
+    return "Reranker: lexical fallback. Enable 'Allow model downloads' for the cross-encoder."
+
+
 def _gate_enabled(st, name: str, default: bool) -> bool:
     overrides = _ui_gate_overrides(st)
     if name in overrides:
@@ -2603,9 +2612,19 @@ def _retrieval_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _citation_display_path(source: str) -> str:
+    """Show a source path relative to data/raw/ instead of the absolute deploy path."""
+    normalized = str(source).replace("\\", "/")
+    marker = "data/raw/"
+    idx = normalized.rfind(marker)
+    if idx != -1:
+        normalized = normalized[idx + len(marker):]
+    return normalized or str(source)
+
+
 def _citation_text(citation: dict[str, Any], index: int) -> str:
     source = citation.get("source_doc") or citation.get("source") or "unknown source"
-    return f"{index}. {source}"
+    return f"{index}. {_citation_display_path(source)}"
 
 
 def _render_citations(st, citations: list[dict[str, Any]]) -> None:
@@ -2613,8 +2632,19 @@ def _render_citations(st, citations: list[dict[str, Any]]) -> None:
         st.caption("No citations returned.")
         return
     st.write("Sources")
-    for index, citation in enumerate(citations[:5], start=1):
-        st.caption(_citation_text(citation, index))
+    seen: set[str] = set()
+    index = 0
+    for citation in citations:
+        path = _citation_display_path(
+            citation.get("source_doc") or citation.get("source") or "unknown source"
+        )
+        if path in seen:
+            continue
+        seen.add(path)
+        index += 1
+        st.caption(f"{index}. {path}")
+        if index >= 5:
+            break
 
 
 def _synthesis_status_caption(synthesis: dict[str, Any] | None) -> str:
@@ -2693,6 +2723,11 @@ def _render_query_tab(st) -> None:
         with _streamlit_container(st, "chat_topbar"):
             _render_query_ready(st)
             strategy = st.selectbox("Strategy", STRATEGIES, index=STRATEGIES.index("hybrid_rerank"))
+            reranker_note = _reranker_note(
+                strategy, _gate_enabled(st, "ALLOW_MODEL_DOWNLOADS", default=False)
+            )
+            if reranker_note:
+                st.caption(reranker_note)
 
         messages = _chat_history(st)
         history_panel = _streamlit_container(st, "chat_history_panel")

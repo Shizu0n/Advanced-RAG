@@ -464,22 +464,41 @@ def _inject_app_chrome(st) -> None:
             }
         }
 
+        [data-testid="stAppViewContainer"] {
+            --rag-sidebar-width: 300px;
+            --rag-chat-max-width: 58rem;
+            --rag-chat-width: min(
+                var(--rag-chat-max-width),
+                calc(100vw - var(--rag-sidebar-width) - 2rem)
+            );
+            --rag-composer-bottom: 0.85rem;
+            --rag-composer-reserve: 5.75rem;
+        }
+
+        [data-testid="stAppViewContainer"]:has(section[data-testid="stSidebar"][aria-expanded="false"]) {
+            --rag-sidebar-width: 0px;
+        }
+
         html,
         body,
         .stApp,
         [data-testid="stAppViewContainer"],
         [data-testid="stAppViewContainer"] > .main {
             height: 100%;
-            max-height: 100%;
-            overflow: hidden !important;
+            min-height: 100dvh;
+            max-height: none;
+            overflow-x: hidden !important;
+            overflow-y: auto !important;
         }
 
         .block-container,
         .main .block-container {
+            min-height: 100dvh;
             height: 100dvh;
             max-height: 100dvh;
-            overflow: hidden !important;
-            padding: 0.35rem 1rem 0.7rem !important;
+            overflow-x: hidden !important;
+            overflow-y: auto !important;
+            padding: 0.35rem 1rem calc(var(--rag-composer-reserve) + 0.9rem) !important;
         }
 
         .rag-shell-header {
@@ -491,9 +510,10 @@ def _inject_app_chrome(st) -> None:
         .st-key-source_index_panel,
         .st-key-main_workspace_panel {
             box-sizing: border-box;
-            height: calc(100dvh - 3.35rem) !important;
-            max-height: calc(100dvh - 3.35rem) !important;
-            overflow: hidden !important;
+            min-height: calc(100dvh - 3.35rem) !important;
+            height: auto !important;
+            max-height: none !important;
+            overflow: visible !important;
             background: var(--rag-surface);
             border: 1px solid var(--rag-border);
             border-radius: 8px;
@@ -504,8 +524,8 @@ def _inject_app_chrome(st) -> None:
 
         [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-main_workspace_panel) {
             display: flex !important;
-            height: 100% !important;
-            max-height: 100% !important;
+            height: auto !important;
+            max-height: none !important;
             min-height: 0 !important;
         }
 
@@ -513,8 +533,8 @@ def _inject_app_chrome(st) -> None:
             display: flex !important;
             flex: 1 1 auto !important;
             flex-direction: column !important;
-            height: 100% !important;
-            max-height: 100% !important;
+            height: auto !important;
+            max-height: none !important;
             min-height: 0 !important;
             background: linear-gradient(180deg, var(--rag-surface-elevated), var(--rag-surface) 34%);
         }
@@ -524,7 +544,7 @@ def _inject_app_chrome(st) -> None:
             flex: 1 1 auto !important;
             flex-direction: column !important;
             min-height: 0 !important;
-            height: 100% !important;
+            height: auto !important;
         }
 
         .st-key-main_workspace_panel > [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-workspace_page_nav) {
@@ -537,7 +557,7 @@ def _inject_app_chrome(st) -> None:
             flex: 1 1 auto !important;
             min-height: 0 !important;
             height: auto !important;
-            overflow: hidden !important;
+            overflow: visible !important;
         }
 
         .st-key-source_index_panel {
@@ -574,18 +594,19 @@ def _inject_app_chrome(st) -> None:
         .st-key-eval_page_content {
             flex: 1 1 auto !important;
             box-sizing: border-box;
-            height: 100% !important;
+            height: auto !important;
             min-height: 0 !important;
-            max-height: 100% !important;
-            overflow-y: auto !important;
+            max-height: none !important;
+            overflow-y: visible !important;
             overflow-x: hidden !important;
             padding-right: 0.2rem;
+            padding-bottom: var(--rag-composer-reserve);
         }
 
         .st-key-chat_page_content {
             display: flex !important;
             flex-direction: column !important;
-            overflow: hidden !important;
+            overflow: visible !important;
         }
 
         .st-key-chat_page_content > [data-testid="stVerticalBlock"],
@@ -595,7 +616,7 @@ def _inject_app_chrome(st) -> None:
             flex: 1 1 auto !important;
             flex-direction: column !important;
             min-height: 0 !important;
-            height: 100% !important;
+            height: auto !important;
         }
 
         .st-key-chat_page_content [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-chat_shell) {
@@ -603,7 +624,7 @@ def _inject_app_chrome(st) -> None:
             flex: 1 1 auto !important;
             min-height: 0 !important;
             height: auto !important;
-            overflow: hidden !important;
+            overflow: visible !important;
         }
 
         .st-key-chat_topbar,
@@ -623,25 +644,25 @@ def _inject_app_chrome(st) -> None:
             flex: 1 1 auto !important;
             min-height: 0 !important;
             height: auto !important;
-            overflow: hidden !important;
+            overflow: visible !important;
         }
 
         .st-key-chat_shell [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-chat_composer_panel) {
             display: flex !important;
             flex: 0 0 auto !important;
-            margin-top: auto !important;
+            margin-top: 0 !important;
             min-height: 0 !important;
             width: 100% !important;
         }
 
         .st-key-chat_history_panel {
             flex: 1 1 auto !important;
-            height: 100% !important;
+            height: auto !important;
             min-height: 12rem !important;
-            max-height: 100% !important;
-            overflow-y: auto !important;
+            max-height: none !important;
+            overflow-y: visible !important;
             overflow-x: hidden !important;
-            padding: 0.35rem 0.2rem 0.6rem 0;
+            padding: 0.35rem 0.2rem 1.1rem 0;
         }
 
         .rag-chat-empty-space {
@@ -654,21 +675,24 @@ def _inject_app_chrome(st) -> None:
 
         .st-key-chat_composer_panel {
             flex: 0 0 auto !important;
-            padding-top: 0.3rem;
-            border-top: 1px solid var(--rag-border);
-            background: var(--rag-surface);
-            position: sticky;
-            bottom: 0;
+            min-height: var(--rag-composer-reserve);
+            padding: 0;
+            border-top: 0;
+            background: transparent;
+            position: static;
+            bottom: auto;
             z-index: 20;
-            padding-bottom: 0.25rem;
         }
 
         [data-testid="stChatInput"] {
-            position: sticky !important;
-            left: auto !important;
+            position: fixed !important;
+            left: calc(
+                var(--rag-sidebar-width) +
+                ((100vw - var(--rag-sidebar-width) - var(--rag-chat-width)) / 2)
+            ) !important;
             right: auto !important;
-            bottom: 0 !important;
-            width: 100% !important;
+            bottom: var(--rag-composer-bottom) !important;
+            width: var(--rag-chat-width) !important;
             max-width: 100% !important;
             margin: 0 !important;
             min-height: 3rem !important;
@@ -712,14 +736,21 @@ def _inject_app_chrome(st) -> None:
         }
 
         @media (max-width: 900px) {
+            [data-testid="stAppViewContainer"] {
+                --rag-sidebar-width: 0px;
+                --rag-chat-width: calc(100vw - 1rem);
+                --rag-composer-bottom: 0.6rem;
+                --rag-composer-reserve: 5.5rem;
+            }
+
             .block-container,
             .main .block-container {
                 height: 100dvh !important;
                 min-height: 100dvh !important;
                 max-height: 100dvh !important;
                 overflow-x: hidden !important;
-                overflow-y: hidden !important;
-                padding: 0.62rem 0.7rem 1rem !important;
+                overflow-y: auto !important;
+                padding: 0.62rem 0.7rem calc(var(--rag-composer-reserve) + 0.9rem) !important;
             }
 
             .rag-shell-header {
@@ -747,16 +778,16 @@ def _inject_app_chrome(st) -> None:
             }
 
             .st-key-main_workspace_panel {
-                height: min(74dvh, 42rem) !important;
-                min-height: min(30rem, calc(100dvh - 1.25rem)) !important;
-                max-height: min(74dvh, 42rem) !important;
+                height: auto !important;
+                min-height: calc(100dvh - 1.25rem) !important;
+                max-height: none !important;
             }
 
             .st-key-chat_page_content,
             .st-key-eval_page_content {
-                height: 100% !important;
+                height: auto !important;
                 min-height: 0 !important;
-                max-height: 100% !important;
+                max-height: none !important;
             }
 
             .st-key-chat_history_panel {
@@ -768,6 +799,12 @@ def _inject_app_chrome(st) -> None:
 
             .st-key-chat_composer_panel {
                 flex: 0 0 auto !important;
+            }
+
+            [data-testid="stChatInput"] {
+                left: 0.5rem !important;
+                right: 0.5rem !important;
+                width: auto !important;
             }
         }
 
@@ -799,15 +836,16 @@ def _inject_app_chrome(st) -> None:
 
             .st-key-source_index_panel,
             .st-key-main_workspace_panel {
-                height: calc(100dvh - 3.35rem) !important;
-                max-height: calc(100dvh - 3.35rem) !important;
+                min-height: calc(100dvh - 3.35rem) !important;
+                height: auto !important;
+                max-height: none !important;
             }
 
             .st-key-chat_page_content,
             .st-key-eval_page_content {
-                height: 100% !important;
+                height: auto !important;
                 min-height: 0 !important;
-                max-height: 100% !important;
+                max-height: none !important;
             }
 
             .st-key-chat_history_panel {

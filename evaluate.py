@@ -973,14 +973,15 @@ NOISY_QUESTION_TERMS = {
     "what fields exist",
 }
 
-PATH_ARTIFACT_QUESTION_TERMS = {
-    "source users",
-    "users paulo",
-    "paulo shizuo",
-    "documents projects",
-    "advanced-rag data raw",
-    "data raw uploaded files",
-}
+_REFERENCE_CONTEXT_TOPIC_RE = re.compile(r"reference context explain about (?P<topic>.+?)\??\s*$")
+
+
+def _reference_context_topic_is_path_artifact(normalized_question: str) -> bool:
+    match = _REFERENCE_CONTEXT_TOPIC_RE.search(normalized_question)
+    if not match:
+        return False
+    tokens = re.findall(r"[a-z0-9][a-z0-9-]*", match.group("topic"))
+    return bool(tokens) and tokens[0] == "source"
 
 
 def _template_golden_item_for_node(node: Any) -> dict[str, str] | None:
@@ -1016,9 +1017,7 @@ def _is_noisy_golden_question(item: dict[str, str]) -> bool:
     compact = re.sub(r"[^a-z0-9]+", "", normalized)
     if any(term.replace(" ", "") in compact for term in NOISY_QUESTION_TERMS):
         return True
-    if "reference context" in normalized and any(
-        term.replace(" ", "") in compact for term in PATH_ARTIFACT_QUESTION_TERMS
-    ):
+    if "reference context" in normalized and _reference_context_topic_is_path_artifact(normalized):
         return True
     if "reference context" in normalized and any(term in normalized for term in (" import ", " schema ", " transform")):
         return True
@@ -1271,8 +1270,12 @@ def maybe_run_real_ragas(
     if enabled is False or not _real_ragas_enabled():
         return None
 
-    config = cloud_ragas.config_from_env() if cloud_client is None else None
-    client = cloud_client or cloud_ragas.client_from_config(config)
+    if cloud_client is None:
+        config = cloud_ragas.config_from_env()
+        client = cloud_ragas.client_from_config(config)
+    else:
+        config = cloud_ragas.config_from_env()
+        client = cloud_client
     try:
         budget = getattr(client, "budget", None)
         sampled_rows = list(rows)[: _max_real_ragas_rows()]
@@ -1305,8 +1308,12 @@ def maybe_run_real_ragas_with_status(
     if enabled is False or not _real_ragas_enabled():
         return None, "Cloud RAGAS was not enabled for this evaluation run."
 
-    config = cloud_ragas.config_from_env() if cloud_client is None else None
-    client = cloud_client or cloud_ragas.client_from_config(config)
+    if cloud_client is None:
+        config = cloud_ragas.config_from_env()
+        client = cloud_ragas.client_from_config(config)
+    else:
+        config = cloud_ragas.config_from_env()
+        client = cloud_client
     try:
         budget = getattr(client, "budget", None)
         sampled_rows = list(rows)[: _max_real_ragas_rows()]
@@ -1376,6 +1383,8 @@ def _latency_values(result: dict[str, Any], measured_total_ms: float) -> dict[st
     retrieval_ms = _finite_latency_ms(latency.get("retrieval_ms"))
     synthesis_ms = _finite_latency_ms(latency.get("synthesis_ms"))
     total_ms = _finite_latency_ms(latency.get("total_ms")) or measured_total_ms
+    if total_ms is None:
+        total_ms = measured_total_ms
 
     if retrieval_ms is None and synthesis_ms is None:
         retrieval_ms = total_ms
@@ -1388,7 +1397,7 @@ def _latency_values(result: dict[str, Any], measured_total_ms: float) -> dict[st
     return {
         "retrieval_ms": round(float(retrieval_ms), 3),
         "synthesis_ms": round(float(synthesis_ms), 3),
-        "total_ms": round(max(total_ms, float(retrieval_ms) + float(synthesis_ms)), 3),
+        "total_ms": round(max(float(total_ms), float(retrieval_ms) + float(synthesis_ms)), 3),
     }
 
 
@@ -1506,7 +1515,7 @@ def print_markdown_report(results: dict[str, dict[str, float]]) -> None:
     if not averages:
         print("\nBest strategy: n/a (no finite metric values were produced).")
         return
-    best = max(averages, key=averages.get)
+    best = max(averages, key=lambda s: averages[s])
     worst_strategy, worst_metric, worst_value = min(
         (
             (strategy, metric, value)
@@ -1586,12 +1595,12 @@ def main(use_real_ragas: bool | None = None) -> None:
                 )
         if cloud_client:
             generate_golden_dataset(
-                nodes,
+                nodes or [],
                 output_path=GOLDEN_DATASET_PATH,
                 providers=default_question_providers(cloud_client=cloud_client),
             )
         else:
-            generate_golden_dataset(nodes, output_path=GOLDEN_DATASET_PATH)
+            generate_golden_dataset(nodes or [], output_path=GOLDEN_DATASET_PATH)
 
     pipeline = pipeline or LocalRAGPipeline(nodes=nodes, allow_index_build=False)
     if cloud_client:

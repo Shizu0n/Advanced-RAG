@@ -502,7 +502,7 @@ def _inject_app_chrome(st) -> None:
             min-width: 0;
         }
 
-        [data-testid="stLayoutWrapper"]:has(> .st-key-main_workspace_panel) {
+        [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-main_workspace_panel) {
             display: flex !important;
             height: 100% !important;
             max-height: 100% !important;
@@ -527,12 +527,12 @@ def _inject_app_chrome(st) -> None:
             height: 100% !important;
         }
 
-        .st-key-main_workspace_panel > [data-testid="stLayoutWrapper"]:has(.st-key-workspace_page_nav) {
+        .st-key-main_workspace_panel > [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-workspace_page_nav) {
             flex: 0 0 auto !important;
         }
 
-        .st-key-main_workspace_panel > [data-testid="stLayoutWrapper"]:has(.st-key-chat_page_content),
-        .st-key-main_workspace_panel > [data-testid="stLayoutWrapper"]:has(.st-key-eval_page_content) {
+        .st-key-main_workspace_panel > [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-chat_page_content),
+        .st-key-main_workspace_panel > [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-eval_page_content) {
             display: flex !important;
             flex: 1 1 auto !important;
             min-height: 0 !important;
@@ -598,7 +598,7 @@ def _inject_app_chrome(st) -> None:
             height: 100% !important;
         }
 
-        .st-key-chat_page_content [data-testid="stLayoutWrapper"]:has(.st-key-chat_shell) {
+        .st-key-chat_page_content [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-chat_shell) {
             display: flex !important;
             flex: 1 1 auto !important;
             min-height: 0 !important;
@@ -618,7 +618,7 @@ def _inject_app_chrome(st) -> None:
             flex: 0 0 auto !important;
         }
 
-        .st-key-chat_shell [data-testid="stLayoutWrapper"]:has(.st-key-chat_history_panel) {
+        .st-key-chat_shell [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-chat_history_panel) {
             display: flex !important;
             flex: 1 1 auto !important;
             min-height: 0 !important;
@@ -626,7 +626,7 @@ def _inject_app_chrome(st) -> None:
             overflow: hidden !important;
         }
 
-        .st-key-chat_shell [data-testid="stLayoutWrapper"]:has(.st-key-chat_composer_panel) {
+        .st-key-chat_shell [data-testid="stVerticalBlockBorderWrapper"]:has(.st-key-chat_composer_panel) {
             display: flex !important;
             flex: 0 0 auto !important;
             margin-top: auto !important;

@@ -332,6 +332,58 @@ class GoldenDatasetTests(unittest.TestCase):
             questions,
         )
 
+    def test_filter_removes_reference_questions_built_from_hosted_mount_path_tokens(self):
+        # On Streamlit Cloud the repo is mounted at /mount/src/advanced-rag, so the
+        # "Source: <path>" provenance header leaks tokens like "mount" / "advanced-rag"
+        # instead of the local developer's home-directory tokens. The filter must drop
+        # these regardless of where the app is deployed.
+        candidates = [
+            {
+                "question": "What does the reference context explain about Source mount advanced-rag data?",
+                "ground_truth": "The backend exposes a FastAPI health check.",
+                "reference_context": "The backend exposes a FastAPI health check.",
+                "source_doc": "composite:README+source-evidence",
+            },
+            {
+                "question": "What setup, architecture, or usage guidance is documented in README.md?",
+                "ground_truth": "The README documents the project stack.",
+                "reference_context": "The README documents the project stack.",
+                "source_doc": "README.md",
+            },
+        ]
+
+        filtered = evaluation.filter_best_golden_items(candidates, limit=2)
+
+        questions = [item["question"] for item in filtered]
+        self.assertNotIn(
+            "What does the reference context explain about Source mount advanced-rag data?",
+            questions,
+        )
+        self.assertIn(
+            "What setup, architecture, or usage guidance is documented in README.md?",
+            questions,
+        )
+
+    def test_filter_keeps_reference_question_with_genuine_content_topic(self):
+        # A reference-context question whose topic comes from real file content (not a
+        # path provenance header) must survive the noise filter.
+        candidates = [
+            {
+                "question": "What does the reference context explain about FastAPI health endpoint?",
+                "ground_truth": "The service exposes a /health endpoint that returns ok.",
+                "reference_context": "The service exposes a /health endpoint that returns ok.",
+                "source_doc": "backend/service.py",
+            },
+        ]
+
+        filtered = evaluation.filter_best_golden_items(candidates, limit=2)
+
+        questions = [item["question"] for item in filtered]
+        self.assertIn(
+            "What does the reference context explain about FastAPI health endpoint?",
+            questions,
+        )
+
     def test_run_evaluation_rejects_empty_golden_dataset(self):
         with TemporaryDirectory() as tmpdir:
             golden_path = Path(tmpdir) / "golden_dataset.json"

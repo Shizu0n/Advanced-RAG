@@ -533,10 +533,14 @@ def run_embedding_model_comparison(
     rows: list[dict[str, float | int | str]] = []
     for model_name in models:
         started = time.perf_counter()
-        # A model already in the local HuggingFace cache (e.g. the active embedder)
-        # needs no network, so run it even when downloads are disabled. Only models
-        # that would require a fresh download are skipped under the gate.
-        if not downloads_allowed and not _hf_model_cached_locally(str(model_name)):
+        # The active embedder is guaranteed available (the index was built with it), so it
+        # always runs and shows real numbers regardless of the gate. Any other model already
+        # in the local HuggingFace cache needs no network either. Only models that would
+        # require a fresh download are skipped. (snapshot_download(local_files_only=True) can
+        # under-report the active embedder as uncached, so the explicit EMBED_MODEL check is
+        # what actually keeps the comparison from being all-skipped.)
+        is_active_embedder = str(model_name) == EMBED_MODEL
+        if not downloads_allowed and not is_active_embedder and not _hf_model_cached_locally(str(model_name)):
             rows.append(
                 {
                     "model": str(model_name),

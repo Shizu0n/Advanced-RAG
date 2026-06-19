@@ -718,6 +718,43 @@ class GoldenDatasetTests(unittest.TestCase):
         self.assertTrue(any("alpha module" in question for question in questions))
         self.assertTrue(any("beta module" in question for question in questions))
 
+    def test_generate_golden_dataset_draws_multiple_questions_from_one_chunk(self):
+        node = TextNode(
+            id_="card",
+            text=(
+                "The model was fine-tuned on dataset b-mc2/sql-create-context. "
+                "The base model is microsoft/Phi-3-mini-4k-instruct. Exact match improved by 12 points."
+            ),
+            metadata={"file_name": "README.md"},
+        )
+
+        class CountingCloudClient:
+            def __init__(self):
+                self.calls = 0
+
+            def generate_json(self, prompt):
+                self.calls += 1
+                return {
+                    "question": f"Question {self.calls} about the fine-tuned model?",
+                    "ground_truth": "The base model is microsoft/Phi-3-mini-4k-instruct.",
+                }
+
+        provider = evaluation.CloudQuestionProvider(cloud_client=CountingCloudClient())
+
+        with TemporaryDirectory() as tmpdir:
+            dataset = evaluation.generate_golden_dataset(
+                [node],
+                output_path=Path(tmpdir) / "golden_dataset.json",
+                providers=[provider],
+                chunk_limit=5,
+                final_limit=6,
+            )
+
+        questions = [item["question"] for item in dataset]
+        # A single-chunk source must still yield several distinct questions, not just one.
+        self.assertGreaterEqual(len(questions), 3)
+        self.assertEqual(len(questions), len(set(questions)))
+
     def test_generate_golden_dataset_uses_resume_questions_for_resume_pdf(self):
         node = TextNode(
             id_="resume",

@@ -10,7 +10,7 @@ The project is offline-first by default. External fetches, model downloads, and 
 
 ## Supported Sources
 
-The product currently supports three source types:
+The application supports three source types:
 
 - **Uploaded files/folders** - browser-uploaded individual files, project folders, or `.zip` archives for hosted deployments
 - **GitHub repositories** — public repository URLs from `github.com`
@@ -97,7 +97,7 @@ Chat messages are persisted per indexed source in local SQLite at `data/chat_his
 
 ### Evaluation
 
-Evaluation generates a golden dataset from the indexed source and scores all retrieval strategies across:
+Evaluation builds a golden dataset from the indexed source and scores all retrieval strategies across:
 
 - Faithfulness
 - Answer relevancy
@@ -198,13 +198,11 @@ The app opens at `http://localhost:8501` as a chat-first workbench:
 
 ### Streamlit Cloud Deployment
 
-The first public deployment target is Streamlit Cloud. Runtime artifacts are intentionally rebuildable and should not be committed: `data/raw/`, `chroma_db/`, and `data/eval/`.
+Streamlit Cloud is the supported hosted deployment target. Runtime directories are rebuildable and should not be committed: `data/raw/`, `chroma_db/`, and `data/eval/`.
 
-Configure Streamlit secrets with the same gates documented in `.env.example`. Keep cloud proof runs guarded with low `MAX_CLOUD_CALLS` and `MAX_REAL_RAGAS_ROWS`; the public app must still work through offline fallback when provider keys or quota are unavailable.
+Configure Streamlit secrets with the same variables documented in `.env.example`. Keep hosted evaluation budgets low with `MAX_CLOUD_CALLS` and `MAX_REAL_RAGAS_ROWS`; the app should continue to work through offline fallback when provider keys or quota are unavailable.
 
 Public deployments cannot read a visitor's `C:\...` or `/Users/...` filesystem path directly. For local projects, use the default upload flow to select the project folder, or upload a `.zip` archive. Public GitHub and Hugging Face sources remain available for hosted sources.
-
-See [`docs/designs/final-polish-backlog-plan.md`](docs/designs/final-polish-backlog-plan.md) for the deployment checklist, Railway fallback criteria, and final acceptance checklist.
 
 ### Python API
 
@@ -279,7 +277,7 @@ Outputs:
 
 - `data/eval/ragas_results.csv` — per-strategy summary metrics
 - `data/eval/ragas_per_question.csv` — per-question breakdown
-- `data/eval/golden_dataset.json` — generated evaluation dataset
+- `data/eval/golden_dataset.json` — evaluation dataset
 - `data/eval/chunking_ablation.csv` — chunk-count and chunk-size comparison for 256, 512, and 1024 token chunks
 - `data/eval/embedding_comparison.csv` — local embedding model timing/dimension comparison for `bge-small`, `bge-base`, and `e5-small`
 
